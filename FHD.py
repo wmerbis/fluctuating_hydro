@@ -35,20 +35,21 @@ import numpy as np
 import matplotlib.pyplot as plt
 from numpy.fft import rfft, irfft
 from matplotlib.animation import FuncAnimation, PillowWriter
-
+from scipy.fft import dct, idct
+import scipy as sp
 
 class fhd:
     '''Defines the 1-D fluctuating hydrodynamics class for simulating sociohydrodynamic models including noise and reactions
 
     '''
-    def __init__(self, L, N, bc = "periodic", fft = True):
+    def __init__(self, L, N, bc = "periodic", fft = False):
         '''
         Initializes instance of the fhd class object
 
         Args:
             L:   length of the spatial domain, x coordinate will be defined as running from -L/2 to L/2
             N:   number of discretization steps
-            bc:  boundary conditions, choose among "periodic", "von Neumann" or "Dirichlet"
+            bc:  boundary conditions, choose among "periodic", "Neumann" or "Dirichlet"
                  (note: latter two are to be implemented)
             fft: Boolean, when True, derivatives are computed using fast Fourier transforms.
                  when False, 6th order finite difference methods are used
@@ -62,20 +63,24 @@ class fhd:
         if bc == "periodic":
             self.N = N
             self.x = np.arange(-L/2, L/2, self.dx)
-        elif bc == "von Neumann":
-            raise ValueError("von Neumann boundary conditions not yet implemented")
+        elif bc == "Neumann":
+            self.N = N + 1
+            self.x = np.linspace(-L/2, L/2, self.N)
         elif bc == "Dirichlet":
             raise ValueError("Dirichet boundary conditions not yet implemented")
         else:
-            raise ValueError("Boundary conditions not properly specified, try: 'periodic', 'von Neumann' or 'Dirichlet' ")
+            raise ValueError("Boundary conditions not properly specified, try: 'periodic', 'Neumann' or 'Dirichlet' ")
 
-        if fft:
-            self.k = np.fft.fftfreq(N, d=self.dx)*2*np.pi
+        if fft and bc == 'periodic':
+            self.k = 2*np.pi*np.fft.fftfreq(self.N, d=self.dx)
+        elif fft and bc == 'Neumann':
+            # self.k = np.pi * np.arrange(self.N) /self.L 
+            raise ValueError("Neumann boundary conditions not implemented for fft derivatives")
         else:
-            self.Dx = makeD(self.N, self.dx)
-            self.D2x = makeD2(self.N, self.dx)
-            self.D3x = makeD3(self.N, self.dx)
-            self.D4x = makeD4(self.N, self.dx)
+            self.Dx = makeD(self.N, self.dx, self.bc)
+            self.D2x = makeD2(self.N, self.dx, self.bc)
+            self.D3x = makeD3(self.N, self.dx, self.bc)
+            # self.D4x = makeD4(self.N, self.dx, self.bc)
             
         self.phi_floor = 1e-14
         self.nspecies = 2
@@ -90,11 +95,16 @@ class fhd:
         return phi
 
     def grad(self, u):
-        if self.fft:
+        if self.fft and self.bc == 'periodic':
             u_hat = np.fft.fft(u)
             grad = np.fft.ifft(1j*self.k*u_hat).real
+        elif self.fft and self.bc == 'Neumann':
+            u_hat = dct(u, type=2, norm='ortho') #Neumann bc's use cosine transforms
+            # factor = (self.k) 
+            # factor[0] = 0  # The zero frequency component should remain zero for Neumann BCs
+            grad = idct(self.k * u_hat, type=2, norm='ortho').real
         else:
-            grad = np.dot(self.Dx, u.T).T
+            grad = self.Dx.dot(u.T).T
         return grad
         
     def lapl(self, u):
@@ -102,7 +112,7 @@ class fhd:
             u_hat = np.fft.fft(u)
             lapl = np.fft.ifft(- self.k**2*u_hat).real
         else:
-            lapl = np.dot(self.D2x, u.T).T
+            lapl = self.D2x.dot(u.T).T
         return lapl
 
     def grad_lapl(self, u):
@@ -110,7 +120,7 @@ class fhd:
             u_hat = np.fft.fft(u)
             d3 = np.fft.ifft(- 1j*self.k**3*u_hat).real
         else:
-            d3 = np.dot(self.D3x, u.T).T
+            d3 = self.D3x.dot(u.T).T
         return d3
 
     def grad_utility(self, phi, param):
@@ -130,6 +140,10 @@ class fhd:
         """Generate stochastic flux term ∂x( rho ξ )"""
         if toggle_noise:
             xi = np.random.normal(0, 1, size= phi.shape)
+            if self.bc == "Neumann":
+                # Set noise to zero on the boundary for Neumann bc's
+                xi[:,0] = 0
+                xi[:,-1] = 0
             rho_face     = np.maximum(phi*phi0, self.phi_floor**2) # Changed to noise_floor^2 because phi*phi0 is also a square!
             noise_flux   = np.sqrt(2*param['D']*self.dx*rho_face/dt)*xi # Double check noise flux dx and dt dependence!!
             dnoise_dx    = self.grad(noise_flux)
@@ -144,10 +158,13 @@ class fhd:
         theta = param["theta"]
         Gamma = param["Gamma"]
         kappa = np.array([[theta-1,theta],[theta,theta-1]])
-        pi = np.tensordot(kappa, phi + Gamma*self.lapl(phi), axes = (1,0))
+        pi = np.tensordot(kappa, phi + Gamma*self.lapl(phi)/2, axes = (1,0))
         w0 = D/(1+np.exp(-beta*pi))
-        gradw0 = D*beta/(2+2*np.cosh(beta*pi))*np.tensordot(kappa, self.grad(phi) + Gamma*self.grad_lapl(phi), axes = (1,0))
+        grad_pi = np.tensordot(kappa, self.grad(phi) + Gamma*self.grad_lapl(phi)/2, axes = (1,0))
+        gradw0 = D*beta/(2+2*np.cosh(beta*pi))*grad_pi
         laplw0 = self.grad(gradw0)
+        # lapl_pi = self.grad(grad_pi)
+        # laplw0 = D*beta/(2+2*np.cosh(beta*pi))*lapl_pi - D*beta**2*np.sinh(beta*pi)/(1+np.cosh(beta*pi))**2/2 * grad_pi**2
         return w0, gradw0, laplw0
 
 
@@ -162,7 +179,11 @@ class fhd:
         """Generate stochastic flux term ∂x( rho ξ )"""
         if toggle_noise:
             xi = np.random.normal(0, 1, size= phi.shape)
-            rho_face     = np.maximum(w0*phi*phi0, 1e-14) # Changed to noise_floor^2 because phi*phi0 is also a square!
+            if self.bc == "Neumann":
+                # Set noise to zero on the boundary for Neumann bc's
+                xi[:,0] = 0
+                xi[:,-1] = 0
+            rho_face     = np.maximum(w0*phi*phi0, 1e-15) 
             noise_flux   = np.sqrt(2*self.dx*rho_face/dt)*xi # Double check noise flux dx and dt dependence!!
             dnoise_dx    = self.grad(noise_flux)
         
@@ -187,7 +208,7 @@ class fhd:
             k3 = dt * rhs(phi + 1/2* k2, param, dt, toggle_noise)
             k4 = dt * rhs(phi + k3, param, dt, toggle_noise)
             rho_next = phi + 1/6*(k1 + 2*k2 + 2*k3 + k4)
-            
+            rho_next +=  dt * phi*(param['b']*(1-phi_tot) - param['d'])
         
         if np.any(rho_next <0):
             # print("fluctuations made phi[a] negative")
@@ -296,14 +317,14 @@ class fhd_2d:
     '''Defines the 1-D fluctuating hydrodynamics class for simulating the sociohydrodynamic equations including noise and reactions:
 
     '''
-    def __init__(self, L, N, bc = "periodic", fft = True):
+    def __init__(self, L, N, bc = "periodic", fft = False):
         '''
         Initializes instance of the fhd class object
 
         Args:
             L:  tuple (Lx, Ly): spatial lengths of the domain, coordinates will be defined as running from -L/2 to L/2
             N:  tuple (Nx, Ny): number of discretization steps per coordinate
-            bc: boundary conditions, choose among "periodic", "von Neumann" or "Dirichlet"
+            bc: boundary conditions, choose among "periodic", "Neumann" or "Dirichlet"
                 (note: latter two are to be implemented
         '''
         self.N = N
@@ -319,12 +340,16 @@ class fhd_2d:
         if bc == "periodic":
             self.x = np.arange(-self.Lx/2, self.Lx/2, self.dx)
             self.y = np.arange(-self.Ly/2, self.Ly/2, self.dy)
-        elif bc == "von Neumann":
-            raise ValueError("von Neumann boundary conditions not yet implemented")
+        elif bc == "Neumann":
+            self.N = (N[0]+1,N[1]+1)
+            self.Nx += 1
+            self.Ny += 1
+            self.x = np.linspace(-self.Lx/2, self.Lx/2, self.Nx)
+            self.y = np.linspace(-self.Ly/2, self.Ly/2, self.Ny)            
         elif bc == "Dirichlet":
             raise ValueError("Dirichet boundary conditions not yet implemented")
         else:
-            raise ValueError("Boundary conditions not properly specified, try: 'periodic', 'von Neumann' or 'Dirichlet' ")
+            raise ValueError("Boundary conditions not properly specified, try: 'periodic', 'Neumann' or 'Dirichlet' ")
         
         self.kx = np.fft.fftfreq(self.Nx, d=self.dx)*2*np.pi
         self.ky = np.fft.fftfreq(self.Ny, d=self.dy)*2*np.pi
@@ -334,15 +359,14 @@ class fhd_2d:
         self.nspecies = 2
 
         # Matrixces Dx and Dy for 8-th order finite differences, needed for divergence function below
-        self.Dx = makeD(self.Nx, self.dx)
-        self.Dy = makeD(self.Ny, self.dy)
+        self.Dx = makeD(self.Nx, self.dx, self.bc)
+        self.Dy = makeD(self.Ny, self.dy, self.bc)
         if not fft:
-            self.D2x = makeD2(self.Nx, self.dx)
-            self.D3x = makeD3(self.Nx, self.dx)
-            # self.D4x = makeD4(self.Nx, self.dx)
-            self.D2y = makeD2(self.Ny, self.dy)
-            self.D3y = makeD3(self.Ny, self.dy)
-            # self.D4y = makeD4(self.Ny, self.dy)
+            self.D2x = makeD2(self.Nx, self.dx, self.bc)
+            self.D3x = makeD3(self.Nx, self.dx, self.bc)
+            
+            self.D2y = makeD2(self.Ny, self.dy, self.bc)
+            self.D3y = makeD3(self.Ny, self.dy, self.bc)
         
     def scale_down_pointwise(self, phi):
         ''' Scales down phi[a] on sites where sum_a phi[a] < 1
@@ -364,9 +388,10 @@ class fhd_2d:
             grad[0] = np.fft.ifft2(grad_x_hat).real
             grad[1] = np.fft.ifft2(grad_y_hat).real
         else:
-            grad = np.zeros((2,)+u.shape)
-            grad[0] = np.dot(self.Dx,u).transpose(1,0,2)
-            grad[1] = np.dot(self.Dy,u.transpose(0,2,1)).transpose(1,2,0)
+            ush = u.shape
+            grad = np.zeros((2,)+ush)
+            grad[0] = np.array([self.Dx.dot(u[i]) for i in range(ush[0])])
+            grad[1] = np.array([self.Dy.dot(u[i].T).T for i in range(ush[0])])
         return grad
 
         
@@ -377,8 +402,9 @@ class fhd_2d:
             lapl_hat = -(self.kx**2 + self.ky**2) * u_hat
             lapl = np.fft.ifft2(lapl_hat).real
         else:
-            lapl = np.dot(self.D2x, u).transpose(1,0,2)
-            lapl += np.dot(self.D2y,u.transpose(0,2,1)).transpose(1,2,0)             
+            ush = u.shape
+            lapl = np.array([self.D2x.dot(u[i]) for i in range(ush[0])])
+            lapl += np.array([self.D2y.dot(u[i].T).T for i in range(ush[0])])          
         return lapl
 
     def grad_lapl(self, u):
@@ -392,9 +418,12 @@ class fhd_2d:
             gradlap[0] = np.fft.ifft2(gradlap_x_hat).real
             gradlap[1] = np.fft.ifft2(gradlap_y_hat).real
         else:
-            gradlap = np.zeros((2,)+u.shape)
-            gradlap[0] = np.dot(self.D3x, u).transpose(1,0,2) + np.dot(self.Dx, np.dot(self.D2y, u.transpose(0,2,1)).transpose(1,2,0)).transpose(1,0,2)
-            gradlap[1] = np.dot(self.D3y, u.transpose(0,2,1)).transpose(1,2,0) + np.dot(self.Dy, np.dot(self.D2x, u).transpose(1,2,0)).transpose(1,2,0)
+            ush = u.shape
+            gradlap = np.zeros((2,)+ush)
+            gradlap[0] =  [self.D3x.dot(u[i]) for i in range(ush[0])] 
+            gradlap[0] += [self.Dx.dot(self.D2y.dot(u[i].T).T) for i in range(ush[0])]
+            gradlap[1] =  [self.D3y.dot(u[i].T).T for i in range(ush[0])] 
+            gradlap[1] += [self.Dy.dot(self.D2x.dot(u[i]).T).T for i in range(ush[0])]
         return gradlap
 
     def grad_utility(self, phi, param):
@@ -412,11 +441,11 @@ class fhd_2d:
         
         # div = np.fft.ifft2(- 1j * self.kx * np.fft.fft2(vec[0])).real
         # div += np.fft.ifft2(- 1j * self.ky * np.fft.fft2(vec[1])).real
-        div = np.dot(self.Dx, vec[0]).transpose(1,0,2)
-        div += np.dot(self.Dy, vec[1].transpose(0,2,1)).transpose(1,2,0)
+        div = np.array([self.Dx.dot(vec[0,i]) for i in range(self.nspecies)])
+        div += np.array([self.Dy.dot(vec[1,i].T).T for i in range(self.nspecies)])
         return div
     
-    def rhs_Vitelli(self, phi, param, dt, toggle_noise = 1):
+    def rhs_Vitelli(self, phi, param, dt, toggle_noise):
         """Compute RHS of the equation"""
 
         phi0   = 1- phi.sum(axis=0)
@@ -432,6 +461,12 @@ class fhd_2d:
         """Generate stochastic flux term ∂x( rho ξ )"""
         if toggle_noise:
             xi = np.random.normal(0, 1, size= (2,)+phi.shape)
+            if self.bc == 'Neumann':
+                # Set noise to zero on the boundary for Neumann bc's
+                xi[:,:,0,:] = 0
+                xi[:,:,-1,:] = 0
+                xi[:,:,:,0] = 0
+                xi[:,:,:,-1] = 0
             rho_face     = np.maximum(phi*phi0, self.phi_floor**2) # Changed to noise_floor^2 because phi*phi0 is also a square!
             noise_flux   = np.sqrt(2*param['D']*self.dx*self.dy*rho_face/dt)*xi # Double check noise flux dx and dt dependence!!
             dnoise_dx    = self.div2d(noise_flux) 
@@ -446,13 +481,14 @@ class fhd_2d:
         theta = param["theta"]
         Gamma = param["Gamma"]
         kappa = np.array([[theta-1,theta],[theta,theta-1]])
-        pi = np.tensordot(kappa, phi + Gamma*self.lapl(phi), axes = (1,0))
+        pi = np.tensordot(kappa, phi + Gamma/2*self.lapl(phi), axes = (1,0))
         w0 = D/(1+np.exp(-beta*pi))
-        gradw0 = D*beta/(2+2*np.cosh(beta*pi))*np.tensordot(kappa, self.grad(phi) + Gamma*self.grad_lapl(phi), axes = (1,1)).transpose(1,0,2,3)
+        grad_pi = np.tensordot(kappa, self.grad(phi) + Gamma/2*self.grad_lapl(phi), axes = (1,1)).transpose(1,0,2,3)
+        gradw0 = D*beta/(2+2*np.cosh(beta*pi))*grad_pi
         laplw0 = self.div2d(gradw0)
         return w0, gradw0, laplw0
 
-    def rhs_Schelling(self, phi, param, dt, toggle_noise = 1):
+    def rhs_Schelling(self, phi, param, dt, toggle_noise):
         """Compute RHS of the equation"""
         phi0   = 1- phi.sum(axis=0)
         phi0 = phi0.reshape((1,)+self.N)
@@ -465,6 +501,12 @@ class fhd_2d:
         """Generate stochastic flux term ∂x( rho ξ )"""
         if toggle_noise:
             xi = np.random.normal(0, 1, size= (2,) + phi.shape)
+            if self.bc == 'Neumann':
+                # Set noise to zero on the boundary for Neumann bc's
+                xi[:,:,0,:] = 0
+                xi[:,:,-1,:] = 0
+                xi[:,:,:,0] = 0
+                xi[:,:,:,-1] = 0
             rho_face     = np.maximum(w0*phi*phi0, 1e-14) # Changed to noise_floor^2 because phi*phi0 is also a square!
             noise_flux   = np.sqrt(2*self.dx*self.dy*rho_face/dt)*xi # Double check noise flux dx and dt dependence!!
             dnoise_dx    = self.div2d(noise_flux) 
@@ -483,6 +525,13 @@ class fhd_2d:
         elif scheme == "PC":
             rho_corr = phi + 0.5*dt*(dphidt + rhs(rho_pred, param,  dt, toggle_noise))
             rho_next = rho_corr + dt * phi*(param['b']*(1-phi_tot) - param['d'])
+        elif scheme == "RK4":
+            k1 = dt * dphidt
+            k2 = dt * rhs(phi + 1/2* k1, param, dt, toggle_noise)
+            k3 = dt * rhs(phi + 1/2* k2, param, dt, toggle_noise)
+            k4 = dt * rhs(phi + k3, param, dt, toggle_noise)
+            rho_next = phi + 1/6*(k1 + 2*k2 + 2*k3 + k4)
+            rho_next +=  dt * phi*(param['b']*(1-phi_tot) - param['d'])
         
         if np.any(rho_next <0):
             # print("fluctuations made phi[a] negative")
@@ -576,6 +625,14 @@ class fhd_2d:
             
         return phi_run
 
+def fraction_unhappy(theta, phi):
+    fractions = phi/phi.sum(axis=0)
+    unhappy = phi[(theta-fractions)>0]
+    if np.any(unhappy):
+        return unhappy.sum()/phi.sum()
+    else:
+        return 0
+    
 def dissimilarity(phi):
     phi0 = 1 - np.sum(phi,axis=0)
     global_dist = np.array([phi[0].mean(), phi[1].mean(), phi0.mean()])
@@ -588,7 +645,6 @@ def mean_relative_entropy(phi):
     phi0 = 1 - np.sum(phi, axis=0)
     global_dist = np.array([phi[0].mean(), phi[1].mean(), phi0.mean()])
     
-    
     # Ensure no division by zero or log of zero
     phi_combined = np.vstack([phi[0], phi[1], phi0]).reshape((3,)+ phi0.shape)
     global_dist = np.clip(global_dist, 1e-10, None)
@@ -598,52 +654,94 @@ def mean_relative_entropy(phi):
     kl_divergence = np.sum(phi_combined * np.log(phi_combined / global_dist.reshape((3,)+ len(phi0.shape)*(1,))), axis=0)
     mean_kl_divergence = np.mean(kl_divergence)/Sglobal
     
-    
     return mean_kl_divergence
 
-def makeD(Nx,dx):
+def makeD(Nx,dx, bc = "periodic"):
     Dx = np.zeros((Nx, Nx))
-    # 1/280	−4/105	1/5	−4/5	0	4/5	−1/5	4/105	−1/280	
-    for i in range(Nx):
-        Dx[i, (i-4) % Nx] = 1/280
-        Dx[i, (i-3) % Nx] = -4/105
-        Dx[i, (i-2) % Nx] = 1/5
-        Dx[i, (i-1) % Nx] = -4/5
-        Dx[i, (i+1) % Nx] = 4/5
-        Dx[i, (i+2) % Nx] = -1/5
-        Dx[i, (i+3) % Nx] = 4/105
-        Dx[i, (i+4) % Nx] = -1/280
-    return Dx/dx
+    # 1/280	−4/105	1/5	−4/5	0	4/5	−1/5	4/105	−1/280	\
+    if bc == 'periodic':
+        for i in range(Nx):
+            Dx[i, (i-4) % Nx] = 1/280
+            Dx[i, (i-3) % Nx] = -4/105
+            Dx[i, (i-2) % Nx] = 1/5
+            Dx[i, (i-1) % Nx] = -4/5
+            Dx[i, (i+1) % Nx] = 4/5
+            Dx[i, (i+2) % Nx] = -1/5
+            Dx[i, (i+3) % Nx] = 4/105
+            Dx[i, (i+4) % Nx] = -1/280
+    elif bc == "Neumann":
+        # Use that u(-dx)=u(dx), u(-2dx)=u(2dx), such that Dx[i, -1] = Dx[i, 1] etc. so use absolute value
+        # On the other boundary it implies Dx[Nx] = Dx[Nx-2] (zero indexing, boundary is at Nx-1), so map Nx + k to Nx - 1 - |Nx-1 - (i+k)|
+        for i in range(Nx):    
+            Dx[i, np.abs(i-4)] += 1/280
+            Dx[i, np.abs(i-3)] += -4/105
+            Dx[i, np.abs(i-2)] += 1/5
+            Dx[i, np.abs(i-1)] += -4/5
+            Dx[i, Nx -1 - np.abs(Nx -1 - (i+1))] += 4/5
+            Dx[i, Nx -1 - np.abs(Nx -1 - (i+2))] += -1/5
+            Dx[i, Nx -1 - np.abs(Nx -1 - (i+3))] += 4/105
+            Dx[i, Nx -1 - np.abs(Nx -1 - (i+4))] += -1/280
+    else:
+        raise ValueError(f"Boundary conditions {bc} not implemented, try 'periodic' or 'Neumann' ")
+    return sp.sparse.csc_array(Dx/dx)
 
-def makeD2(Nx, dx):
+def makeD2(Nx, dx, bc = 'periodic'):
     D2x = np.zeros((Nx,Nx))
     # −1/560	8/315	−1/5	8/5	−205/72	8/5	−1/5	8/315	−1/560	
-    for i in range(Nx):
-        D2x[i, (i-4) % Nx] = -1/560
-        D2x[i, (i-3) % Nx] = 8/315
-        D2x[i, (i-2) % Nx] = -1/5
-        D2x[i, (i-1) % Nx] = 8/5
-        D2x[i,i] = -205/72
-        D2x[i, (i+1) % Nx] = 8/5
-        D2x[i, (i+2) % Nx] = -1/5
-        D2x[i, (i+3) % Nx] = 8/315
-        D2x[i, (i+4) % Nx] = -1/560
-    return D2x/dx**2
+    if bc == 'periodic':
+        for i in range(Nx):
+            D2x[i, (i-4) % Nx] = -1/560
+            D2x[i, (i-3) % Nx] = 8/315
+            D2x[i, (i-2) % Nx] = -1/5
+            D2x[i, (i-1) % Nx] = 8/5
+            D2x[i,i] = -205/72
+            D2x[i, (i+1) % Nx] = 8/5
+            D2x[i, (i+2) % Nx] = -1/5
+            D2x[i, (i+3) % Nx] = 8/315
+            D2x[i, (i+4) % Nx] = -1/560
+    elif bc == 'Neumann':
+        for i in range(Nx):
+            D2x[i, np.abs(i-4)] += -1/560
+            D2x[i, np.abs(i-3)] += 8/315
+            D2x[i, np.abs(i-2)] += -1/5
+            D2x[i, np.abs(i-1)] += 8/5
+            D2x[i,i] += -205/72
+            D2x[i,  Nx -1 - np.abs(Nx -1 - (i+1))] += 8/5
+            D2x[i,  Nx -1 - np.abs(Nx -1 - (i+2))] += -1/5
+            D2x[i,  Nx -1 - np.abs(Nx -1 - (i+3))] += 8/315
+            D2x[i,  Nx -1 - np.abs(Nx -1 - (i+4))] += -1/560
+    else:
+        raise ValueError(f"Boundary conditions {bc} not implemented, try 'periodic' or 'Neumann' ")
+    return sp.sparse.csc_array(D2x/dx**2)
 
-def makeD3(Nx, dx):
+def makeD3(Nx, dx, bc = 'periodic'):
     D3x = np.zeros((Nx,Nx))
     # −7/240	3/10	−169/120	61/30	0	−61/30	169/120	−3/10	7/240	
-    for i in range(Nx):
-        D3x[i, (i-4) % Nx] = -7/240
-        D3x[i, (i-3) % Nx] = 3/10
-        D3x[i, (i-2) % Nx] = -169/120
-        D3x[i, (i-1) % Nx] = 61/30
-        # D3[i,i] = 0
-        D3x[i, (i+1) % Nx] = -61/30
-        D3x[i, (i+2) % Nx] = 169/120
-        D3x[i, (i+3) % Nx] = -3/10
-        D3x[i, (i+4) % Nx] = 7/240
-    return D3x/dx**3
+    if bc == 'periodic':
+        for i in range(Nx):
+            D3x[i, (i-4) % Nx] = -7/240
+            D3x[i, (i-3) % Nx] = 3/10
+            D3x[i, (i-2) % Nx] = -169/120
+            D3x[i, (i-1) % Nx] = 61/30
+            # D3[i,i] = 0
+            D3x[i, (i+1) % Nx] = -61/30
+            D3x[i, (i+2) % Nx] = 169/120
+            D3x[i, (i+3) % Nx] = -3/10
+            D3x[i, (i+4) % Nx] = 7/240
+    elif bc == 'Neumann':
+        for i in range(Nx):
+            D3x[i, np.abs(i-4)] += -7/240
+            D3x[i, np.abs(i-3)] += 3/10
+            D3x[i, np.abs(i-2)] += -169/120
+            D3x[i, np.abs(i-1)] += 61/30
+            # D3[i,i] = 0
+            D3x[i, Nx -1 - np.abs(Nx -1 - (i+1))] += -61/30
+            D3x[i, Nx -1 - np.abs(Nx -1 - (i+2))] += 169/120
+            D3x[i, Nx -1 - np.abs(Nx -1 - (i+3))] += -3/10
+            D3x[i, Nx -1 - np.abs(Nx -1 - (i+4))] += 7/240
+    else:
+        raise ValueError(f"Boundary conditions {bc} not implemented, try 'periodic' or 'Neumann' ")
+    return sp.sparse.csc_array(D3x/dx**3)
 
 def makeD4(Nx, dx):
     D4x = np.zeros((Nx,Nx))
@@ -658,5 +756,5 @@ def makeD4(Nx, dx):
         D4x[i, (i+2) % Nx] = 169/60
         D4x[i, (i+3) % Nx] = -2/5
         D4x[i, (i+4) % Nx] = 7/240
-    return D4x/dx**4
+    return sp.sparse.csc_array(D4x/dx**4)
     
