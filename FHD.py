@@ -429,7 +429,11 @@ class fhd_2d:
     def grad_utility(self, phi, param):
         """Compute ∇ U = (∇πa + Γa ∇^3ρa) with πa = sum_b kappa_ab * rho_b for each species a."""
         pi = np.tensordot(param['kappa'],phi, axes = (1,0))
-        dUdx  = self.grad(pi) + param['Gamma']*self.grad_lapl(phi)
+        phisqr_ab = np.einsum("aij, bij -> abij", phi, phi)
+        nuterm = np.tensordot(param['nu'], phisqr_ab, axes = ([1,2],[0,1]))
+        Gammaterm = np.tensordot(param['Gamma'], self.grad_lapl(phi), axes=(1,1)).transpose(1,0,2,3)
+        dUdx  = self.grad(pi) + self.grad(nuterm) + Gammaterm
+        
         return dUdx
 
     def div2d(self, vec):
@@ -474,6 +478,49 @@ class fhd_2d:
             divJ += toggle_noise*dnoise_dx
         
         return divJ
+
+    def rhs_SchellingwithVoter(self, phi, param, dt, toggle_noise):
+        """Compute RHS of the equation"""
+
+        phi0   = 1- phi.sum(axis=0)
+        phi0 = phi0.reshape((1,)+self.N)
+        dUdx = self.grad_utility(phi, param)
+        
+        """Compute grad J =  D rho_0 ∂^2 rho - D rho ∂^2 rho_0  - ∂( rho*rho_0 ∂U_a) """
+        rhorho0dUdx = phi*phi0*dUdx
+        lapphi = self.lapl(phi)
+        div_dUdx = self.div2d(rhorho0dUdx) 
+        divJ = param['D']*phi0*lapphi - param['D']*phi*self.lapl(phi0) - param['D']*param['beta']*div_dUdx 
+        divJ[0] += param['lambda']*(phi[1]*lapphi[0] - phi[0]*lapphi[1])
+        divJ[1] += param['lambda']*(phi[0]*lapphi[1] - phi[1]*lapphi[0])
+    
+        """Generate stochastic flux term ∂x( rho ξ )"""
+        if toggle_noise:
+            # Add conservative noise for Voter
+            xi = np.random.normal(0, 1, size= (2,)+phi.shape)
+            if self.bc == 'Neumann':
+                # Set noise to zero on the boundary for Neumann bc's
+                xi[:,:,0,:] = 0
+                xi[:,:,-1,:] = 0
+                xi[:,:,:,0] = 0
+                xi[:,:,:,-1] = 0
+            rho_face     = np.maximum(phi*phi0, self.phi_floor**2) # Changed to noise_floor^2 because phi*phi0 is also a square!
+            noise_flux   = np.sqrt(2*param['D']*self.dx*self.dy*rho_face/dt)*xi # Double check noise flux dx and dt dependence!!
+            dnoise_dx    = self.div2d(noise_flux) 
+            divJ += toggle_noise*dnoise_dx
+
+            # Add demographic noise for Voter model
+            xi2 = np.random.normal(0, 1, size = self.N)
+            # if self.bc == "Neumann":
+            #     xi2[0,:] = 0
+            #     xi2[-1,:] = 0
+            #     xi2[:,0] = 0
+            #     xi2[:,-1] = 0
+            demographic_noise = np.sqrt(4*param['lambda']*phi[0]*phi[1]/dt)*xi2
+            divJ[0] += toggle_noise*demographic_noise
+            divJ[1] -= toggle_noise*demographic_noise
+        
+        return divJ
         
     def w0(self, phi, param):
         D = param["D"]
@@ -481,9 +528,10 @@ class fhd_2d:
         theta = param["theta"]
         Gamma = param["Gamma"]
         kappa = np.array([[theta-1,theta],[theta,theta-1]])
-        pi = np.tensordot(kappa, phi + Gamma/2*self.lapl(phi), axes = (1,0))
+        pi = np.tensordot(kappa, phi, axes = (1,0)) + np.tensordot(Gamma, self.lapl(phi), axes = (1,0))
         w0 = D/(1+np.exp(-beta*pi))
-        grad_pi = np.tensordot(kappa, self.grad(phi) + Gamma/2*self.grad_lapl(phi), axes = (1,1)).transpose(1,0,2,3)
+        grad_pi = np.tensordot(kappa, self.grad(phi), axes = (1,1)).transpose(1,0,2,3)
+        grad_pi += np.tensordot(Gamma, self.grad_lapl(phi), axes = (1,1)).transpose(1,0,2,3)
         gradw0 = D*beta/(2+2*np.cosh(beta*pi))*grad_pi
         laplw0 = self.div2d(gradw0)
         return w0, gradw0, laplw0
@@ -585,6 +633,7 @@ class fhd_2d:
                         'beta':  Inverse temperature, large beta means scricter enforcement of threshold moves
                         'b':     Reaction birth rate
                         'd':     Reaction death rate
+                    "Schelling+Voter"
             verbatum: If True print and plot stuff
 
         Returns:
@@ -605,18 +654,25 @@ class fhd_2d:
                 phi_current = self.step(self.rhs_Vitelli, phi_current, param, dt, toggle_noise, scheme)
             elif model == "Schelling":
                 phi_current = self.step(self.rhs_Schelling, phi_current, param, dt, toggle_noise, scheme)
+            elif model == "Schelling+Voter":
+                phi_current = self.step(self.rhs_SchellingwithVoter, phi_current, param, dt, toggle_noise, scheme)
             else:
                 raise ValueError(f"Model {model} is unknown, please choose 'Vitelli' or 'Schelling'") 
         
             if n % plot_every == 0:
                 if verbatum:
-                    print(f"Step {n}/{nsteps}: mean rho = {phi_current.mean():.6f}, min = {phi_current.min():.6e}, D_index = {dissimilarity(phi_current):.6f}")
+                    print(f"Step {n}/{nsteps}: mean rho = {phi_current.mean():.6f}, min = {phi_current.min():.6e}, D_index = {dissimilarity(phi_current):.6f}, H_index = {mean_relative_entropy(phi_current):.6f}")
                 phi_run[:,n//plot_every,:,:] = phi_current
 
         if verbatum:
             phi_diff = phi_run[0,:,:,:] - phi_run[1,:,:,:]
             im =plt.imshow(phi_diff[-1], cmap = 'RdBu', aspect='auto', origin='lower', extent=[-self.Lx/2,self.Lx/2,-self.Ly/2,self.Ly/2], vmin=-1, vmax=1)
-            plt.title(fr"$D = {param['D']},\, \kappa aa = {param['kappa'][0,0]},\, \kappa ab = {param['kappa'][0,1]},\, \kappa ba = {param['kappa'][1,0]},\, \Gamma = { param['Gamma']}, \, b={param['b']}, \, d={param['d']} $")
+            kappa = param['kappa']
+            D = param['D']
+            Gamma = param['Gamma']
+            D_v = param['lambda']
+            title = fr"$D = {D},\, \kappa = [[{kappa[0,0]:.1f}, {kappa[0,1]:.1f}], [{kappa[1,0]:.1f} , {kappa[1,1]:.1f}]] \,, \Gamma == [[{Gamma[0,0]:.1f}, {Gamma[0,1]:.1f}], [{Gamma[1,0]:.1f} , {Gamma[1,1]:.1f}]], \, D_v = {D_v} $"
+            plt.title(title)
             plt.xlabel("x")
             plt.ylabel("t")
             cbar = plt.colorbar(im, fraction=0.046)
@@ -652,7 +708,7 @@ def mean_relative_entropy(phi):
     Sglobal = - np.sum(global_dist * np.log(global_dist))
     
     kl_divergence = np.sum(phi_combined * np.log(phi_combined / global_dist.reshape((3,)+ len(phi0.shape)*(1,))), axis=0)
-    mean_kl_divergence = np.mean(kl_divergence)/Sglobal
+    mean_kl_divergence = np.mean(kl_divergence)
     
     return mean_kl_divergence
 
