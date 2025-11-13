@@ -188,7 +188,8 @@ class fhd_2d:
         """Compute grad J =  D rho_0 ∂^2 rho - D rho ∂^2 rho_0  - ∂( rho*rho_0 ∂U_a) """
         rhorho0dUdx = phi*phi0*dUdx
         div_dUdx = self.div2d(rhorho0dUdx) 
-        divJ = param['D']*phi0*self.lapl(phi) - param['D']*phi*self.lapl(phi0) - div_dUdx 
+        D = param['D']
+        divJ = np.einsum("a, aij->aij", D, phi0*self.lapl(phi) - phi*self.lapl(phi0)) - div_dUdx 
     
         """Generate stochastic flux term ∂x( rho ξ )"""
         if toggle_noise:
@@ -200,7 +201,8 @@ class fhd_2d:
                 xi[:,:,:,0] = 0
                 xi[:,:,:,-1] = 0
             rho_face     = np.maximum(phi*phi0, self.phi_floor**2) # Changed to noise_floor^2 because phi*phi0 is also a square!
-            noise_flux   = np.sqrt(2*param['D']*self.dx*self.dy*rho_face/dt)*xi # Double check noise flux dx and dt dependence!!
+            noise_term   = np.einsum("a, aij-> aij", param['D'], rho_face)*2*self.dx*self.dy/dt
+            noise_flux   = np.einsum("aij, laij -> laij", np.sqrt(noise_term), xi) 
             dnoise_dx    = self.div2d(noise_flux) 
         
             divJ += toggle_noise*dnoise_dx
@@ -218,9 +220,11 @@ class fhd_2d:
         rhorho0dUdx = phi*phi0*dUdx
         lapphi = self.lapl(phi)
         div_dUdx = self.div2d(rhorho0dUdx) 
-        divJ = param['D']*phi0*lapphi - param['D']*phi*self.lapl(phi0) - param['D']*param['beta']*div_dUdx 
-        divJ[0] += param['D_v']*(phi[1]*lapphi[0] - phi[0]*lapphi[1])
-        divJ[1] += param['D_v']*(phi[0]*lapphi[1] - phi[1]*lapphi[0])
+        D = param['D']
+        divJ = np.einsum("a,aij -> aij", D, phi0*lapphi - phi*self.lapl(phi0) - param['beta']*div_dUdx)
+        voter_current = param['D_v']*(phi[1]*lapphi[0] - phi[0]*lapphi[1])
+        divJ[0] += voter_current
+        divJ[1] += -voter_current
     
         """Generate stochastic flux term ∂x( rho ξ )"""
         if toggle_noise:
@@ -233,7 +237,8 @@ class fhd_2d:
                 xi[:,:,:,0] = 0
                 xi[:,:,:,-1] = 0
             rho_face     = np.maximum(phi*phi0, self.phi_floor**2) # Changed to noise_floor^2 because phi*phi0 is also a square!
-            noise_flux   = np.sqrt(2*param['D']*self.dx*self.dy*rho_face/dt)*xi # Double check noise flux dx and dt dependence!!
+            noise_term   = np.einsum("a, aij-> aij", param['D'], rho_face)*2*self.dx*self.dy/dt
+            noise_flux   = np.einsum("aij, laij -> laij", np.sqrt(noise_term), xi)             
             dnoise_dx    = self.div2d(noise_flux) 
             divJ += toggle_noise*dnoise_dx
 
@@ -244,9 +249,10 @@ class fhd_2d:
             #     xi2[-1,:] = 0
             #     xi2[:,0] = 0
             #     xi2[:,-1] = 0
-            demographic_noise = np.sqrt(4*param['D_v']*phi[0]*phi[1]/dt)*xi2
-            divJ[0] += toggle_noise*demographic_noise
-            divJ[1] -= toggle_noise*demographic_noise
+            rho_face     = np.maximum(phi[0]*phi[1], self.phi_floor**2) # Changed to noise_floor^2 because phi*phi0 is also a square!
+            demographic_noise = np.einsum("ij,ij->ij", np.sqrt(4*param['D_v']*rho_face/dt), xi2)
+            divJ[0] += param['noise_v']*demographic_noise
+            divJ[1] -= param['noise_v']*demographic_noise
         
         return divJ
         
@@ -257,11 +263,11 @@ class fhd_2d:
         sigma = param["sigma"]
         kappa = np.array([[theta-1,theta],[theta,theta-1]])
         Gamma = kappa*sigma**2/2
-        pi = np.tensordot(kappa, phi, axes = (1,0)) + np.tensordot(Gamma, self.lapl(phi), axes = (1,0))
-        w0 = D/(1+np.exp(-beta*pi))
-        grad_pi = np.tensordot(kappa, self.grad(phi), axes = (1,1)).transpose(1,0,2,3)
-        grad_pi += np.tensordot(Gamma, self.grad_lapl(phi), axes = (1,1)).transpose(1,0,2,3)
-        gradw0 = D*beta/(2+2*np.cosh(beta*pi))*grad_pi
+        pi = np.einsum("ab, bij-> aij", kappa, phi) + np.einsum("ab, bij-> aij", Gamma, self.lapl(phi))
+        w0 = np.einsum("a, aij -> aij", D, 1/(1+np.exp(-beta*pi)))
+        grad_pi = np.einsum("ab, lbij-> laij", kappa, self.grad(phi))
+        grad_pi += np.einsum("ab, lbij-> laij", self.grad_lapl(phi))
+        gradw0 = np.einsum("aij, laij -> laij",  np.einsum("a, aij->aij", D, beta/(2+2*np.cosh(beta*pi))) , grad_pi)
         laplw0 = self.div2d(gradw0)
         return w0, gradw0, laplw0
 
@@ -284,8 +290,8 @@ class fhd_2d:
                 xi[:,:,-1,:] = 0
                 xi[:,:,:,0] = 0
                 xi[:,:,:,-1] = 0
-            rho_face     = np.maximum(w0*phi*phi0, 1e-14) # Changed to noise_floor^2 because phi*phi0 is also a square!
-            noise_flux   = np.sqrt(2*self.dx*self.dy*rho_face/dt)*xi # Double check noise flux dx and dt dependence!!
+            rho_face     = np.maximum(w0*phi*phi0, 1e-14) 
+            noise_flux   = np.einsum("aij, laij -> laij", np.sqrt(2*self.dx*self.dy*rho_face/dt), xi)
             dnoise_dx    = self.div2d(noise_flux) 
         
             divJ += toggle_noise*dnoise_dx
@@ -310,17 +316,17 @@ class fhd_2d:
             rho_next = phi + 1/6*(k1 + 2*k2 + 2*k3 + k4)
             # rho_next +=  dt * phi*(param['b']*(1-phi_tot) - param['d'])
         
-        if np.any(rho_next <0):
-            # print("fluctuations made phi[a] negative")
-            rho_next = np.maximum(rho_next,self.phi_floor)
+        # if np.any(rho_next <0):
+        #     # print("fluctuations made phi[a] negative")
+        #     rho_next = np.maximum(rho_next,self.phi_floor)
         
-        if np.any(rho_next>1):
-            # print("fluctuations made phi[a] larger than 1")
-            rho_next = np.minimum(rho_next,1-self.phi_floor)
+        # if np.any(rho_next>1):
+        #     # print("fluctuations made phi[a] larger than 1")
+        #     rho_next = np.minimum(rho_next,1-self.phi_floor)
         
-        if np.any(rho_next.sum(axis=0)>1):
-            rho_next = self.scale_down_pointwise(rho_next)
-            # raise ValueError("Fluctuations made phi0 negative")      
+        # if np.any(rho_next.sum(axis=0)>1):
+        #     rho_next = self.scale_down_pointwise(rho_next)
+        #     # raise ValueError("Fluctuations made phi0 negative")      
         
         return rho_next
 
@@ -350,17 +356,17 @@ class fhd_2d:
             scheme: Numerical integration scheme, choose between forward Euler 'FE' or predictor-corrector 'PC'
             model:  Specify which model to run. Options are: 
                     "Vitelli"  with expected parameters in dictionary param:
-                        'D':     float: diffusion constant
+                        'D':     numpy array of shape (nspecies): diffusion constants for each species
                         'kappa': numpy array of shape (nspecies, nspecies) with linear utility parameters \kappa^{ab} \phi_b
                         'Gamma': numpy array of shape (nspecies, nspecies) for the lapl(phi) term in the utility \Gamma^{ab} \nabla^2 \phi_b
                         'nu':    Optional np.array of shape (nspecies, nspecies, nspecies) for the quadratic term in the utility: nu^{abc} \phi_b \phi_c
                     "Schelling" with expected parameters in dictionary param:
-                        'D':     float: diffusion constant
+                        'D':     numpy array of shape (nspecies): diffusion constants for each species
                         'theta': float: satisfaction threshold (between 0 and 1)
                         'sigma': Coefficient of the lapl(phi) term in pi (sigma^2/2 of the Gaussian neighborhood kernel)
                         'beta':  Inverse temperature, large beta means scricter enforcement of threshold moves
                     "Schelling+Voter" with expected parameters
-                        'D':     float: diffusion constant
+                        'D':     numpy array of shape (nspecies): diffusion constants for each species
                         'kappa': numpy array of shape (nspecies, nspecies) with linear utility parameters \kappa^{ab} \phi_b
                         'Gamma': numpy array of shape (nspecies, nspecies) for the lapl(phi) term in the utility \Gamma^{ab} \nabla^2 \phi_b
                         'nu':    Optional np.array of shape (nspecies, nspecies, nspecies) for the quadratic term in the utility: nu^{abc} \phi_b \phi_c
