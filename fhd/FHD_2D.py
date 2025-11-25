@@ -155,11 +155,11 @@ class fhd_2d:
 
     def grad_utility(self, phi, param):
         """Compute ∇ U = (∇πa + Γa ∇^3ρa) with πa = sum_b kappa_ab * rho_b for each species a."""
-        pi = np.tensordot(param['kappa'],phi, axes = (1,0))
-        Gammaterm = np.tensordot(param['Gamma'], self.grad_lapl(phi), axes=(1,1)).transpose(1,0,2,3)
+        pi = np.einsum("ab, bij -> aij", param['kappa'],phi)
+        Gammaterm = np.einsum("ab, xbij -> xaij", param['Gamma'], self.grad_lapl(phi))
         if 'nu' in param:
             phisqr_ab = np.einsum("aij, bij -> abij", phi, phi)
-            nuterm = np.tensordot(param['nu'], phisqr_ab, axes = ([1,2],[0,1]))
+            nuterm = np.einsum("abc, bcij-> aij", param['nu'], phisqr_ab, axes = ([1,2],[0,1]))
             return self.grad(pi) + self.grad(nuterm) + Gammaterm
         else:
             return self.grad(pi) + Gammaterm
@@ -251,8 +251,11 @@ class fhd_2d:
             #     xi2[:,-1] = 0
             rho_face     = np.maximum(phi[0]*phi[1], self.phi_floor**2) # Changed to noise_floor^2 because phi*phi0 is also a square!
             demographic_noise = np.einsum("ij,ij->ij", np.sqrt(4*param['D_v']*rho_face/dt), xi2)
-            divJ[0] += param['noise_v']*demographic_noise
-            divJ[1] -= param['noise_v']*demographic_noise
+            
+            noise_ceiling = np.maximum(-phi[0]/dt,param['noise_v']*demographic_noise)
+            noise_floor = np.minimum(noise_ceiling, phi[1]/dt)
+            divJ[0] += noise_floor
+            divJ[1] -= noise_floor
         
         return divJ
         
@@ -266,7 +269,7 @@ class fhd_2d:
         pi = np.einsum("ab, bij-> aij", kappa, phi) + np.einsum("ab, bij-> aij", Gamma, self.lapl(phi))
         w0 = np.einsum("a, aij -> aij", D, 1/(1+np.exp(-beta*pi)))
         grad_pi = np.einsum("ab, lbij-> laij", kappa, self.grad(phi))
-        grad_pi += np.einsum("ab, lbij-> laij", self.grad_lapl(phi))
+        grad_pi += np.einsum("ab, lbij-> laij", Gamma, self.grad_lapl(phi))
         gradw0 = np.einsum("aij, laij -> laij",  np.einsum("a, aij->aij", D, beta/(2+2*np.cosh(beta*pi))) , grad_pi)
         laplw0 = self.div2d(gradw0)
         return w0, gradw0, laplw0
@@ -316,17 +319,17 @@ class fhd_2d:
             rho_next = phi + 1/6*(k1 + 2*k2 + 2*k3 + k4)
             # rho_next +=  dt * phi*(param['b']*(1-phi_tot) - param['d'])
         
-        # if np.any(rho_next <0):
-        #     # print("fluctuations made phi[a] negative")
-        #     rho_next = np.maximum(rho_next,self.phi_floor)
+        if np.any(rho_next <0):
+            # print("fluctuations made phi[a] negative")
+            rho_next = np.maximum(rho_next,self.phi_floor)
         
-        # if np.any(rho_next>1):
-        #     # print("fluctuations made phi[a] larger than 1")
-        #     rho_next = np.minimum(rho_next,1-self.phi_floor)
+        if np.any(rho_next>1):
+            # print("fluctuations made phi[a] larger than 1")
+            rho_next = np.minimum(rho_next,1-self.phi_floor)
         
-        # if np.any(rho_next.sum(axis=0)>1):
-        #     rho_next = self.scale_down_pointwise(rho_next)
-        #     # raise ValueError("Fluctuations made phi0 negative")      
+        if np.any(rho_next.sum(axis=0)>1):
+            rho_next = self.scale_down_pointwise(rho_next)
+            # raise ValueError("Fluctuations made phi0 negative")      
         
         return rho_next
 
@@ -395,7 +398,7 @@ class fhd_2d:
             elif model == "Schelling+Voter":
                 phi_current = self.step(self.rhs_SchellingwithVoter, phi_current, param, dt, toggle_noise, scheme)
             else:
-                raise ValueError(f"Model {model} is unknown, please choose 'Vitelli' or 'Schelling'") 
+                raise ValueError(f"Model {model} is unknown, please choose 'Vitelli', 'Schelling' or 'Schelling+Voter'") 
         
             if n % plot_every == 0:
                 if verbatum:
@@ -409,7 +412,7 @@ class fhd_2d:
             D = param['D']
             Gamma = param['Gamma']
             D_v = param['D_v']
-            title = fr"$D = {D},\, \kappa = [[{kappa[0,0]:.1f}, {kappa[0,1]:.1f}], [{kappa[1,0]:.1f} , {kappa[1,1]:.1f}]] \,, \Gamma == [[{Gamma[0,0]:.1f}, {Gamma[0,1]:.1f}], [{Gamma[1,0]:.1f} , {Gamma[1,1]:.1f}]], \, D_v = {D_v} $"
+            title = fr"$D = [{D[0]:.1f}, {D[1]:.1f}],\, \kappa = [[{kappa[0,0]:.1f}, {kappa[0,1]:.1f}], [{kappa[1,0]:.1f} , {kappa[1,1]:.1f}]] \,, \Gamma = [[{Gamma[0,0]:.1f}, {Gamma[0,1]:.1f}], [{Gamma[1,0]:.1f} , {Gamma[1,1]:.1f}]], \, D_v = {D_v} $"
             plt.title(title)
             plt.xlabel("x")
             plt.ylabel("t")
