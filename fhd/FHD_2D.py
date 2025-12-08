@@ -159,7 +159,7 @@ class fhd_2d:
         Gammaterm = np.einsum("ab, xbij -> xaij", param['Gamma'], self.grad_lapl(phi))
         if 'nu' in param:
             phisqr_ab = np.einsum("aij, bij -> abij", phi, phi)
-            nuterm = np.einsum("abc, bcij-> aij", param['nu'], phisqr_ab, axes = ([1,2],[0,1]))
+            nuterm = np.einsum("abc, bcij-> aij", param['nu'], phisqr_ab)
             return self.grad(pi) + self.grad(nuterm) + Gammaterm
         else:
             return self.grad(pi) + Gammaterm
