@@ -33,6 +33,32 @@ def mean_relative_entropy(phi):
     
     return mean_kl_divergence
 
+def entropy_index(phi):
+    '''
+    Computes the entropy index of a field configuration. The entropy index is computed as:
+
+    S_H = 1/H \sum_i f_i h_i
+
+    where:
+        i is the label for the discretized region
+        f_i is the local fraction of occupants in the region
+        h_i is the relative entropy between the local population composition and the global composition
+        H is the Shannon entropy of the global composition
+    '''
+    phi_tot = np.sum(phi, axis=0)
+    global_dist = np.array([phi[0].mean(), phi[1].mean()])/np.sum(phi, axis = 0).mean()
+    
+    # Ensure no division by zero or log of zero
+    global_dist = np.clip(global_dist, 1e-10, None)
+    p_clipped = np.clip(phi/phi.sum(axis=0), 1e-10, None)
+    H = - np.sum(global_dist * np.log(global_dist))
+    
+    kl_divergence = np.sum(p_clipped * np.log(p_clipped / global_dist.reshape((2,)+ len(phi_tot.shape)*(1,))), axis=0)
+    
+    f_i = phi_tot/np.sum(phi_tot)
+    S_H = 1/H*np.sum(f_i*kl_divergence)
+    return S_H
+
 def makeD(Nx,dx, bc = "periodic"):
     Dx = np.zeros((Nx, Nx))
     # 1/280	−4/105	1/5	−4/5	0	4/5	−1/5	4/105	−1/280	\
