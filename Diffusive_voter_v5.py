@@ -117,8 +117,8 @@ def utility_and_hypothetical_utility_flat(x, neighbors,
             laplacian_minus[i] = -4.0 + n_minus[i]
             laplacian_plus[i] = n_plus[i]
         else:
-            laplacian_minus[i] = n_minus[i]
-            laplacian_plus[i] = n_plus[i]
+            laplacian_minus[i] =-4+ n_minus[i]
+            laplacian_plus[i] =-4+ n_plus[i]
 
     # 3) compute pi_plus, pi_minus, pi
     pi_plus = np.empty(N, dtype=np.float64)
@@ -160,11 +160,11 @@ def utility_and_hypothetical_utility_flat(x, neighbors,
                 owner[pos]    = i
                 # contribution if moved to j depends on what spin i has
                 if x[i] == 1: #we have not consider the new local configuration as the move happens
-                    pi_plus_vacant = pi_plus[j]  - 4*Gamma_aa # 5 comes from -4 *(n==1) and -1 of reducing 1 plus meighbor
+                    pi_plus_vacant = pi_plus[j] - (kappa_aa + Gamma_aa)  # 5 comes from -4 *(n==1) and -1 of reducing 1 plus meighbor
                     delta_flat[pos] = pi_plus_vacant - pi[i]
                 else:
                     # x[i] == -1 expected (we skipped x[i]==0 above)
-                    pi_minus_vacant = pi_minus[j] - 4*Gamma_bb
+                    pi_minus_vacant = pi_minus[j] - (kappa_bb + Gamma_bb)
                     delta_flat[pos] = pi_minus_vacant- pi[i]
                 pos += 1
 
