@@ -29,7 +29,7 @@ def mean_relative_entropy(phi):
     Sglobal = - np.sum(global_dist * np.log(global_dist))
     
     kl_divergence = np.sum(phi_combined * np.log(phi_combined / global_dist.reshape((3,)+ len(phi0.shape)*(1,))), axis=0)
-    mean_kl_divergence = np.mean(kl_divergence)
+    mean_kl_divergence = np.mean(kl_divergence)/Sglobal
     
     return mean_kl_divergence
 
