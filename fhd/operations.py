@@ -161,26 +161,36 @@ def makeD4(Nx, dx):
         D4x[i, (i+4) % Nx] = 7/240
     return sp.sparse.csc_array(D4x/dx**4)
 
-def power_spectrum(phi_run, L,  num_bins=50, averaged = True, bp = 0):
+def power_spectrum(phi_run, L,  num_bins=50, averaged = True, bp = 0, centered = True):
     '''Compute the angle averaged power spectrum for a run, averaged over timeseries from until the end bp:'''
     Nx, Ny = phi_run.shape[2:]
     Lx, Ly = L
     dx, dy = Lx / Nx, Ly / Ny
 
     if not averaged:
-        bp = -2
+        bp = -1
+
+    if centered:
+        fields = phi_run[:,bp:,:,:] - phi_run[:,bp:,:,:].mean(axis=(2,3))[:,:,np.newaxis,np.newaxis]
+        phi_empty = 1 - phi_run[:,bp:,:,:].sum(axis=0)
+        phi_empty = phi_empty - phi_empty.mean(axis=(1,2))[:,np.newaxis,np.newaxis]
+    else:
+        fields = phi_run[:,bp:,:,:]
+        phi_empty = 1 - phi_run[:,bp:,:,:].sum(axis=0)
         
-    fields = phi_run[:,bp:,:,:]
-    phi_empty = 1 - phi_run[:,bp:,:,:].sum(axis=0)
     fields = np.concatenate((fields, phi_empty[np.newaxis,:,:,:]), axis=0)
 
     # Fourier Transform
     phi_k = np.fft.fft2(fields, axes=(2, 3))
 
     # Power Spectrum
-    power_spectrum = np.abs(phi_k)**2
+    power_spectrum = np.einsum("atij, atij -> atij", np.conjugate(phi_k), phi_k).real
+    G_AB = (np.conjugate(phi_k[0])*phi_k[1]).real
+    # G_BA = (np.conjugate(phi_k[1])*phi_k[0]).real
+    
     # average along time axis
     power_spectrum = power_spectrum.mean(axis=1)
+    G_AB = G_AB.mean(axis=0)
 
     # Compute wave numbers
     kx = np.fft.fftfreq(Nx, d=dx)*2*np.pi
@@ -194,12 +204,64 @@ def power_spectrum(phi_run, L,  num_bins=50, averaged = True, bp = 0):
     k_bin_centers = 0.5 * (k_bins[1:] + k_bins[:-1])
     
     power_spectra = np.zeros((power_spectrum.shape[0], len(k_bin_centers)))
+    G = np.zeros(len(k_bin_centers))
     
+    for a in range(power_spectrum.shape[0]):
+        power_spectrum_flat = power_spectrum[a].ravel()
+        G_AB_flat = G_AB.ravel()
+        for i in range(len(k_bin_centers)):
+            mask = (k_flat >= k_bins[i]) & (k_flat < k_bins[i+1])
+            power_spectra[a,i] = np.mean(power_spectrum_flat[mask])
+            G[i] = np.mean(G_AB_flat[mask])
+        
+    # return k_bin_centers, power_spectra
+    return k_bin_centers, power_spectra, G
+    
+def power_spectrum_1d(phi_run, L,  num_bins=50, averaged = True, bp = 0):
+    '''Compute the angle averaged power spectrum for a run, averaged over timeseries from until the end bp:
+    1D version of the code above'''
+    N = phi_run.shape[2]
+    dx = L / N
+
+    if not averaged:
+        bp = -1
+        
+    fields = phi_run[:,bp:,:]
+    phi_empty = 1 - phi_run[:,bp:,:].sum(axis=0)
+    fields = np.concatenate((fields, phi_empty[np.newaxis,:,:]), axis=0)
+
+    fields_fluct = fields - np.mean(fields, axis = (1,2))[:,np.newaxis,np.newaxis]
+    # Fourier Transform
+    phi_k = np.fft.fft(fields_fluct)
+
+    # Power Spectrum
+    power_spectrum = np.abs(phi_k)**2
+    S_ab = np.mean((phi_k[0]*np.conj(phi_k[1])).real, axis=0)
+    # average along time axis
+    power_spectrum = power_spectrum.mean(axis=1)
+
+    # Compute wave numbers
+    kx = np.fft.fftfreq(N, d=dx)*2*np.pi
+    k = np.sqrt(kx**2)
+
+    # Angle-Averaged Power Spectrum
+    k_flat = k.ravel()
+    k_bins = np.linspace(0, np.max(k), num_bins)
+    k_bin_centers = 0.5 * (k_bins[1:] + k_bins[:-1])
+
+    S_ab_spectrum = np.zeros(len(k_bin_centers))
+    power_spectra = np.zeros((power_spectrum.shape[0], len(k_bin_centers)))
+
     for a in range(power_spectrum.shape[0]):
         power_spectrum_flat = power_spectrum[a].ravel()
         for i in range(len(k_bin_centers)):
             mask = (k_flat >= k_bins[i]) & (k_flat < k_bins[i+1])
             power_spectra[a,i] = np.mean(power_spectrum_flat[mask])
-        
-    return k_bin_centers, power_spectra
     
+    S_ab_flat = S_ab.ravel()
+    for i in range(len(k_bin_centers)):
+        mask = (k_flat >= k_bins[i]) & (k_flat < k_bins[i+1])
+        S_ab_spectrum[i] = np.mean(S_ab_flat[mask])
+        
+
+    return k_bin_centers, power_spectra, S_ab_spectrum

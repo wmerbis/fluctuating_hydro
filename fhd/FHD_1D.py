@@ -147,17 +147,21 @@ class fhd:
     
         """Generate stochastic flux term ∂x( rho ξ )"""
         if toggle_noise:
+            if 'h' in param:
+                h = param['h']
+            else:
+                h = self.dx
             xi = np.random.normal(0, 1, size= phi.shape)
             if self.bc == "Neumann":
                 # Set noise to zero on the boundary for Neumann bc's
                 xi[:,0] = 0
                 xi[:,-1] = 0
             rho_face     = np.maximum(phi*phi0, self.phi_floor**2) # Changed to noise_floor^2 because phi*phi0 is also a square!
-            noise_term   = np.einsum("a, ai-> ai", D, rho_face)*2*self.dx/dt
+            noise_term   = np.einsum("a, ai-> ai", D, rho_face)*2*h/dt
             noise_flux   = np.einsum("ai, ai -> ai", np.sqrt(noise_term), xi) 
             dnoise_dx    = self.grad(noise_flux)
         
-            divJ += toggle_noise*dnoise_dx
+            divJ += dnoise_dx
         
         return divJ
 
@@ -188,16 +192,20 @@ class fhd:
     
         """Generate stochastic flux term ∂x( rho ξ )"""
         if toggle_noise:
+            if 'h' in param:
+                h = param['h']
+            else:
+                h = self.dx
             xi = np.random.normal(0, 1, size= phi.shape)
             if self.bc == "Neumann":
                 # Set noise to zero on the boundary for Neumann bc's
                 xi[:,0] = 0
                 xi[:,-1] = 0
-            rho_face     = np.maximum(w0*phi*phi0, 1e-15) 
-            noise_flux   = np.sqrt(2*self.dx*rho_face/dt)*xi # Double check noise flux dx and dt dependence!!
+            rho_face     = np.maximum(w0*phi*phi0, self.phi_floor**2) 
+            noise_flux   = np.sqrt(2*h*rho_face/dt)*xi # Double check noise flux dx and dt dependence!!
             dnoise_dx    = self.grad(noise_flux)
         
-            divJ += toggle_noise*dnoise_dx
+            divJ += dnoise_dx
         
         return divJ
     
@@ -220,6 +228,10 @@ class fhd:
     
         """Generate stochastic flux term ∂x( rho ξ )"""
         if toggle_noise:
+            if 'h' in param:
+                h = param['h']
+            else:
+                h = self.dx
             # Add conservative noise for Voter
             xi = np.random.normal(0, 1, size= phi.shape)
             if self.bc == "Neumann":
@@ -227,10 +239,10 @@ class fhd:
                 xi[:,0] = 0
                 xi[:,-1] = 0
             rho_face     = np.maximum(phi*phi0, self.phi_floor**2) # Changed to noise_floor^2 because phi*phi0 is also a square!
-            noise_term   = np.einsum("a, ai-> ai", D, rho_face)*2*self.dx/dt
+            noise_term   = np.einsum("a, ai-> ai", D, rho_face)*2*h/dt
             noise_flux   = np.einsum("ai, ai -> ai", np.sqrt(noise_term), xi)             
             dnoise_dx    = self.grad(noise_flux) 
-            divJ += toggle_noise*dnoise_dx
+            divJ += dnoise_dx
 
             # Add demographic noise for Voter model
             xi2 = np.random.normal(0, 1, size = self.N)
@@ -240,7 +252,7 @@ class fhd:
             #     xi2[:,0] = 0
             #     xi2[:,-1] = 0
             rho_face     = np.maximum(phi[0]*phi[1], self.phi_floor**2) # Changed to noise_floor^2 because phi*phi0 is also a square!
-            demographic_noise = np.einsum("i,i->i", np.sqrt(4*param['D_v']*rho_face/dt), xi2)
+            demographic_noise = np.einsum("i,i->i", np.sqrt(4*param['D_v']*rho_face/dt/h), xi2)
             
             noise_ceiling = np.maximum(-phi[0]/dt,param['noise_v']*demographic_noise)
             noise_floor = np.minimum(noise_ceiling, phi[1]/dt)

@@ -1,20 +1,24 @@
 """
-1D implementation of sociohydrodynamic models based on Schelling's model.
+2D implementation of sociohydrodynamic models based on Schelling's model and combined with the Voter model.
 
 Model "Vitelli" incorporates a noisy version of the model presented in Seara et.al 2025. With local density phi_a 
 of agents of type a evolving as:
 
-∂t phi_a = ∂x [D phi_0 ∂x phi_a - D phi_a ∂x + phi_a phi_0 ∂x pi_a +  sqrt(2D dx^d phi_a phi_0) Z] + R(phi)
+∂t phi_a = \nabla  [D^a phi_0 \nabla phi_a - D^a phi_a \nabla  phi_0 + D^a \beta phi_a phi_0 \nabla  pi_a +  sqrt(2D^a h^2 phi_a phi_0) Z] 
 
 with: 
 phi_0 = 1 - sum_b phi_b (density of vacant sites) 
 Z Gaussian white noise
-R(phi) implements a voter model with mean-field equation ∂t phi_a = phi*(b*pho_0 - d) with b and d birth and death rates respectively
+pi_a = is the Gradient of a utility function U^a, such that:
+pi_a = \nabla U^a = \nabla [ \sum_b \kappa^{ab} \phi_b + \sum_{b, c} \nu^{abc} \phi_b \phi_c + \sum_b \Gamma^{ab} \nabla^2 \phi_b ]
+D^a is the type dependent Schelling diffusion constant
+\beta is the inverse temperature controlling the strength of the utility gradient on the diffusion process
+h is the microscopic lattice spacing (zero for the strict thermodynamic limit)
 
 Model "Schelling" implements Schelling type rules where agents only diffuse if the fraction of like agents is below a threshold theta.
 In that case the dynamical equations become:
 
-∂t phi_a =   w0 (phi_0 ∂^2 phi_a - phi_a ∂^2 phi_0)  + phi_a * phi_0 * ∂^2 w0 + 2 phi_0 ∂ w0 . ∂ phi_a ) +  ∂[sqrt(2 w0 dx^d phi_a phi_0) Z] + R(phi)
+∂t phi_a =   w0 (phi_0 ∂^2 phi_a - phi_a ∂^2 phi_0)  + phi_a * phi_0 * ∂^2 w0 + 2 phi_0 ∂ w0 . ∂ phi_a ) +  ∂[sqrt(2 w0 h^2 phi_a phi_0) Z] + R(phi)
 
 with:
 w0 = D/ (1+ e^(-\beta \pi)) density dependent diffusion term
@@ -23,10 +27,10 @@ Z Gaussian white noise
 R(phi) implements a voter model with mean-field equation ∂t phi_a = phi*(b*pho_0 - d) with b and d birth and death rates respectively
 
 Features:
-- Two class objects: fhd for 1D, fhd_2d for 2D
+- A class object fhd_2d for 2D (see FHD_1D.py for 1D version of the code)
 - Positivity floor for densities
 - multiplicative conservative noise ~ sqrt(phi_a phi_0), turn on by passing non-zero "toggle_noise"
-- numerical differentiation by fft, when passing "fft = False" when initializing the class objects derivatives are computed using finite difference 
+- numerical differentiation by fft, derivatives are computed using finite differences when passing "fft = False".
 
 Authors: Tuan Pham and Wout Merbis
 """
@@ -41,7 +45,7 @@ import scipy as sp
 from .operations import *
 
 class fhd_2d:
-    '''Defines the 1-D fluctuating hydrodynamics class for simulating the sociohydrodynamic equations including noise and reactions:
+    '''Defines the 2-D fluctuating hydrodynamics class for simulating the sociohydrodynamic equations including noise and reactions:
 
     '''
     def __init__(self, L, N, bc = "periodic", fft = False):
@@ -49,10 +53,10 @@ class fhd_2d:
         Initializes instance of the fhd class object
 
         Args:
-            L:  tuple (Lx, Ly): spatial lengths of the domain, coordinates will be defined as running from -L/2 to L/2
-            N:  tuple (Nx, Ny): number of discretization steps per coordinate
-            bc: boundary conditions, choose among "periodic", "Neumann" or "Dirichlet"
-                (note: latter two are to be implemented
+            L:   tuple (Lx, Ly): spatial lengths of the domain, coordinates will be defined as running from -L/2 to L/2
+            N:   tuple (Nx, Ny): number of discretization steps per coordinate
+            bc:  boundary conditions, choose "periodic" or "Neumann"
+            fft: Bool: when True derivatives are computed using FFT (only compatible with periodic bc's)
         '''
         self.N = N
         self.L = L
@@ -85,7 +89,7 @@ class fhd_2d:
         self.phi_floor = 1e-14
         self.nspecies = 2
 
-        # Matrixces Dx and Dy for 8-th order finite differences, needed for divergence function below
+        # Matrices Dx and Dy for 8-th order finite differences, needed for divergence function below
         self.Dx = makeD(self.Nx, self.dx, self.bc)
         self.Dy = makeD(self.Ny, self.dy, self.bc)
         if not fft:
@@ -96,7 +100,7 @@ class fhd_2d:
             self.D3y = makeD3(self.Ny, self.dy, self.bc)
         
     def scale_down_pointwise(self, phi):
-        ''' Scales down phi[a] on sites where sum_a phi[a] < 1
+        ''' Scales down phi[a] on sites where sum_a phi[a] > 1
         '''
         sumphi = np.sum(phi, axis=0)
         divisor = np.maximum(sumphi+self.phi_floor,1)
@@ -193,6 +197,11 @@ class fhd_2d:
     
         """Generate stochastic flux term ∂x( rho ξ )"""
         if toggle_noise:
+            if 'h' in param:
+                h = param['h']
+            else:
+                h = np.sqrt(self.dx*self.dy)
+
             xi = np.random.normal(0, 1, size= (2,)+phi.shape)
             if self.bc == 'Neumann':
                 # Set noise to zero on the boundary for Neumann bc's
@@ -201,11 +210,11 @@ class fhd_2d:
                 xi[:,:,:,0] = 0
                 xi[:,:,:,-1] = 0
             rho_face     = np.maximum(phi*phi0, self.phi_floor**2) # Changed to noise_floor^2 because phi*phi0 is also a square!
-            noise_term   = np.einsum("a, aij-> aij", param['D'], rho_face)*2*self.dx*self.dy/dt
-            noise_flux   = np.einsum("aij, laij -> laij", np.sqrt(noise_term), xi) 
+            noise_term   = np.einsum("a, aij-> aij", param['D'], rho_face)*2/dt
+            noise_flux   = np.einsum("aij, laij -> laij", h*np.sqrt(noise_term), xi) 
             dnoise_dx    = self.div2d(noise_flux) 
         
-            divJ += toggle_noise*dnoise_dx
+            divJ += dnoise_dx
         
         return divJ
 
@@ -229,6 +238,10 @@ class fhd_2d:
         """Generate stochastic flux term ∂x( rho ξ )"""
         if toggle_noise:
             # Add conservative noise for Voter
+            if 'h' in param:
+                h = param['h']
+            else:
+                h = np.sqrt(self.dx*self.dy)
             xi = np.random.normal(0, 1, size= (2,)+phi.shape)
             if self.bc == 'Neumann':
                 # Set noise to zero on the boundary for Neumann bc's
@@ -237,10 +250,10 @@ class fhd_2d:
                 xi[:,:,:,0] = 0
                 xi[:,:,:,-1] = 0
             rho_face     = np.maximum(phi*phi0, self.phi_floor**2) # Changed to noise_floor^2 because phi*phi0 is also a square!
-            noise_term   = np.einsum("a, aij-> aij", param['D'], rho_face)*2*self.dx*self.dy/dt
-            noise_flux   = np.einsum("aij, laij -> laij", np.sqrt(noise_term), xi)             
+            noise_term   = np.einsum("a, aij-> aij", param['D'], rho_face)*2/dt
+            noise_flux   = np.einsum("aij, laij -> laij", h*np.sqrt(noise_term), xi)             
             dnoise_dx    = self.div2d(noise_flux) 
-            divJ += toggle_noise*dnoise_dx
+            divJ += dnoise_dx
 
             # Add demographic noise for Voter model
             xi2 = np.random.normal(0, 1, size = self.N)
@@ -286,6 +299,10 @@ class fhd_2d:
     
         """Generate stochastic flux term ∂x( rho ξ )"""
         if toggle_noise:
+            if 'h' in param:
+                h = param['h']
+            else:
+                h = np.sqrt(self.dx*self.dy)
             xi = np.random.normal(0, 1, size= (2,) + phi.shape)
             if self.bc == 'Neumann':
                 # Set noise to zero on the boundary for Neumann bc's
@@ -294,10 +311,10 @@ class fhd_2d:
                 xi[:,:,:,0] = 0
                 xi[:,:,:,-1] = 0
             rho_face     = np.maximum(w0*phi*phi0, 1e-14) 
-            noise_flux   = np.einsum("aij, laij -> laij", np.sqrt(2*self.dx*self.dy*rho_face/dt), xi)
+            noise_flux   = np.einsum("aij, laij -> laij", h*np.sqrt(2*rho_face/dt), xi)
             dnoise_dx    = self.div2d(noise_flux) 
         
-            divJ += toggle_noise*dnoise_dx
+            divJ += dnoise_dx
         
         return divJ
         
