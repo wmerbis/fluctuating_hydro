@@ -419,9 +419,106 @@ class fhd_2d:
         
             if n % plot_every == 0:
                 if verbatum:
-                    print(f"Step {n}/{nsteps}: mean rho = {phi_current.mean():.6f}, min = {phi_current.min():.6e}, D_index = {dissimilarity(phi_current):.6f}, H_index = {mean_relative_entropy(phi_current):.6f}")
+                    print(f"Step {n}/{nsteps}: mean rho = {phi_current.mean():.6f}, min = {phi_current.min():.6e}, KL_divergence = {dissimilarity(phi_current):.6f}, H_index = {mean_relative_entropy(phi_current):.6f}")
                 phi_run[:,n//plot_every,:,:] = phi_current
 
+        if verbatum:
+            phi_diff = phi_run[0,:,:,:] - phi_run[1,:,:,:]
+            im =plt.imshow(phi_diff[-1], cmap = 'RdBu', aspect='auto', origin='lower', extent=[-self.Lx/2,self.Lx/2,-self.Ly/2,self.Ly/2], vmin=-1, vmax=1)
+            kappa = param['kappa']
+            D = param['D']
+            Gamma = param['Gamma']
+            D_v = param['D_v']
+            title = fr"$D = [{D[0]:.1f}, {D[1]:.1f}],\, \kappa = [[{kappa[0,0]:.1f}, {kappa[0,1]:.1f}], [{kappa[1,0]:.1f} , {kappa[1,1]:.1f}]] \,, \Gamma = [[{Gamma[0,0]:.1f}, {Gamma[0,1]:.1f}], [{Gamma[1,0]:.1f} , {Gamma[1,1]:.1f}]], \, D_v = {D_v} $"
+            plt.title(title)
+            plt.xlabel("x")
+            plt.ylabel("t")
+            cbar = plt.colorbar(im, fraction=0.046)
+            cbar.set_label(r"$\phi_a - \phi_b$",size=14)
+            plt.show()
+            
+        return phi_run
+    
+    def run_until_converged(self, phi, param, dt, toggle_noise, 
+            save_every = 500,
+            scheme = "FE", 
+            model = "Vitelli",
+            verbatum = True):
+        ''' Runs the FHD simulation with specified parameters until converged, recording every save_every timesteps.
+
+        Arg:
+            phi:    Initial condition for phi, should have shape (nspecies, N)
+            param:  Dictionary with parameter settings, see 'model' below for expected parameters
+            dt:     Size of the time step
+            toggle_noise: strength of noise term, if zero, no noise is used
+            no_frames: Number of frames saved in the final np. array
+            scheme: Numerical integration scheme, choose between forward Euler 'FE' or predictor-corrector 'PC'
+            model:  Specify which model to run. Options are: 
+                    "Vitelli"  with expected parameters in dictionary param:
+                        'D':     numpy array of shape (nspecies): diffusion constants for each species
+                        'kappa': numpy array of shape (nspecies, nspecies) with linear utility parameters \kappa^{ab} \phi_b
+                        'Gamma': numpy array of shape (nspecies, nspecies) for the lapl(phi) term in the utility \Gamma^{ab} \nabla^2 \phi_b
+                        'nu':    Optional np.array of shape (nspecies, nspecies, nspecies) for the quadratic term in the utility: nu^{abc} \phi_b \phi_c
+                    "Schelling" with expected parameters in dictionary param:
+                        'D':     numpy array of shape (nspecies): diffusion constants for each species
+                        'theta': float: satisfaction threshold (between 0 and 1)
+                        'sigma': Coefficient of the lapl(phi) term in pi (sigma^2/2 of the Gaussian neighborhood kernel)
+                        'beta':  Inverse temperature, large beta means scricter enforcement of threshold moves
+                    "Schelling+Voter" with expected parameters
+                        'D':     numpy array of shape (nspecies): diffusion constants for each species
+                        'kappa': numpy array of shape (nspecies, nspecies) with linear utility parameters \kappa^{ab} \phi_b
+                        'Gamma': numpy array of shape (nspecies, nspecies) for the lapl(phi) term in the utility \Gamma^{ab} \nabla^2 \phi_b
+                        'nu':    Optional np.array of shape (nspecies, nspecies, nspecies) for the quadratic term in the utility: nu^{abc} \phi_b \phi_c
+                        'D_v':   float: coefficient for voter model diffusion term
+                        'noise_v': float: strength of voter model noise (default is one)
+            verbatum: If True print and plot stuff
+
+        Returns:
+            phi_run: numpy array of shape (nspecies, frames+1, N) with the simulation timeseries
+                    
+        '''
+        plot_every = save_every
+        phi = self.scale_down(phi)
+        phi = np.maximum(phi, self.phi_floor)
+        
+        phi_current = phi.copy()
+        phi_run = [phi_current]
+        
+        converged = False
+        eps_mean = 1e-3
+        # eps_Fano = 1e-2
+        T = 100
+        K = 50
+
+        DKL = []
+        Dis_idx = []
+        H_idx = []
+        n = 0
+
+        while not converged:
+            # print("step", n)
+            n+=1
+            if model == "Vitelli":
+                phi_current = self.step(self.rhs_Vitelli, phi_current, param, dt, toggle_noise, scheme)
+            elif model == "Schelling":
+                phi_current = self.step(self.rhs_Schelling, phi_current, param, dt, toggle_noise, scheme)
+            elif model == "Schelling+Voter":
+                phi_current = self.step(self.rhs_SchellingwithVoter, phi_current, param, dt, toggle_noise, scheme)
+            else:
+                raise ValueError(f"Model {model} is unknown, please choose 'Vitelli', 'Schelling' or 'Schelling+Voter'") 
+        
+            if n % plot_every == 0:
+                Dis_idx.append(dissimilarity(phi_current))
+                DKL.append(mean_relative_entropy(phi_current))
+                if verbatum:
+                    print(f"Step {n}: mean rho = {phi_current.mean():.6f}, min = {phi_current.min():.6e}, D_index = {Dis_idx[-1]:.6f}, KL_divergence = {DKL[-1]:.6f}")
+                phi_run.append(phi_current)
+
+                if len(DKL)>T+K:
+                    converged = check_convergence([Dis_idx, DKL], T, eps_mean, K)
+
+        phi_run = np.array(phi_run).transpose(1,0,2,3)
+        
         if verbatum:
             phi_diff = phi_run[0,:,:,:] - phi_run[1,:,:,:]
             im =plt.imshow(phi_diff[-1], cmap = 'RdBu', aspect='auto', origin='lower', extent=[-self.Lx/2,self.Lx/2,-self.Ly/2,self.Ly/2], vmin=-1, vmax=1)

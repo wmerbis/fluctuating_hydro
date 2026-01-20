@@ -265,3 +265,22 @@ def power_spectrum_1d(phi_run, L,  num_bins=50, averaged = True, bp = 0):
         
 
     return k_bin_centers, power_spectra, S_ab_spectrum
+
+
+def check_convergence(Obs_list, T, eps_mean = 1e-3, K = 50):
+    """ Checks whether the change in running averages of the mean and Fano factors of all observables in Obs_list 
+    are below the specified eps_mean and eps_Fano for the last K samples.
+    """
+    criteria = []
+    for Obs in Obs_list:
+        Obs_sliding = np.array([np.mean(Obs[t:t+T]) for t in range(len(Obs)-T)])
+        # var_sliding = np.array([np.var(Obs[t:t+T]) for t in range(len(Obs)-T)])
+        # Fano = var_sliding/Obs_sliding
+
+        mean_check = np.abs(Obs_sliding[1:]-Obs_sliding[:-1])/Obs_sliding[:-1]
+        criteria.append(mean_check[-K:] < eps_mean)
+
+        # Fano_check = np.abs(Fano[1:]-Fano[:-1])/Fano[:-1] 
+        # criteria.append(Fano[-K:] < eps_Fano)
+            
+    return np.all(criteria)
