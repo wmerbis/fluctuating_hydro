@@ -4,43 +4,40 @@ import numpy as np
 from numba import njit, prange, typed
 from numpy.fft import fft2, ifft2, fftshift
 
-outdir = "results_kappa_scan_h01_Dv01"
+outdir = "results_Dv_scan"
 os.makedirs(outdir, exist_ok=True)
 
-h  = 0.1
-Dv = 0.1
+h  = 1
 # --- Fixed Parameters ---
 where_to_start =5
-kappa_vals = np.linspace(-1.0, 1.0, 11)   # 11×11 grid
-n_k = len(kappa_vals)
+Dv_vals = np.linspace(0.01, 0.1, 11)   # 11×11 grid
+Da_vals = np.linspace(0.01, 1, 11)
+n_k = len(Da_vals)
 n_rep = 10
-M = 50   # number of snapshots to keep for taking average 
-Nx = 50
-Ny = 50
+M = 200   # number of snapshots to keep for taking average 
+Nx = 128
+Ny = 128
 N = Nx * Ny
-max_step=100*N #h smaller one needs to run longer!
+max_step=200*N #h smaller one needs to run longer!
 snapshot_interval = 5 
-gamma = 0.2
-DA = gamma/(2*h*h)   # diffusion of species A
-DB = gamma/(2*h*h)   # diffusion of species B
-betaA = 1/DA
-betaB = 1/DB
+beta = 10
 vacant = 0.3
 kappa_aa = 0.6
 kappa_bb = 0.6
-lambda_a = Dv/(h*h) 
-lambda_b = Dv/(h*h)
+kappa_ab = -0.4
+kappa_ba = -0.4
 Gamm=1
-Gamma_aa = Gamm/(h*h)
-Gamma_bb = Gamm/(h*h)
+Gamma_aa = Gamm
+Gamma_bb = Gamm
 Gamma_ab = 0 
 Gamma_ba = 0
 
 # define physical k axes (if domain lengths Lx,Ly, and spacing dx and dy)
-dx = h #Lx/Nx in general, if we know the physical length Lx, and the number of houses along one axis, Nx then dx= Lx/Nx, the same for dy=Ly/Ny 
-dy = h #Ly/Ny
+Lx=50
+dx = Lx/Nx # in general, if we know the physical length Lx, and the number of houses along one axis, Nx then dx= Lx/Nx, the same for dy=Ly/Ny 
+dy = Lx/Nx
 kx = 2*np.pi * np.fft.fftfreq(Nx, d=dx)
-ky = 2*np.pi * np.fft.fftfreq(Ny, d=dy)
+ky = 2*np.pi * np.fft.fftfreq(Nx, d=dy)
 kxg, kyg = np.meshgrid(kx, ky, indexing='ij')
 kgrid = np.sqrt(kxg**2 + kyg**2)
 k_flat = kgrid.ravel()
@@ -209,13 +206,13 @@ def utility_and_hypothetical_utility_flat(x, neighbors,
     return delta_flat, vac_indices, vac_starts,  owner, voter_reaction
 
 @njit(parallel=True)
-def compute_move_rates_flat(delta_flat, gamma):
+def compute_move_rates_flat(delta_flat, beta, Da):
     """
       - rates: 1d array of acceptance rates (len == len(delta_flat))
     """
     total_moves = delta_flat.shape[0]
     rates = np.empty(total_moves, dtype=np.float64)
-    beta = 2.0 / gamma
+    gamma = 2.0 *Da
     rates= gamma / (1.0 + np.exp(-(beta) * delta_flat))
     return rates
 
@@ -247,7 +244,7 @@ def compute_voter_rates(voter_reaction, lambda_a, lambda_b):
 
 # --- Main Simulation ---
 @njit
-def simulation_with_snapshots(time, y0, neighbors, gamma, kappa_aa, kappa_bb, kappa_ab, kappa_ba, lambda_a, lambda_b , snapshot_interval=snapshot_interval):
+def simulation_with_snapshots(time, y0, neighbors, beta, Da, kappa_aa, kappa_bb, kappa_ab, kappa_ba, lambda_a, lambda_b , snapshot_interval=snapshot_interval):
     t = time[0]
     tmax = time[-1]
     record_start = max_step - M * snapshot_interval
@@ -260,7 +257,7 @@ def simulation_with_snapshots(time, y0, neighbors, gamma, kappa_aa, kappa_bb, ka
                                                                                     neighbors.astype(np.int64),
                                                                                     kappa_aa, kappa_bb, kappa_ab, kappa_ba,  Gamma_aa, Gamma_ab, Gamma_ba, Gamma_bb)
 
-        rates = compute_move_rates_flat(delta_flat,  gamma)
+        rates = compute_move_rates_flat(delta_flat,  beta, Da)
         voter_rates = compute_voter_rates(voter_reaction, lambda_a, lambda_b)
         # Combine into one array
         total_len = rates.shape[0] + voter_rates.shape[0]
@@ -380,18 +377,25 @@ def make_wave_pattern(Nx, Ny, M,freq_x, freq_y, smoothness):
 A, neighbors = generate_graph(Nx, Ny)
 
 # ================= SLURM JOB MAPPING =================
-job_id = 1# int(os.environ.get("SLURM_ARRAY_TASK_ID", 0))
+job_id = int(os.environ.get("SLURM_ARRAY_TASK_ID", 0))
 
 #if job_id < 0 or job_id >= n_k * n_k:
 #    raise RuntimeError("Invalid SLURM_ARRAY_TASK_ID")
+#job_id=0
+#i = job_id // n_k
+#j = job_id % n_k
+
+#for job_id in range(0, 1): #range(n_k * n_k):  # 0 → 120
 
 i = job_id // n_k
 j = job_id % n_k
 
-kappa_ab = kappa_vals[i]
-kappa_ba = kappa_vals[j]
+Da     = Da_vals[j]
+Dv       = Dv_vals[i]
+lambda_a = Dv
+lambda_b = Dv
 
-print(f"[JOB {job_id}] κ_ab={kappa_ab:.3f}, κ_ba={kappa_ba:.3f}")
+print(f"[JOB {job_id}] Da={Da:.3f}, Dv={Dv:.3f}")
 
 # ensure to have an array of independent jobs
 np.random.seed(12345 + job_id)
@@ -426,7 +430,7 @@ for rep in range(n_rep):
 
     snapshots, _ = simulation_with_snapshots(
         np.linspace(0, N/10, N),
-        y0, neighbors, gamma,
+        y0, neighbors, beta, Da,
         kappa_aa, kappa_bb, kappa_ab, kappa_ba,
         lambda_a, lambda_b
     )
@@ -544,7 +548,7 @@ for rep in range(n_rep):
 
 outfile = os.path.join(
     outdir,
-    f"scan_kab_{i:02d}_kba_{j:02d}.npz"
+    f"scan_Da_{Da:.3f}_Dv_{Dv:.3f}.npz"
 )
 
 np.savez(
@@ -560,7 +564,15 @@ np.savez(
     slopeAB=np.nanmean(slopeAB_list),
     H=np.nanmean(H_list),
     D=np.nanmean(D_list),
- 
+    M= M,   # number of snapshots to keep for taking average, 
+    Nx = Nx,
+    max_step=max_step, 
+    beta = beta,
+    vacant = vacant, 
+    kappa_aa = kappa_aa,
+    kappa_bb = kappa_bb,
+    Gamma=Gamm,
+    Lx=Lx,  
 )
 
 print(f"[JOB {job_id}] Saved → {outfile}")

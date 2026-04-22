@@ -10,12 +10,12 @@ import time
 where_to_start =5
 repetition = 1   #  use 1 repetition for animation
 M = 20   # number of snapshots to average over
-h= 0.25
-Nx = 100
-Ny = 100
+h= 1
+Nx = 30
+Ny = 30
 N = Nx * Ny
-max_step=200*N #Getting patterns in 772.11s
-snapshot_interval = max_step/M 
+max_step=1000*N
+snapshot_interval = 20*N #  max_step/M 
 gamma = 0.2
 DA = gamma/(2*h*h)   # diffusion of species A
 DB = gamma/(2*h*h)   # diffusion of species B
@@ -24,9 +24,9 @@ betaB = 1/DB
 vacant = 0.3
 kappa_aa = 0.6
 kappa_bb = 0.6
-kappa_ab = 1
+kappa_ab = -1
 kappa_ba = -1
-Dv = 0.001 
+Dv = 0.1 
 lambda_a = Dv/(h*h) 
 lambda_b = Dv/(h*h)
 Gamm=1
@@ -206,6 +206,54 @@ def generate_graph(Lx, Ly):
                 A[i,j] = A[j,i] = 1
     return A, neighbors
 
+@njit(parallel=True)
+def voter_only(x, neighbors):
+    """
+    this function returns voter dynamics only:
+    """
+    N = x.shape[0]
+    z = neighbors.shape[1]
+
+    # 1) Count neighbor types & empty counts
+    n_plus = np.zeros(N, dtype=np.int64)
+    n_minus = np.zeros(N, dtype=np.int64)
+    empty_counts = np.zeros(N, dtype=np.int64)
+    total_pairs = 0
+    for i in prange(N):
+        plus = 0
+        minus = 0
+        empty = 0
+        for k in range(z):
+            j = neighbors[i, k]
+            v = x[j]
+            if v == 1:
+                plus += 1
+            elif v == -1:
+                minus += 1
+                if x[i] == 1:
+                    total_pairs += 1
+            else:
+                # v == 0
+                empty += 1
+        n_plus[i] = plus
+        n_minus[i] = minus
+        empty_counts[i] = empty
+
+    # 1.1) make the 1-d array for all ordered pair of x[i] = 1 (origin) and x[j] =-1 (target)
+    voter_reaction = np.empty(2 * total_pairs, dtype=np.int64)
+    p = 0
+    for i in range(N):
+        if x[i] == 1:
+            for k in range(z):
+                j = neighbors[i, k]
+                if x[j] == -1:
+                    voter_reaction[p] = i
+                    voter_reaction[p + 1] = j
+                    p += 2
+
+    return  voter_reaction
+
+
 # # --- Utility difference ---
 @njit(parallel=True)
 def utility_and_hypothetical_utility_flat(x, neighbors,
@@ -378,26 +426,36 @@ def compute_voter_rates(voter_reaction, lambda_a, lambda_b):
 
 # --- Main Simulation ---
 @njit
-def simulation_with_snapshots(time, y0, neighbors, gamma, kappa_aa, kappa_bb, kappa_ab, kappa_ba, lambda_a, lambda_b , snapshot_interval=snapshot_interval):
+def simulation_with_snapshots(time, y0, neighbors, gamma, kappa_aa, kappa_bb, kappa_ab, kappa_ba, lambda_a, lambda_b , snapshot_interval=snapshot_interval, Schelling=False):
     t = time[0]
     tmax = time[-1]
     x = y0.copy()
     snapshots = [x.copy().reshape(Ny,Nx)]  # store initial state
     step = 0
     while step < max_step:
-        delta_flat, vac_indices, vac_starts, owner, voter_reaction = utility_and_hypothetical_utility_flat(x.astype(np.int64),
-                                                                                    neighbors.astype(np.int64),
-                                                                                    kappa_aa, kappa_bb, kappa_ab, kappa_ba,  Gamma_aa, Gamma_ab, Gamma_ba, Gamma_bb)
+        
+        if Schelling:
+            delta_flat, vac_indices, vac_starts, owner, voter_reaction = utility_and_hypothetical_utility_flat(x.astype(np.int64),
+                                                                                        neighbors.astype(np.int64),
+                                                                                        kappa_aa, kappa_bb, kappa_ab, kappa_ba,  Gamma_aa, Gamma_ab, Gamma_ba, Gamma_bb)
 
-        rates = compute_move_rates_flat(delta_flat,  gamma)
-        voter_rates = compute_voter_rates(voter_reaction, lambda_a, lambda_b)
-        # Combine into one array
-        total_len = rates.shape[0] + voter_rates.shape[0]
-        rates_new = np.empty(total_len, dtype=np.float64)
-        for i in range(rates.shape[0]):
-            rates_new[i] = rates[i]
-        for i in range(voter_rates.shape[0]):
-            rates_new[rates.shape[0] + i] = voter_rates[i]
+            rates = compute_move_rates_flat(delta_flat,  gamma)
+            voter_rates = compute_voter_rates(voter_reaction, lambda_a, lambda_b)
+            # Combine into one array
+            total_len = rates.shape[0] + voter_rates.shape[0]
+            rates_new = np.empty(total_len, dtype=np.float64)
+            for i in range(rates.shape[0]):
+                rates_new[i] = rates[i]
+            for i in range(voter_rates.shape[0]):
+                rates_new[rates.shape[0] + i] = voter_rates[i]
+        else:
+            voter_reaction = voter_only(x.astype(np.int64),neighbors.astype(np.int64))
+            voter_rates = compute_voter_rates(voter_reaction, lambda_a, lambda_b)
+            total_len =  voter_rates.shape[0]
+            rates_new = np.empty(total_len, dtype=np.float64)
+            for i in range(voter_rates.shape[0]):
+                rates_new[i] = voter_rates[i]
+
 
         total_rates = np.sum(rates_new)
         if total_rates == 0:
@@ -490,7 +548,7 @@ def update(frame):
     im.set_array(snapshots[frame])
     return [im]
 
-anim = FuncAnimation(fig, update, frames=len(snapshots), interval=2000, blit=True)
+anim = FuncAnimation(fig, update, frames=len(snapshots), interval=1000, blit=True)
 # --- Export as GIF ---
 gif_writer = PillowWriter(fps=10)
 anim.save(f"h_{h}_Gamma{Gamm}_kappa_aa{kappa_aa}_kappa_ab{kappa_ab}_kappa_ba{kappa_ba}_Dv{Dv}_DA{gamma/2}_movie.gif", writer=gif_writer)
