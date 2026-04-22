@@ -271,7 +271,7 @@ class fhd_2d:
             divJ[1] -= noise_floor
         
         return divJ
-        
+    
     def w0(self, phi, param):
         D = param["D"]
         beta = param["beta"]
@@ -440,7 +440,7 @@ class fhd_2d:
         return phi_run
     
     def run_until_converged(self, phi, param, dt, toggle_noise, 
-            save_every = 500,
+            save_every = 500, T= 100, K = 50,
             scheme = "FE", 
             model = "Vitelli",
             verbatum = True):
@@ -451,7 +451,9 @@ class fhd_2d:
             param:  Dictionary with parameter settings, see 'model' below for expected parameters
             dt:     Size of the time step
             toggle_noise: strength of noise term, if zero, no noise is used
-            no_frames: Number of frames saved in the final np. array
+            save_every: Number of frames between storing a snapshot in the final np.array
+            T:      int: number of snapshots taking into the time-window for computing the slidding averages
+            K:      int: number of snapshots over which the change in slidding window averages is below convergence threshold 
             scheme: Numerical integration scheme, choose between forward Euler 'FE' or predictor-corrector 'PC'
             model:  Specify which model to run. Options are: 
                     "Vitelli"  with expected parameters in dictionary param:
@@ -486,9 +488,6 @@ class fhd_2d:
         
         converged = False
         eps_mean = 1e-3
-        # eps_Fano = 1e-2
-        T = 100
-        K = 50
 
         DKL = []
         Dis_idx = []
