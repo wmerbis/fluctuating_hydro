@@ -158,12 +158,13 @@ class fhd_2d_3species:
             gradlap[1] += [self.Dy.dot(self.D2x.dot(u[i]).T).T for i in range(ush[0])]
         return gradlap
 
-    def grad_utility(self, phi, param, h = None):
+    def grad_utility(self, phi, param, H = None):
         """Compute ∇ U = (∇πa + Γa ∇^3ρa) with πa = sum_b kappa_ab * rho_b for each species a."""
         pi = np.einsum("ab, bij -> aij", param['kappa'], phi)
         Gammaterm = np.einsum("ab, xbij -> xaij", param['Gamma'], self.grad_lapl(phi))
         if 'delta' in param:
-            pi += np.einsum("a, aij -> ij", param['delta'], h)
+            # pi += np.einsum("a, aij -> ij", param['delta'], H)
+            pi += param['delta'][:, None, None] * H
         if 'nu' in param:
             phisqr_ab = np.einsum("aij, bij -> abij", phi, phi)
             nuterm = np.einsum("abc, bcij-> aij", param['nu'], phisqr_ab)
@@ -184,14 +185,13 @@ class fhd_2d_3species:
         div += np.array([self.Dy.dot(vec[1,i].T).T for i in range(self.nspecies)])
         return div
     
-    def rhs_Vitelli(self, phi, param, dt, toggle_noise, h = None):
+    def rhs_Vitelli(self, phi, param, dt, toggle_noise, H = None):
         """Compute RHS of the equation"""
-
         phi0   = 1- phi.sum(axis=0)
         phi0 = phi0.reshape((1,)+self.N)
 
-        if h is not None:
-            dUdx = self.grad_utility(phi, param, h)
+        if H is not None:
+            dUdx = self.grad_utility(phi, param, H)
         else: 
             dUdx = self.grad_utility(phi, param)
 
@@ -376,9 +376,12 @@ class fhd_2d_3species:
         
         return divJ
         
-    def step(self, rhs, phi, param, dt, toggle_noise, scheme):
+    def step(self, rhs, phi, param, dt, toggle_noise, scheme, H = None):
         phi_tot = np.sum(phi, axis=0)
-        dphidt = rhs(phi, param, dt, toggle_noise)
+        if H is not None:
+            dphidt = rhs(phi, param, dt, toggle_noise, H)
+        else:
+            dphidt = rhs(phi, param, dt, toggle_noise)
         rho_pred = phi + dt * dphidt
     
         if scheme == "FE":
@@ -421,7 +424,7 @@ class fhd_2d_3species:
             no_frames = 100,
             scheme = "FE", 
             model = "Vitelli",
-            h = None,
+            H = None,
             verbatum = True):
         ''' Runs the FHD simulation with specified parameters for nsteps, recording no_frames equally timed frames.
 
@@ -468,8 +471,8 @@ class fhd_2d_3species:
         for n in range(1, nsteps + 1):     
             # print("step", n)
             if model == "Vitelli":
-                if h is not None:
-                    phi_current = self.step(self.rhs_Vitelli, phi_current, param, dt, toggle_noise, scheme, h)
+                if H is not None:
+                    phi_current = self.step(self.rhs_Vitelli, phi_current, param, dt, toggle_noise, scheme, H)
                 else:
                     phi_current = self.step(self.rhs_Vitelli, phi_current, param, dt, toggle_noise, scheme)
             elif model == "Schelling":
