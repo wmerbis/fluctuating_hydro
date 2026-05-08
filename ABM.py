@@ -680,9 +680,10 @@ if len(t_data) > 0:
 
 plt.loglog(t_plot[valid_t], kmean_tidx[valid_t],'-o', label="simulations")
 
-plt.xlabel("t")
-plt.ylabel(r'$\langle k \rangle$')
-plt.legend()
+plt.ylabel(r'$\langle k \rangle$', fontsize=FS_LABEL)
+plt.xlabel(r'$t$', fontsize=FS_LABEL)
+plt.legend(fontsize=18)
+plt.tick_params(axis='both', labelsize=FS_TICK)
 plt.title(fr"$ Da = {Da},\, Dv = {Dv} $")
 plt.tight_layout()
 #plt.show()
