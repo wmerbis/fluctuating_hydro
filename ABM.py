@@ -6,6 +6,9 @@ from tqdm.auto import trange
 from numba import njit, prange, typed
 from numpy.fft import fft2, ifft2, fftshift
 import time
+
+#this code includes: ABM for 1 single simulation, saving the output, making animation, extracting the slope of domain growth, and both numerical and theoretical computation of power spectrum
+
 FS_TITLE = 22
 FS_LABEL = 20
 FS_TICK  = 20
