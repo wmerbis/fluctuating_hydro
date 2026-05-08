@@ -746,7 +746,7 @@ print(f"log–log slope BB = {slope_B:.3f}")
 print(f"log–log slope AB = {slope_AB:.3f}")
 
 #------------------------------- saving --------------------------------------
-#outfile = os.path.join(outdir, f"scan_Da_{Da:.3f}_Dv_{Dv:.3f}.npz")
+
 np.savez(
     f"scan_Da_{Da:.3f}_Dv_{Dv:.3f}.npz",
     snapshots=snapshots,
