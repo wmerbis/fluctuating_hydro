@@ -687,7 +687,7 @@ plt.tick_params(axis='both', labelsize=FS_TICK)
 plt.title(fr"$ Da = {Da},\, Dv = {Dv} $")
 plt.tight_layout()
 #plt.show()
-plt.savefig(f"Da{Da}_Dv{Dv}.png", dpi=300)  
+plt.savefig(f"Gamma{Gamm}_kappa_aa{kappa_aa}_kappa_ab{kappa_ab}_kappa_ba{kappa_ba}_Da{Da}_Dv{Dv}.png", dpi=300)  
 
 #------------------------------------Power spectrum analysis---------------------------------
 # flatten for radial averaging
@@ -749,7 +749,7 @@ print(f"log–log slope AB = {slope_AB:.3f}")
 #------------------------------- saving --------------------------------------
 
 np.savez(
-    f"scan_Da_{Da:.3f}_Dv_{Dv:.3f}.npz",
+    f"scan_Gamma{Gamm}_kappa_aa{kappa_aa}_kappa_ab{kappa_ab}_kappa_ba{kappa_ba}_Da_{Da:.3f}_Dv_{Dv:.3f}.npz",
     snapshots=snapshots,
     n_take=take,
     k0=k0,
