@@ -390,7 +390,7 @@ job_id = int(os.environ.get("SLURM_ARRAY_TASK_ID", 0))
 i = job_id // n_k
 j = job_id % n_k
 
-Da     = lambdaa_vals[j]
+Da     = lambda_vals[j]
 Dv       = lambdav_vals[i]
 lambda_a = Dv
 lambda_b = Dv
