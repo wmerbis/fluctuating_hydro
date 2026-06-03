@@ -1,104 +1,117 @@
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation, PillowWriter
+from scipy.ndimage import gaussian_filter1d
 from tqdm.auto import trange
 from numba import njit, prange, typed
 from numpy.fft import fft2, ifft2, fftshift
 import time
 
+#this code includes: ABM for 1 single simulation, saving the output, making animation, extracting the slope of domain growth, and both numerical and theoretical computation of power spectrum
+
+FS_TITLE = 22
+FS_LABEL = 20
+FS_TICK  = 20
+FS_CBAR  = 20
 # ---------------- Parameters ----------------------
 where_to_start =5
 repetition = 1   #  use 1 repetition for animation
-M = 20   # number of snapshots to average over
-h= 1
-Nx = 30
-Ny = 30
+M = 1800   # number of snapshots to average over
+Nx = 128
+Ny = 128
 N = Nx * Ny
-max_step=1000*N
-snapshot_interval = 20*N #  max_step/M 
-gamma = 0.2
-DA = gamma/(2*h*h)   # diffusion of species A
-DB = gamma/(2*h*h)   # diffusion of species B
-betaA = 1/DA
-betaB = 1/DB
+max_step=2000*N
+n_discard = 100   # discard first 100 saved snapshots
+snapshot_interval = N # snapshot_interval = max(1, max_step // M)# max_step/M 
+Da = 1
+DA = Da   # diffusion of species A
+DB = Da   # diffusion of species B
+beta = 10
+betaA = beta
+betaB = beta
 vacant = 0.3
 kappa_aa = 0.6
 kappa_bb = 0.6
-kappa_ab = -1
-kappa_ba = -1
-Dv = 0.1 
-lambda_a = Dv/(h*h) 
-lambda_b = Dv/(h*h)
+kappa_ab = -0.4
+kappa_ba = -0.4
+Dv = 0.01 
+lambda_a = Dv
+lambda_b = Dv
 Gamm=1
-Gamma_aa = Gamm/(h*h)
-Gamma_bb = Gamm/(h*h)
+Gamma_aa = Gamm
+Gamma_bb = Gamm
 Gamma_ab = 0 
 Gamma_ba = 0
 
-# -------------------- radial binning procedure -----------------------------
-# define physical k axes (if domain lengths Lx,Ly, and spacing dx and dy)
-
-dx = dy = h #choose_dx(DA, DB, Gamm, lambda_a, lambda_b)
-#print(f"Auto-chosen dx = {dx:.3f}, kmax = {np.pi/dx:.3f}")
+# -------------------------define physical k axes ----------------------------------
+# (if domain lengths Lx,Ly, and spacing dx and dy)
+Lx=12.8
+h = Lx/Nx # for the theory comparison
+dx = Lx/Nx # in general, if we know the physical length Lx, and the number of houses along one axis, Nx then dx= Lx/Nx, the same for dy=Ly/Ny 
+dy = Lx/Nx
 kx = 2*np.pi * np.fft.fftfreq(Nx, d=dx)
-ky = 2*np.pi * np.fft.fftfreq(Ny, d=dy)
+ky = 2*np.pi * np.fft.fftfreq(Nx, d=dy)
 kxg, kyg = np.meshgrid(kx, ky, indexing='ij')
 kgrid = np.sqrt(kxg**2 + kyg**2)
-# flatten for radial averaging 
 k_flat = kgrid.ravel()
+
+# -------------------- radial binning procedure ---------------------------------
+
 kmax = k_flat.max()
 nbins = min(60, Nx//2)   # choose reasonable number bins
 kbins = np.linspace(0.0, kmax, nbins+1)
 kcent = 0.5*(kbins[:-1] + kbins[1:])
+bin_index = np.searchsorted(kbins, k_flat) - 1
+valid_bin = (bin_index >= 0) & (bin_index < nbins)
+counts = np.bincount(bin_index[valid_bin], minlength=nbins)
+
+mask = counts > 0
+
+# k grid excluding zero mode and any bins with zero count
+k_vals = kcent[mask]
+
+# we pick indices where k>0 (should be all valid except possibly first)
+pos      = k_vals > 0
+if len(pos) == 0:
+    raise RuntimeError("No nonzero k bins.")
+
+k_use = k_vals[pos]
+k_vals   = k_use
 
 #----------------------------------------helper functions--------------------------
-def choose_dx(DA, DB, Gamma, lambda_a, lambda_b, alpha=0.6):
+
+def radial_average_2d(S2d):
+    Sflat = S2d.ravel().real
+    Srad = np.bincount(
+        bin_index[valid_bin],
+        weights=Sflat[valid_bin],
+        minlength=nbins
+    ).astype(float)
+    Srad[mask] /= counts[mask]
+    return Srad
+
+def fit_power_law_time(t, y):
     """
-    Choose coarse-graining length dx so that kmax = pi/dx
-    stays safely within the continuum regime.
+    Fit y ~ C * t^slope on log-log axes.
+    Returns:
+        alpha  such that y ~ C * t^(-alpha)
+        C
+        slope  in log(y) = slope*log(t) + intercept
     """
-    k_uv_gamma = np.sqrt(Gamma / min(DA, DB))
-    k_uv_voter = np.sqrt(min(lambda_a, lambda_b) / min(DA, DB))
-    k_uv = min(k_uv_gamma, k_uv_voter)
+    mask = np.isfinite(t) & np.isfinite(y) & (t > 0) & (y > 0)
+    t_fit = t[mask]
+    y_fit = y[mask]
 
-    dx = np.pi / (alpha * k_uv)
-    return max(dx, 1.0)  # never finer than lattice spacing
+    if len(t_fit) < 2:
+        return np.nan, np.nan, np.nan
 
-def continuum_k_window(k_vals, Lx, dx, DA, DB, Gamma, lambda_a, lambda_b,
-                        ir_factor=2.0, uv_factor=0.6):
-    """
-    Returns boolean mask selecting the continuum-valid k range.
-    """
-    k_ir = ir_factor * (2*np.pi / (Lx * dx))
+    logt = np.log(t_fit)
+    logy = np.log(y_fit)
 
-    k_uv_gamma = np.sqrt(Gamma / min(DA, DB))
-    k_uv_voter = np.sqrt(min(lambda_a, lambda_b) / min(DA, DB))
-    k_uv = uv_factor * min(k_uv_gamma, k_uv_voter)
-
-    return (k_vals > k_ir) & (k_vals < k_uv), k_ir, k_uv
-
-def mean_relative_entropy(phi):
-    phi0 = 1 - np.sum(phi, axis=0)
-    global_dist = np.array([phi[0].mean(), phi[1].mean(), phi0.mean()])
-    
-    # Ensure no division by zero or log of zero
-    phi_combined = np.vstack([phi[0], phi[1], phi0]).reshape((3,)+ phi0.shape)
-    global_dist = np.clip(global_dist, 1e-10, None)
-    phi_combined = np.clip(phi_combined, 1e-10, None)
-    Sglobal = - np.sum(global_dist * np.log(global_dist))
-    
-    kl_divergence = np.sum(phi_combined * np.log(phi_combined / global_dist.reshape((3,)+ len(phi0.shape)*(1,))), axis=0)
-    mean_kl_divergence = np.mean(kl_divergence)/Sglobal
-    
-    return mean_kl_divergence
-
-def dissimilarity(phi):
-    phi0 = 1 - np.sum(phi,axis=0)
-    global_dist = np.array([phi[0].mean(), phi[1].mean(), phi0.mean()])
-    D = np.mean(np.abs(phi[0] - global_dist[0]))/global_dist[0]
-    D += np.mean(np.abs(phi[1] - global_dist[1]))/global_dist[1]
-    D += np.mean(np.abs(phi0 - global_dist[2]))/global_dist[2]
-    return D/2
+    slope, intercept = np.polyfit(logt, logy, 1)
+    C = np.exp(intercept)
+    alpha = -slope
+    return alpha, C, slope
 
 # --- Log–log slope extraction ---
 def loglog_slope(k, S):
@@ -113,6 +126,22 @@ def loglog_slope(k, S):
     sol, *_ = np.linalg.lstsq(A, logS, rcond=None)
     slope, intercept = sol
     return -slope, intercept
+
+#generate initially a pattern to look for the travelling phase
+
+def make_wave_pattern(Nx, Ny, M,freq_x, freq_y, smoothness):
+    # if freq_x and freq_y large enough, we get patches 
+    X, Y = np.meshgrid(np.linspace(0, 2*np.pi*freq_x, Nx), np.linspace(0, 2*np.pi*freq_y, Ny))
+    wave = np.sin(X + 0.5*Y) + 0.5*np.sin(1.5*X - 0.3*Y) + 0.2*np.random.randn(Ny, Nx)
+    smooth = gaussian_filter1d(wave, sigma=smoothness, axis=1)
+    flat =smooth.flatten()
+    y0 = np.zeros_like(flat)
+    abs_sorted_indices = np.argsort(np.abs(flat))
+    # Indices of elements that will be nonzero
+    nonzero_indices = abs_sorted_indices[M:]  
+    # Assign ±1 based on sign of original values
+    y0[nonzero_indices] = np.sign(flat[nonzero_indices])
+    return y0.flatten()
 
 #----------------------------------Jay's prediction-------------------------------
 # === Drift matrix M(k) and noise matrix Q(k) ===
@@ -187,20 +216,20 @@ def SBB_th(k, a0, b0, h):
 
 #----------------------------------------Agent-based simulation--------------------------
 # --- Graph / lattice generation ---
-def generate_graph(Lx, Ly):
-    N = Lx*Ly
+def generate_graph(Nx, Ny):
+    N = Nx*Ny
     A = np.zeros((N, N), np.uint8)
     neighbors = np.zeros((N, 4), dtype=int)
 
-    def node(x, y): return x + Lx * y
+    def node(x, y): return x + Nx * y
 
-    for x in range(Lx):
-        for y in range(Ly):
+    for x in range(Nx):
+        for y in range(Ny):
             i = node(x, y)
-            right = node((x+1)%Lx, y)
-            left  = node((x-1)%Lx, y)
-            up    = node(x, (y+1)%Ly)
-            down  = node(x, (y-1)%Ly)
+            right = node((x+1)%Nx, y)
+            left  = node((x-1)%Nx, y)
+            up    = node(x, (y+1)%Ny)
+            down  = node(x, (y-1)%Ny)
             neighbors[i] = [right, left, up, down]
             for j in neighbors[i]:
                 A[i,j] = A[j,i] = 1
@@ -388,13 +417,13 @@ def utility_and_hypothetical_utility_flat(x, neighbors,
     return delta_flat, vac_indices, vac_starts,  owner, voter_reaction
 
 @njit(parallel=True)
-def compute_move_rates_flat(delta_flat, gamma):
+def compute_move_rates_flat(delta_flat, beta, Da):
     """
       - rates: 1d array of acceptance rates (len == len(delta_flat))
     """
     total_moves = delta_flat.shape[0]
     rates = np.empty(total_moves, dtype=np.float64)
-    beta = 2.0 / gamma
+    gamma = 2.0 * Da
     rates= gamma / (1.0 + np.exp(-(beta) * delta_flat))
     return rates
 
@@ -426,11 +455,11 @@ def compute_voter_rates(voter_reaction, lambda_a, lambda_b):
 
 # --- Main Simulation ---
 @njit
-def simulation_with_snapshots(time, y0, neighbors, gamma, kappa_aa, kappa_bb, kappa_ab, kappa_ba, lambda_a, lambda_b , snapshot_interval=snapshot_interval, Schelling=False):
+def simulation_with_snapshots(time, y0, neighbors, beta, Da, kappa_aa, kappa_bb, kappa_ab, kappa_ba, lambda_a, lambda_b , snapshot_interval=snapshot_interval, Schelling=True):
     t = time[0]
-    tmax = time[-1]
     x = y0.copy()
     snapshots = [x.copy().reshape(Ny,Nx)]  # store initial state
+    snap_times = [t]
     step = 0
     while step < max_step:
         
@@ -439,7 +468,7 @@ def simulation_with_snapshots(time, y0, neighbors, gamma, kappa_aa, kappa_bb, ka
                                                                                         neighbors.astype(np.int64),
                                                                                         kappa_aa, kappa_bb, kappa_ab, kappa_ba,  Gamma_aa, Gamma_ab, Gamma_ba, Gamma_bb)
 
-            rates = compute_move_rates_flat(delta_flat,  gamma)
+            rates = compute_move_rates_flat(delta_flat, beta, Da)
             voter_rates = compute_voter_rates(voter_reaction, lambda_a, lambda_b)
             # Combine into one array
             total_len = rates.shape[0] + voter_rates.shape[0]
@@ -460,11 +489,6 @@ def simulation_with_snapshots(time, y0, neighbors, gamma, kappa_aa, kappa_bb, ka
         total_rates = np.sum(rates_new)
         if total_rates == 0:
             break
-        #selected_move = np.random.choice(len(rates), p=rates/total_rates) #O(N)
-        #method with #O(log(N))
-        # r = np.random.rand()             
-        # threshold = r * total_rates
-        # selected_move = np.searchsorted(np.cumsum(rates), threshold)
         r_thresh = np.random.rand() * total_rates
         cumulative = 0.0
         selected_move = 0
@@ -496,26 +520,11 @@ def simulation_with_snapshots(time, y0, neighbors, gamma, kappa_aa, kappa_bb, ka
         step += 1
         if step % snapshot_interval == 0:
             snapshots.append(x.copy().reshape(Ny,Nx))
-    return snapshots, t
+            snap_times.append(t)
+    return snapshots,  np.array(snap_times), t
 
-#generate initially a pattern to look for the travelling phase
-from scipy.ndimage import gaussian_filter1d
+# ------------------------------------ Run a single simulation  --------------------
 
-def make_wave_pattern(Lx, Ly, M,freq_x, freq_y, smoothness):
-    # if freq_x and freq_y large enough, we get patches 
-    X, Y = np.meshgrid(np.linspace(0, 2*np.pi*freq_x, Lx), np.linspace(0, 2*np.pi*freq_y, Ly))
-    wave = np.sin(X + 0.5*Y) + 0.5*np.sin(1.5*X - 0.3*Y) + 0.2*np.random.randn(Ly, Lx)
-    smooth = gaussian_filter1d(wave, sigma=smoothness, axis=1)
-    flat =smooth.flatten()
-    y0 = np.zeros_like(flat)
-    abs_sorted_indices = np.argsort(np.abs(flat))
-    # Indices of elements that will be nonzero
-    nonzero_indices = abs_sorted_indices[M:]  
-    # Assign ±1 based on sign of original values
-    y0[nonzero_indices] = np.sign(flat[nonzero_indices])
-    return y0.flatten()
-
-# --- Run a single simulation for animation ---
 A, neighbors = generate_graph(Nx, Ny)
 #random initial condition
 y0 = np.zeros(N)
@@ -532,16 +541,17 @@ if (kappa_ab*kappa_ba) < 0:
     y0 = make_wave_pattern(Nx, Ny,int(vacant*N), freq_x=4, freq_y=4, smoothness=3)
 
 t0 = time.time()
-snapshots, _ = simulation_with_snapshots(np.linspace(0,  N/10, N), y0, neighbors, gamma, kappa_aa, kappa_bb, kappa_ab, kappa_ba, lambda_a, lambda_b)
+snapshots, snap_times, trun = simulation_with_snapshots(np.linspace(0,  N/10, N), y0, neighbors,  beta, Da, kappa_aa, kappa_bb, kappa_ab, kappa_ba, lambda_a, lambda_b)
 t1 = time.time()
+print(trun)
 print(f"Getting patterns in {t1-t0:.2f}s")
-#snapshots = simulation_with_snapshots_jit(20000*N, y0, neighbors, gamma, kappa_aa, kappa_bb, kappa_ab, kappa_ba, 1000, Lx, Ly)
 
-# --- Animation ---
+#--------------------------------------------------- Animation -------------------------------
+
 fig, ax = plt.subplots()
 cmap = plt.get_cmap('bwr', 3)  # blue-white-red
 im = ax.imshow(snapshots[0], cmap=cmap, vmin=-1, vmax=1)
-ax.set_title(fr"$h={h},\,\Gamma = {Gamm},\, D = {gamma/2},\, \kappa aa = {kappa_aa},\, \kappa ab = {kappa_ab},\, \kappa ba = {kappa_ba}, \, \lambda_a={Dv}$")
+ax.set_title(fr"$\Gamma = {Gamm},\,  \kappa aa = {kappa_aa},\, \kappa ab = {kappa_ab},\, \kappa ba = {kappa_ba}, \, Da = {Da},\, Dv={Dv}$")
 plt.colorbar(im, ax=ax, ticks=[-1,0,1], label='State')
 
 def update(frame):
@@ -551,31 +561,43 @@ def update(frame):
 anim = FuncAnimation(fig, update, frames=len(snapshots), interval=1000, blit=True)
 # --- Export as GIF ---
 gif_writer = PillowWriter(fps=10)
-anim.save(f"h_{h}_Gamma{Gamm}_kappa_aa{kappa_aa}_kappa_ab{kappa_ab}_kappa_ba{kappa_ba}_Dv{Dv}_DA{gamma/2}_movie.gif", writer=gif_writer)
+anim.save(f"Gamma{Gamm}_kappa_aa{kappa_aa}_kappa_ab{kappa_ab}_kappa_ba{kappa_ba}_Dv{Dv}_DA{Da}_movie.gif", writer=gif_writer)
 plt.show()
 
-# ------------------- Pick the final snapshot and build densities -------------------
-final = snapshots[-1]          # shape (Ly, Lx)
+# Pick the final snapshot and build densities 
+final = snapshots[-1]          # shape (Ny, Nx)
 
-#####################  Power spectrum computed over M snapshots
-take = min(M, len(snapshots))  # take the mininum between the required last M snapshots and the real length of snapshot
+#------------------------------Power spectrum computed over M snapshots-------------------------------
+
+snapshots_analysis = snapshots[n_discard:]
+snap_times_analysis = snap_times[n_discard:]
+
+take = min(M, len(snapshots_analysis))  # take the mininum between the required last M snapshots and the real length of snapshot
 
 S_AA_acc = np.zeros((Ny, Nx), dtype=np.float64)
 S_BB_acc = np.zeros((Ny, Nx), dtype=np.float64)
 S_AB_acc = np.zeros((Ny, Nx), dtype=np.float64)
 S_00_acc = np.zeros((Ny, Nx), dtype=np.float64)
-H_field  = 0
-D_field  = 0
 
-for jj,snap in enumerate(snapshots[-take:]):
+S_AA_tidx = np.full(( take, nbins), np.nan)
+S_BB_tidx = np.full(( take, nbins), np.nan)
+S_AB_tidx = np.full(( take, nbins), np.nan)
+S_00_tidx = np.full(( take, nbins), np.nan)
+
+# store characteristic wave number vs time
+kmean_tidx = np.full((take), np.nan)
+kpeak_tidx = np.full((take), np.nan)
+
+
+for jj,snap in enumerate(snapshots_analysis[-take:]):
     #indicator fields
     rhoA = (snap == 1).astype(float)
     rhoB = (snap == -1).astype(float)
     rho0 = (snap == 0).astype(float)
 
     stack_field = np.stack([rhoA, rhoB])
-    H_field += mean_relative_entropy(stack_field)
-    D_field += dissimilarity(stack_field)
+    #H_field += mean_relative_entropy(stack_field)
+    #D_field += dissimilarity(stack_field)
     
     #mean (global) densities
     a0 = rhoA.mean()
@@ -591,21 +613,81 @@ for jj,snap in enumerate(snapshots[-take:]):
     dB_k = fft2(dB)
     d0_k = fft2(d0)
 
+    S_AA_2d = (dA_k * np.conj(dA_k)).real / N
+    S_BB_2d = (dB_k * np.conj(dB_k)).real / N
+    S_00_2d = (d0_k * np.conj(d0_k)).real / N
+    S_AB_2d = np.real(dA_k * np.conj(dB_k)) / N # complex in general; take real part for radial averaging
+
     # accumulate structure factors over the last M snapshots
-    S_AA_acc += (dA_k * np.conj(dA_k)).real / N
-    S_BB_acc += (dB_k * np.conj(dB_k)).real / N
-    S_00_acc += (d0_k * np.conj(d0_k)).real / N
-    S_AB_acc += np.real(dA_k * np.conj(dB_k)) / N  # complex in general; take real part for radial averaging
+    S_AA_acc += S_AA_2d
+    S_BB_acc += S_BB_2d 
+    S_00_acc += S_00_2d
+    S_AB_acc += S_AB_2d 
+
+    # radial average at THIS time point
+    S_AA_t  = radial_average_2d(S_AA_2d)
+    S_BB_t  = radial_average_2d(S_BB_2d)
+    S_00_t  = radial_average_2d(S_00_2d)
+    S_AB_t  = radial_average_2d(S_AB_2d)
+
+    S_AA_tidx[jj, :] = S_AA_t 
+    S_BB_tidx[jj, :] = S_BB_t 
+    S_00_tidx[jj, :] = S_00_t 
+    S_AB_tidx[jj, :] = S_AB_t 
+
+    # characteristic k at this time
+    Ssym_t = S_AA_t[mask][pos] + S_BB_t[mask][pos]
+    if np.any(np.isfinite(Ssym_t)) and np.nansum(Ssym_t) > 0:
+        kmean_tidx[jj] = np.sum(k_use * Ssym_t) / np.sum(Ssym_t)
+        kpeak_tidx[jj] = k_use[np.argmax(Ssym_t)]
 
 # average over snapshots
 S_AA_k = S_AA_acc / take
 S_BB_k = S_BB_acc / take
 S_AB_k = S_AB_acc / take
 S_00_k = S_00_acc / take
-H_field = H_field/take
-D_field = D_field/take
 
-print(f"H value {H_field} and D value {D_field}")
+# --------------------------------------Slope of domain growth -------------------------------
+
+t_plot = snap_times_analysis[-take:]  # snapshot index; use real saved times if available
+valid_t = ~np.isnan(kmean_tidx)
+
+t_data = t_plot[valid_t]
+k_data = kmean_tidx[valid_t]
+
+plt.figure()
+fit_mask = (t_data >= 10) & (t_data <= 5000)
+t_fit = t_data[fit_mask]
+k_fit_time = k_data[fit_mask]
+alpha_fit, C_fit, slope_fit = fit_power_law_time(t_fit, k_fit_time)
+
+if np.isfinite(alpha_fit):
+    t_line = np.linspace(t_fit.min(), t_fit.max(), 200)
+    k_line = C_fit * t_line**(slope_fit)
+    plt.loglog(
+        t_line,
+        k_line,
+        '--',
+        linewidth=2,
+        label=fr'fit: $\langle k\rangle \sim t^{{-{alpha_fit:.3f}}}$'
+    )
+
+if len(t_data) > 0:
+    c1 = k_data[0] * t_data[0]**(1/3)
+    c2 = k_data[0] * t_data[0]**(1/4)
+    plt.loglog(t_data, c1 * t_data**(-1/3), label=r'$\sim t^{-1/3}$')
+    plt.loglog(t_data, c2 * t_data**(-1/4), label=r'$\sim t^{-1/4}$')
+
+plt.loglog(t_plot[valid_t], kmean_tidx[valid_t],'-o', label="simulations")
+
+plt.ylabel(r'$\langle k \rangle$', fontsize=FS_LABEL)
+plt.xlabel(r'$t$', fontsize=FS_LABEL)
+plt.legend(fontsize=18)
+plt.tick_params(axis='both', labelsize=FS_TICK)
+plt.title(fr"$ Da = {Da},\, Dv = {Dv} $")
+plt.tight_layout()
+#plt.show()
+plt.savefig(f"Gamma{Gamm}_kappa_aa{kappa_aa}_kappa_ab{kappa_ab}_kappa_ba{kappa_ba}_Da{Da}_Dv{Dv}.png", dpi=300)  
 
 #------------------------------------Power spectrum analysis---------------------------------
 # flatten for radial averaging
@@ -617,7 +699,6 @@ Srad_A = np.zeros(nbins)
 Srad_B = np.zeros(nbins)
 Srad_0 = np.zeros(nbins)
 Srad_AB = np.zeros(nbins)
-counts = np.zeros(nbins, dtype=int)
 
 for i, k in enumerate(k_flat):
     binidx = np.searchsorted(kbins, k) - 1
@@ -628,22 +709,13 @@ for i, k in enumerate(k_flat):
         Srad_AB[binidx] += S_AB_flat[i]
         counts[binidx] += 1
 
-mask = counts > 0
+mask = counts>0 
 Srad_A[mask] /= counts[mask]
 Srad_B[mask] /= counts[mask]
 Srad_0[mask] /= counts[mask]
 Srad_AB[mask] /= counts[mask]
 
-# ------------------ find peak radial wavenumber and extract ring ----------------
-
-# choose data points to fit: exclude k=0 and any bins with zero count
-k_vals = kcent[mask]
-# exclude k=0 bin, so we pick indices where k>0 (should be all valid except possibly first)
-pos      = k_vals > 0
-if len(pos) == 0:
-    raise RuntimeError("No nonzero k bins.")
-
-k_vals   = k_vals[pos]
+# ------------------ find peak radial wavenumber ----------------
 SA       = Srad_A[mask][pos]
 SB       = Srad_B[mask][pos]
 S0       = Srad_0[mask][pos]
@@ -654,8 +726,8 @@ k0 = k_vals[np.argmax(S_sym)]
 print("Detected radial peak k0 =", k0,  "dx=",dx, " kmax=", kmax) 
 
 #-------------------computing slope and fit--------------------------------------
-# Use ONLY u-th smallest and v-th largest nonzero k bins:
-# k[ pos[u] : pos[-v] ]  → includes everything in between but excludes the extreme ends
+# Use ONLY idx_low-th smallest and idx_high-th largest nonzero k bins:
+# k[ pos[idx_low] : pos[-idx_high] ]  → includes everything in between but excludes the extreme ends
 
 idx_low = np.argmax(S_sym)+where_to_start      # fifth smallest non-zero
 idx_high = -2    # second largest non-zero
@@ -670,77 +742,63 @@ slope_B, _ = loglog_slope(k_fit, SB_fit)
 slope_0, _ = loglog_slope(k_fit, S0_fit)
 slope_AB, _ = loglog_slope(k_fit, np.abs(SAB_fit))
 
-""" fit_mask, k_ir, k_uv = continuum_k_window(
-    k_vals, Lx, dx, DA, DB, Gamm, lambda_a, lambda_b
-)
-k_fit   = k_vals[fit_mask]
-SA_fit  = Svals_A[fit_mask]
-SB_fit  = Svals_B[fit_mask]
-SAB_fit = Svals_AB[fit_mask] """
-
-# x = 1/k^2
-X = 1.0 / (k_fit**2)
-def fit_C(y, X):
-    num = np.sum(y * X)
-    den = np.sum(X * X)
-    return 0.0 if den == 0 else num / den
-
-C_A = fit_C(SA_fit, X)
-C_AB = fit_C(SAB_fit, X)
-C_B = fit_C(SB_fit, X)
-
-# Build fitted curves on same k grid for plotting
-kplot = np.linspace(np.min(k_fit), np.max(k_fit), 200)
-fitA = C_A / (kplot**2)
-fitAB = C_AB / (kplot**2)
-fitB = C_B / (kplot**2)
-
-slope_A, _ = loglog_slope(k_fit, SA_fit)
-slope_B, _ = loglog_slope(k_fit, SB_fit)
-slope_AB, _ = loglog_slope(k_fit, np.abs(SAB_fit))
 print(f"log–log slope AA = {slope_A:.3f}")
 print(f"log–log slope BB = {slope_B:.3f}")
 print(f"log–log slope AB = {slope_AB:.3f}")
 
-fitAnew = C_A / (kplot**slope_A)
-fitAnew = C_B / (kplot**slope_B)
-fitABnew = -C_AB / (kplot**slope_AB)
+#------------------------------- saving --------------------------------------
+
+np.savez(
+    f"scan_Gamma{Gamm}_kappa_aa{kappa_aa}_kappa_ab{kappa_ab}_kappa_ba{kappa_ba}_Da_{Da:.3f}_Dv_{Dv:.3f}.npz",
+    snapshots=snapshots,
+    n_take=take,
+    k0=k0,
+    slopeA=slope_A,
+    slopeB=slope_B,
+    slopeAB=slope_AB,
+    M= M,   # number of snapshots to keep for taking average, 
+    Nx = Nx,
+    max_step=max_step, 
+    beta = beta,
+    vacant = vacant, 
+    kappa_ab=kappa_ab,
+    kappa_ba=kappa_ba,
+    kappa_aa = kappa_aa,
+    kappa_bb = kappa_bb,
+    Gamma=Gamm,
+    h=h,  
+)
 
 # ------------------------------ plotting ------------------------------------
 plt.figure(figsize=(14,6))
 
 # 1) final snapshot
 plt.subplot(1,3,1)
-plt.title(fr"$h={h},\,\Gamma = {Gamm},\, D = {gamma/2},\, \kappa aa = {kappa_aa},\, \kappa ab = {kappa_ab},\, \kappa ba = {kappa_ba}, \, Dv={Dv} $")
+plt.title(fr"$\Gamma = {Gamm},\, Da = {Da},\, \kappa aa = {kappa_aa},\, \kappa ab = {kappa_ab},\, \kappa ba = {kappa_ba}, \, Dv={Dv} $")
 plt.imshow(final, cmap='bwr', vmin=-1, vmax=1, origin='lower')
 
-# # 2) 
+# # 2) plt.ylabel('equal-time correlations')
 plt.subplot(1,3,2)
 plt.plot(k_vals, SA, 'o-', label='G_AA ', markersize=5)
-plt.plot(kplot, fitA, '--', label=f'fit AA: {C_A:.3f}/k^2')
 plt.plot(k_vals, SB, 'v-', label='G_BB', markersize=5)
-plt.plot(kplot, fitB, '--', label=f'fit BB: {C_B:.3f}/k^2')
 plt.plot(k_vals, SAB, 's-', label='G_AB', markersize=5)
-plt.plot(kplot, fitAB, '--', label=f'fit AB: {C_AB:.3f}/k^2')
-plt.xlabel('k')
-# plt.ylabel('equal-time correlations')
-plt.legend()
+plt.xlabel(r'$k$', fontsize=FS_LABEL)
+plt.legend(fontsize=18)
+plt.tick_params(axis='both', labelsize=FS_TICK)
 plt.title(fr"$\rho_A^{(0)} = {a0:.2f}, \rho_B^{(0)} = {b0:.2f}$")
-plt.grid(True)
+#plt.grid(True)
 
+kplot = np.linspace(np.min(k_fit), np.max(k_fit), 200)
 SAA_theory = np.array([SAA_th(k, a0, b0, h) for k in kplot])
 SBB_theory = np.array([SBB_th(k, a0, b0, h) for k in kplot])
 SAB_theory = np.array([SAB_th(k, a0, b0, h) for k in kplot])
-# Optional: log-log view to check slope ~ -2
+# Optional: log-log view to check slope 
 plt.subplot(1,3,3)
 plt.loglog(k_fit, SA_fit, 'o', label=f'G_AA with 1/k^{slope_A:.3f}')
-#plt.loglog(kplot, fitAnew, '--', label=f'fit AA: {C_A:.2f}/k^{slope_A:.2f}')
 plt.loglog(kplot, SAA_theory, '--', label=f'theory for AA')
 plt.loglog(k_fit, SB_fit, 'v', label=f'G_BB with 1/k^{slope_B:.3f}')
-#plt.loglog(kplot, fitBnew, '--', label=f'fit BB: {C_A:.2f}/k^{slope_A:.2f}')
 plt.loglog(kplot, SBB_theory, '--', label=f'theory for BB')
 plt.loglog(k_fit,  np.abs(SAB_fit), 's', label=f'G_AB with 1/k^{slope_AB:.3f}')
-#plt.loglog(kplot, fitABnew, '-', label=f'fit AB: {C_AB:.2f}/k^{slope_AB:.2f}')
 if  kappa_ab == kappa_ba < 0 :
     plt.loglog(kplot, -SAB_theory, '-', label=f'theory for AB')
 else:
@@ -752,7 +810,7 @@ plt.title(
     fr"peak at: $ k0 = {k0:.3f}, h = {h}, dx = {dx}, Nx = {Nx}$")
 plt.grid(True, which='both', ls=':')
 plt.tight_layout()
-plt.savefig(f"h_{h}_Gamma{Gamm}_kappa_aa{kappa_aa}_kappa_ab{kappa_ab}_kappa_ba{kappa_ba}_Dv{Dv}_DA{gamma/2}.png", dpi=300)
+plt.savefig(f"Gamma{Gamm}_kappa_aa{kappa_aa}_kappa_ab{kappa_ab}_kappa_ba{kappa_ba}_Dv{Dv}_DA{Da}.png", dpi=300)
 plt.show()
 
 # # 3) raw equal-time auto-correlation C_AA(x) (inverse FFT of full S_AA_k)
