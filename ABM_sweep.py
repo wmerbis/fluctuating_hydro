@@ -10,8 +10,8 @@ os.makedirs(outdir, exist_ok=True)
 h  = 1
 # --- Fixed Parameters ---
 where_to_start =5
-Dv_vals = np.linspace(0.01, 0.1, 11)   # 11×11 grid
-Da_vals = np.linspace(0.01, 1, 11)
+lambdav_vals = np.linspace(0.01, 0.1, 11)   # 11×11 grid
+lambda_vals = np.linspace(0.01, 1, 11)
 n_k = len(Da_vals)
 n_rep = 10
 M = 200   # number of snapshots to keep for taking average 
@@ -390,8 +390,8 @@ job_id = int(os.environ.get("SLURM_ARRAY_TASK_ID", 0))
 i = job_id // n_k
 j = job_id % n_k
 
-Da     = Da_vals[j]
-Dv       = Dv_vals[i]
+Da     = lambdaa_vals[j]
+Dv       = lambdav_vals[i]
 lambda_a = Dv
 lambda_b = Dv
 
