@@ -202,7 +202,7 @@ class fhd_2d:
             else:
                 h = np.sqrt(self.dx*self.dy)
 
-            xi = np.random.normal(0, 1, size= (2,)+phi.shape)
+            xi = np.random.normal(0, 1, size= (2,)+phi.shape)/np.sqrt(self.dx*self.dy)
             if self.bc == 'Neumann':
                 # Set noise to zero on the boundary for Neumann bc's
                 xi[:,:,0,:] = 0
@@ -242,7 +242,7 @@ class fhd_2d:
                 h = param['h']
             else:
                 h = np.sqrt(self.dx*self.dy)
-            xi = np.random.normal(0, 1, size= (2,)+phi.shape)
+            xi = np.random.normal(0, 1, size= (2,)+phi.shape)/np.sqrt(self.dx*self.dy)
             if self.bc == 'Neumann':
                 # Set noise to zero on the boundary for Neumann bc's
                 xi[:,:,0,:] = 0
@@ -256,7 +256,7 @@ class fhd_2d:
             divJ += dnoise_dx
 
             # Add demographic noise for Voter model
-            xi2 = np.random.normal(0, 1, size = self.N)
+            xi2 = np.random.normal(0, 1, size = self.N)/np.sqrt(self.dx*self.dy)
             # if self.bc == "Neumann":
             #     xi2[0,:] = 0
             #     xi2[-1,:] = 0
@@ -303,7 +303,7 @@ class fhd_2d:
                 h = param['h']
             else:
                 h = np.sqrt(self.dx*self.dy)
-            xi = np.random.normal(0, 1, size= (2,) + phi.shape)
+            xi = np.random.normal(0, 1, size= (2,) + phi.shape)/np.sqrt(self.dx*self.dy)
             if self.bc == 'Neumann':
                 # Set noise to zero on the boundary for Neumann bc's
                 xi[:,:,0,:] = 0
@@ -515,6 +515,8 @@ class fhd_2d:
 
                 if len(DKL)>T+K:
                     converged = check_convergence([Dis_idx, DKL], T, eps_mean, K)
+                    if Dis_idx[-1] < eps_mean: # If dissimilarity is very small, run converged in well-mixed state
+                        converged = True
 
         phi_run = np.array(phi_run).transpose(1,0,2,3)
         

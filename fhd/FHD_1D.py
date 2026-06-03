@@ -196,7 +196,7 @@ class fhd:
                 h = param['h']
             else:
                 h = self.dx
-            xi = np.random.normal(0, 1, size= phi.shape)
+            xi = np.random.normal(0, 1, size= phi.shape)/self.dx
             if self.bc == "Neumann":
                 # Set noise to zero on the boundary for Neumann bc's
                 xi[:,0] = 0
@@ -233,7 +233,7 @@ class fhd:
             else:
                 h = self.dx
             # Add conservative noise for Voter
-            xi = np.random.normal(0, 1, size= phi.shape)
+            xi = np.random.normal(0, 1, size= phi.shape)/self.dx
             if self.bc == "Neumann":
                 # Set noise to zero on the boundary for Neumann bc's
                 xi[:,0] = 0
@@ -245,7 +245,7 @@ class fhd:
             divJ += dnoise_dx
 
             # Add demographic noise for Voter model
-            xi2 = np.random.normal(0, 1, size = self.N)
+            xi2 = np.random.normal(0, 1, size = self.N)/self.dx
             # if self.bc == "Neumann":
             #     xi2[0,:] = 0
             #     xi2[-1,:] = 0

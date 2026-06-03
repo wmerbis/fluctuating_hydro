@@ -284,3 +284,9 @@ def check_convergence(Obs_list, T, eps_mean = 1e-3, K = 50):
         # criteria.append(Fano[-K:] < eps_Fano)
             
     return np.all(criteria)
+
+def kmean(power_spectrum, k_bins):
+    '''Computes the mean of the wavenumber averaged over the power spectrum as distribution'''
+    Z = np.sum(power_spectrum)
+    kmean = np.sum(k_bins*power_spectrum)
+    return kmean/Z
