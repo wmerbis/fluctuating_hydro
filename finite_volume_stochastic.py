@@ -1009,6 +1009,7 @@ class SchellingVoterFVSolver:
         """
         if record_snapshots_every is None:
             record_snapshots_every = snapshot_every
+            record_masses_every = snapshot_every
         if record_masses_every < 0 or record_snapshots_every < 0:
             raise ValueError("record intervals must be non-negative")
 
@@ -1032,6 +1033,7 @@ class SchellingVoterFVSolver:
                 masses_occ.append(m["occupied"])
                 masses_tot.append(m["total"])
                 mass_times.append(n * dt)
+                print(f"step {n}/{nsteps}:    <m_A> = {masses_A[-1]/masses_tot[-1]:.2f},   <m_B> = {masses_B[-1]/masses_tot[-1]:.2f},    <m_occ> = {masses_occ[-1]/masses_tot[-1]:.2f}")
 
             if record_snapshots_every > 0 and n % record_snapshots_every == 0:
                 snapshots.append((n * dt, self.rho_A.copy(), self.rho_B.copy()))
@@ -1087,7 +1089,7 @@ def benchmark_fast_paths(nx: int = 96, ny: int = 96, nsteps: int = 100, dt: floa
         D_v=0.05,
         beta=10.0,
         h_noise=min(lx / nx, ly / ny),
-        kappa=np.array([[0.6, -0.2], [-0.2, 0.6]], dtype=float),
+        kappa=np.array([[0.6, -0.4], [-0.4, 0.6]], dtype=float),
         gamma=np.array([[1.0, 0.0], [0.0, 1.0]], dtype=float),
     )
     rho_A0, rho_B0 = make_random_initial_condition(nx, ny, seed=11)
@@ -1146,7 +1148,7 @@ def main() -> None:
         D_v=0.05,
         beta=10.0,
         h_noise=min(lx / nx, ly / ny),
-        kappa=np.array([[0.6, -0.2], [-0.2, 0.6]], dtype=float),
+        kappa=np.array([[0.6, -0.4], [-0.4, 0.6]], dtype=float),
         gamma=np.array([[1.0, 0.0], [0.0, 1.0]], dtype=float),
     )
 
