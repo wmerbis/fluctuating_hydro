@@ -381,7 +381,7 @@ class ModelParameters:
 
     def __post_init__(self) -> None:
         if self.kappa is None:
-            self.kappa = np.array([[0.6, -0.2], [-0.2, 0.6]], dtype=float)
+            self.kappa = np.array([[0.6, -0.4], [-0.4, 0.6]], dtype=float)
         else:
             self.kappa = np.asarray(self.kappa, dtype=float)
         if self.gamma is None:
