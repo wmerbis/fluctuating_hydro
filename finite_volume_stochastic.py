@@ -37,6 +37,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Dict, Optional, Tuple
+import time
 
 import numpy as np
 
@@ -162,7 +163,7 @@ def _explicit_rhs_numba(
 ) -> None:
     ny, nx = rho_A.shape
 
-    _compute_rho0_inplace(rho_A, rho_B, active, rho0)
+    # rho0 is supplied by step()/explicit_rhs() so it is computed once per step.
     _compute_linear_utility_inplace(rho_A, rho_B, active, k00, k01, k10, k11, U_A, U_B)
     _zero_array(rhs_A)
     _zero_array(rhs_B)
@@ -276,7 +277,7 @@ def _stochastic_increment_numba(
 ) -> None:
     ny, nx = rho_A.shape
 
-    _compute_rho0_inplace(rho_A, rho_B, active, rho0)
+    # rho0 is supplied by step()/stochastic_increment(); avoid recomputing it here.
     _zero_array(dW_A)
     _zero_array(dW_B)
 
@@ -359,6 +360,204 @@ def _stochastic_increment_numba(
                 dW_B[iy, ix] = 0.0
 
 
+@njit(cache=True)
+def _compute_rho0_periodic_inplace(rho_A: Array, rho_B: Array, rho0: Array) -> None:
+    """Fully-active shortcut: no mask checks while forming vacancies."""
+    ny, nx = rho_A.shape
+    for iy in range(ny):
+        for ix in range(nx):
+            rho0[iy, ix] = 1.0 - rho_A[iy, ix] - rho_B[iy, ix]
+
+
+@njit(cache=True)
+def _compute_linear_utility_periodic_inplace(
+    rho_A: Array,
+    rho_B: Array,
+    k00: float,
+    k01: float,
+    k10: float,
+    k11: float,
+    U_A: Array,
+    U_B: Array,
+) -> None:
+    """Fully-active shortcut for the local utility matrix multiply."""
+    ny, nx = rho_A.shape
+    for iy in range(ny):
+        for ix in range(nx):
+            ra = rho_A[iy, ix]
+            rb = rho_B[iy, ix]
+            U_A[iy, ix] = k00 * ra + k01 * rb
+            U_B[iy, ix] = k10 * ra + k11 * rb
+
+
+@njit(cache=True)
+def _explicit_rhs_periodic_numba(
+    rho_A: Array,
+    rho_B: Array,
+    dx: float,
+    dy: float,
+    D_A: float,
+    D_B: float,
+    D_v: float,
+    beta: float,
+    k00: float,
+    k01: float,
+    k10: float,
+    k11: float,
+    rho0: Array,
+    U_A: Array,
+    U_B: Array,
+    rhs_A: Array,
+    rhs_B: Array,
+) -> None:
+    """Fast conservative RHS for the common fully-active periodic grid.
+
+    This is algebraically the same face update as the generic kernel, but it
+    removes mask tests and boundary-condition branches from the hot path.
+    """
+    ny, nx = rho_A.shape
+    _compute_linear_utility_periodic_inplace(rho_A, rho_B, k00, k01, k10, k11, U_A, U_B)
+    _zero_array(rhs_A)
+    _zero_array(rhs_B)
+
+    inv_dx = 1.0 / dx
+    inv_dy = 1.0 / dy
+
+    for iy in range(ny):
+        for ix in range(nx):
+            jx = ix + 1
+            if jx == nx:
+                jx = 0
+
+            rhoA_x = 0.5 * (rho_A[iy, ix] + rho_A[iy, jx])
+            rhoB_x = 0.5 * (rho_B[iy, ix] + rho_B[iy, jx])
+            rho0_x = 0.5 * (rho0[iy, ix] + rho0[iy, jx])
+
+            d_rhoA_x = (rho_A[iy, jx] - rho_A[iy, ix]) * inv_dx
+            d_rhoB_x = (rho_B[iy, jx] - rho_B[iy, ix]) * inv_dx
+            d_rho0_x = (rho0[iy, jx] - rho0[iy, ix]) * inv_dx
+            d_UA_x = (U_A[iy, jx] - U_A[iy, ix]) * inv_dx
+            d_UB_x = (U_B[iy, jx] - U_B[iy, ix]) * inv_dx
+
+            F_A = D_A * (rho0_x * d_rhoA_x - rhoA_x * d_rho0_x - beta * rho0_x * rhoA_x * d_UA_x)
+            F_A += D_v * (rhoB_x * d_rhoA_x - rhoA_x * d_rhoB_x)
+            F_B = D_B * (rho0_x * d_rhoB_x - rhoB_x * d_rho0_x - beta * rho0_x * rhoB_x * d_UB_x)
+            F_B += D_v * (rhoA_x * d_rhoB_x - rhoB_x * d_rhoA_x)
+
+            contrib_A = F_A * inv_dx
+            contrib_B = F_B * inv_dx
+            rhs_A[iy, ix] += contrib_A
+            rhs_A[iy, jx] -= contrib_A
+            rhs_B[iy, ix] += contrib_B
+            rhs_B[iy, jx] -= contrib_B
+
+    for iy in range(ny):
+        ky = iy + 1
+        if ky == ny:
+            ky = 0
+        for ix in range(nx):
+            rhoA_y = 0.5 * (rho_A[iy, ix] + rho_A[ky, ix])
+            rhoB_y = 0.5 * (rho_B[iy, ix] + rho_B[ky, ix])
+            rho0_y = 0.5 * (rho0[iy, ix] + rho0[ky, ix])
+
+            d_rhoA_y = (rho_A[ky, ix] - rho_A[iy, ix]) * inv_dy
+            d_rhoB_y = (rho_B[ky, ix] - rho_B[iy, ix]) * inv_dy
+            d_rho0_y = (rho0[ky, ix] - rho0[iy, ix]) * inv_dy
+            d_UA_y = (U_A[ky, ix] - U_A[iy, ix]) * inv_dy
+            d_UB_y = (U_B[ky, ix] - U_B[iy, ix]) * inv_dy
+
+            F_A = D_A * (rho0_y * d_rhoA_y - rhoA_y * d_rho0_y - beta * rho0_y * rhoA_y * d_UA_y)
+            F_A += D_v * (rhoB_y * d_rhoA_y - rhoA_y * d_rhoB_y)
+            F_B = D_B * (rho0_y * d_rhoB_y - rhoB_y * d_rho0_y - beta * rho0_y * rhoB_y * d_UB_y)
+            F_B += D_v * (rhoA_y * d_rhoB_y - rhoB_y * d_rhoA_y)
+
+            contrib_A = F_A * inv_dy
+            contrib_B = F_B * inv_dy
+            rhs_A[iy, ix] += contrib_A
+            rhs_A[ky, ix] -= contrib_A
+            rhs_B[iy, ix] += contrib_B
+            rhs_B[ky, ix] -= contrib_B
+
+
+@njit(cache=True)
+def _stochastic_increment_periodic_numba(
+    rho_A: Array,
+    rho_B: Array,
+    dx: float,
+    dy: float,
+    vol: float,
+    D_A: float,
+    D_B: float,
+    D_v: float,
+    h_noise: float,
+    spatial_dim: int,
+    dt: float,
+    rho0: Array,
+    dW_A: Array,
+    dW_B: Array,
+    eta_A_x: Array,
+    eta_B_x: Array,
+    eta_A_y: Array,
+    eta_B_y: Array,
+    xi: Array,
+) -> None:
+    """Fast stochastic increment for fully-active periodic grids."""
+    ny, nx = rho_A.shape
+    _zero_array(dW_A)
+    _zero_array(dW_B)
+
+    inv_dx = 1.0 / dx
+    inv_dy = 1.0 / dy
+    scale_cv = np.sqrt(dt / vol)
+
+    for iy in range(ny):
+        for ix in range(nx):
+            jx = ix + 1
+            if jx == nx:
+                jx = 0
+            rhoA_x = 0.5 * (rho_A[iy, ix] + rho_A[iy, jx])
+            rhoB_x = 0.5 * (rho_B[iy, ix] + rho_B[iy, jx])
+            rho0_x = 0.5 * (rho0[iy, ix] + rho0[iy, jx])
+            amp_A = h_noise * np.sqrt(max(2.0 * D_A * rho0_x * rhoA_x, 0.0))
+            amp_B = h_noise * np.sqrt(max(2.0 * D_B * rho0_x * rhoB_x, 0.0))
+            contrib_A = scale_cv * amp_A * eta_A_x[iy, ix] * inv_dx
+            contrib_B = scale_cv * amp_B * eta_B_x[iy, ix] * inv_dx
+            dW_A[iy, ix] += contrib_A
+            dW_A[iy, jx] -= contrib_A
+            dW_B[iy, ix] += contrib_B
+            dW_B[iy, jx] -= contrib_B
+
+    for iy in range(ny):
+        ky = iy + 1
+        if ky == ny:
+            ky = 0
+        for ix in range(nx):
+            rhoA_y = 0.5 * (rho_A[iy, ix] + rho_A[ky, ix])
+            rhoB_y = 0.5 * (rho_B[iy, ix] + rho_B[ky, ix])
+            rho0_y = 0.5 * (rho0[iy, ix] + rho0[ky, ix])
+            amp_A = h_noise * np.sqrt(max(2.0 * D_A * rho0_y * rhoA_y, 0.0))
+            amp_B = h_noise * np.sqrt(max(2.0 * D_B * rho0_y * rhoB_y, 0.0))
+            contrib_A = scale_cv * amp_A * eta_A_y[iy, ix] * inv_dy
+            contrib_B = scale_cv * amp_B * eta_B_y[iy, ix] * inv_dy
+            dW_A[iy, ix] += contrib_A
+            dW_A[ky, ix] -= contrib_A
+            dW_B[iy, ix] += contrib_B
+            dW_B[ky, ix] -= contrib_B
+
+    voter_prefactor = 2.0 * spatial_dim * D_v * (h_noise ** (spatial_dim - 2))
+    for iy in range(ny):
+        for ix in range(nx):
+            amp_v = np.sqrt(max(voter_prefactor * rho_A[iy, ix] * rho_B[iy, ix], 0.0))
+            source = scale_cv * amp_v * xi[iy, ix]
+            dW_A[iy, ix] += source
+            dW_B[iy, ix] -= source
+
+# Numba parallelization is intentionally not enabled here: the conservative
+# face-scatter updates write to both neighboring cells, so naive prange would
+# introduce races. A parallel two-pass face-flux implementation can be added
+# later without changing the public API.
+
+
 @dataclass
 class ModelParameters:
     """Physical and numerical parameters for the finite-volume model.
@@ -425,6 +624,9 @@ class SchellingVoterFVSolver:
         species masses when limiting is needed.
     rng:
         Optional NumPy random generator used for stochastic increments.
+    use_periodic_fast_path:
+        If true, automatically dispatch fully active periodic grids to branch-free
+        specialized kernels; disable for benchmarking the generic path.
     """
 
     def __init__(
@@ -440,6 +642,7 @@ class SchellingVoterFVSolver:
         stochastic: bool = True,
         simplex_limiter: bool = True,
         rng: Optional[np.random.Generator] = None,
+        use_periodic_fast_path: bool = True,
     ) -> None:
         self.nx = int(nx)
         self.ny = int(ny)
@@ -456,6 +659,7 @@ class SchellingVoterFVSolver:
         self.simplex_limiter = bool(simplex_limiter)
         self.last_limiter_corrections = 0
         self.rng = np.random.default_rng() if rng is None else rng
+        self.use_periodic_fast_path = bool(use_periodic_fast_path)
 
         if self.bc not in {"periodic", "noflux"}:
             raise ValueError("bc must be 'periodic' or 'noflux'")
@@ -467,6 +671,9 @@ class SchellingVoterFVSolver:
             if active.shape != (self.ny, self.nx):
                 raise ValueError("active mask must have shape (ny, nx)")
             self.active = active.copy()
+
+        self.fully_active_periodic = self.bc_periodic == 1 and bool(np.all(self.active))
+        self._use_fast_periodic = self.use_periodic_fast_path and self.fully_active_periodic
 
         self.rho_A = np.zeros((self.ny, self.nx), dtype=np.float64)
         self.rho_B = np.zeros((self.ny, self.nx), dtype=np.float64)
@@ -491,13 +698,18 @@ class SchellingVoterFVSolver:
         self._eta_B_y = np.zeros((self.ny, self.nx), dtype=np.float64)
         self._xi = np.zeros((self.ny, self.nx), dtype=np.float64)
 
-        # Precompute Fourier wave numbers for the stiff step.
-        kx = 2.0 * np.pi * np.fft.fftfreq(self.nx, d=self.dx)
+        # Precompute real-FFT wave numbers and spectral work buffers for the
+        # stiff step. rfft2 keeps only nx//2+1 columns for real-valued fields.
+        kx = 2.0 * np.pi * np.fft.rfftfreq(self.nx, d=self.dx)
         ky = 2.0 * np.pi * np.fft.fftfreq(self.ny, d=self.dy)
-        self._KX, self._KY = np.meshgrid(kx, ky)
-        self._k2 = self._KX**2 + self._KY**2
-        self._k4 = self._k2**2
-        self._zero_mode = self._k4 == 0.0
+        self._KX_r, self._KY_r = np.meshgrid(kx, ky)
+        self._k2_r = self._KX_r**2 + self._KY_r**2
+        self._k4_r = self._k2_r**2
+        rshape = (self.ny, self.nx // 2 + 1)
+        self._rhoA_hat = np.zeros(rshape, dtype=np.complex128)
+        self._rhoB_hat = np.zeros(rshape, dtype=np.complex128)
+        self._stiff_tmp_hat = np.zeros(rshape, dtype=np.complex128)
+        self._stiff_det = np.zeros(rshape, dtype=np.float64)
 
     def apply_simplex_limiter(
         self,
@@ -554,62 +766,133 @@ class SchellingVoterFVSolver:
             "total": float(np.sum((occ + self._rho0)[self.active]) * self.vol),
         }
 
-    def explicit_rhs(self, rho_A: Array, rho_B: Array) -> Tuple[Array, Array]:
-        _explicit_rhs_numba(
-            rho_A,
-            rho_B,
-            self.active,
-            self.dx,
-            self.dy,
-            self.bc_periodic,
-            self.params.D_A,
-            self.params.D_B,
-            self.params.D_v,
-            self.params.beta,
-            self.params.kappa[0, 0],
-            self.params.kappa[0, 1],
-            self.params.kappa[1, 0],
-            self.params.kappa[1, 1],
-            self._rho0,
-            self._U_A,
-            self._U_B,
-            self._rhs_A,
-            self._rhs_B,
-        )
+    def _compute_rho0_for_state(self, rho_A: Array, rho_B: Array) -> Array:
+        """Refresh the vacancy scratch once for the supplied state."""
+        if self._use_fast_periodic:
+            _compute_rho0_periodic_inplace(rho_A, rho_B, self._rho0)
+        else:
+            _compute_rho0_inplace(rho_A, rho_B, self.active, self._rho0)
+        return self._rho0
+
+    def _fill_standard_normal(self, out: Array) -> None:
+        """Fill RNG scratch in-place when NumPy supports Generator(..., out=...)."""
+        try:
+            self.rng.standard_normal(out=out)
+        except TypeError:  # NumPy < 1.17-compatible fallback: same distribution, one temporary.
+            out[...] = self.rng.standard_normal(out.shape)
+
+    def explicit_rhs(self, rho_A: Array, rho_B: Array, rho0: Optional[Array] = None) -> Tuple[Array, Array]:
+        if rho0 is None:
+            rho0 = self._compute_rho0_for_state(rho_A, rho_B)
+
+        if self._use_fast_periodic:
+            _explicit_rhs_periodic_numba(
+                rho_A,
+                rho_B,
+                self.dx,
+                self.dy,
+                self.params.D_A,
+                self.params.D_B,
+                self.params.D_v,
+                self.params.beta,
+                self.params.kappa[0, 0],
+                self.params.kappa[0, 1],
+                self.params.kappa[1, 0],
+                self.params.kappa[1, 1],
+                rho0,
+                self._U_A,
+                self._U_B,
+                self._rhs_A,
+                self._rhs_B,
+            )
+        else:
+            _explicit_rhs_numba(
+                rho_A,
+                rho_B,
+                self.active,
+                self.dx,
+                self.dy,
+                self.bc_periodic,
+                self.params.D_A,
+                self.params.D_B,
+                self.params.D_v,
+                self.params.beta,
+                self.params.kappa[0, 0],
+                self.params.kappa[0, 1],
+                self.params.kappa[1, 0],
+                self.params.kappa[1, 1],
+                rho0,
+                self._U_A,
+                self._U_B,
+                self._rhs_A,
+                self._rhs_B,
+            )
         return self._rhs_A, self._rhs_B
 
-    def stochastic_increment(self, rho_A: Array, rho_B: Array, dt: float) -> Tuple[Array, Array]:
-        # Fill random buffers. These assignments still create temporaries from NumPy's RNG,
-        # but the large deterministic work arrays are reused in-place.
-        self._eta_A_x[...] = self.rng.standard_normal((self.ny, self.nx))
-        self._eta_B_x[...] = self.rng.standard_normal((self.ny, self.nx))
-        self._eta_A_y[...] = self.rng.standard_normal((self.ny, self.nx))
-        self._eta_B_y[...] = self.rng.standard_normal((self.ny, self.nx))
-        self._xi[...] = self.rng.standard_normal((self.ny, self.nx))
+    def stochastic_increment(
+        self,
+        rho_A: Array,
+        rho_B: Array,
+        dt: float,
+        rho0: Optional[Array] = None,
+    ) -> Tuple[Array, Array]:
+        if rho0 is None:
+            rho0 = self._compute_rho0_for_state(rho_A, rho_B)
 
-        _stochastic_increment_numba(
-            rho_A,
-            rho_B,
-            self.active,
-            self.dx,
-            self.dy,
-            self.vol,
-            self.bc_periodic,
-            self.params.D_A,
-            self.params.D_B,
-            self.params.D_v,
-            self.params.h_noise,
-            self.params.spatial_dim,
-            dt,
-            self._rho0,
-            self._dW_A,
-            self._dW_B,
-            self._eta_A_x,
-            self._eta_B_x,
-            self._eta_A_y,
-            self._eta_B_y,
-            self._xi,
-        )
+        # Fill preallocated random buffers directly when supported; this avoids
+        # five large temporary arrays per stochastic step on modern NumPy.
+        self._fill_standard_normal(self._eta_A_x)
+        self._fill_standard_normal(self._eta_B_x)
+        self._fill_standard_normal(self._eta_A_y)
+        self._fill_standard_normal(self._eta_B_y)
+        self._fill_standard_normal(self._xi)
+
+        if self._use_fast_periodic:
+            _stochastic_increment_periodic_numba(
+                rho_A,
+                rho_B,
+                self.dx,
+                self.dy,
+                self.vol,
+                self.params.D_A,
+                self.params.D_B,
+                self.params.D_v,
+                self.params.h_noise,
+                self.params.spatial_dim,
+                dt,
+                rho0,
+                self._dW_A,
+                self._dW_B,
+                self._eta_A_x,
+                self._eta_B_x,
+                self._eta_A_y,
+                self._eta_B_y,
+                self._xi,
+            )
+        else:
+            _stochastic_increment_numba(
+                rho_A,
+                rho_B,
+                self.active,
+                self.dx,
+                self.dy,
+                self.vol,
+                self.bc_periodic,
+                self.params.D_A,
+                self.params.D_B,
+                self.params.D_v,
+                self.params.h_noise,
+                self.params.spatial_dim,
+                dt,
+                rho0,
+                self._dW_A,
+                self._dW_B,
+                self._eta_A_x,
+                self._eta_B_x,
+                self._eta_A_y,
+                self._eta_B_y,
+                self._xi,
+            )
         return self._dW_A, self._dW_B
 
     def _assert_stiff_step_supported(self) -> None:
@@ -623,43 +906,67 @@ class SchellingVoterFVSolver:
     def semi_implicit_gamma_step(self, rho_A_star: Array, rho_B_star: Array, dt: float) -> Tuple[Array, Array]:
         self._assert_stiff_step_supported()
 
-        rho0_star = 1.0 - rho_A_star - rho_B_star
-        Mbar_A = self.params.beta * self.params.D_A * float(np.mean(rho0_star * rho_A_star))
-        Mbar_B = self.params.beta * self.params.D_B * float(np.mean(rho0_star * rho_B_star))
+        # Reuse the vacancy scratch for the mobility averages used by the same
+        # frozen-coefficient analytic 2x2 Fourier solve as before.
+        self._rho0[...] = 1.0
+        self._rho0 -= rho_A_star
+        self._rho0 -= rho_B_star
+        np.multiply(self._rho0, rho_A_star, out=self._rho_A_new)
+        Mbar_A = self.params.beta * self.params.D_A * float(np.mean(self._rho_A_new))
+        np.multiply(self._rho0, rho_B_star, out=self._rho_B_new)
+        Mbar_B = self.params.beta * self.params.D_B * float(np.mean(self._rho_B_new))
 
         g = self.params.gamma
-        alpha = dt * self._k4
+        alpha = dt * self._k4_r
 
+        # Build the determinant in a reusable real scratch array. The m_ij arrays
+        # are kept as scalar+alpha expressions to preserve the vectorized analytic
+        # inversion while reducing persistent allocations.
         m11 = 1.0 + alpha * (Mbar_A * g[0, 0])
         m12 = alpha * (Mbar_A * g[0, 1])
         m21 = alpha * (Mbar_B * g[1, 0])
         m22 = 1.0 + alpha * (Mbar_B * g[1, 1])
-        det = m11 * m22 - m12 * m21
+        np.multiply(m11, m22, out=self._stiff_det)
+        self._stiff_det -= m12 * m21
 
-        rhoA_hat = np.fft.fft2(rho_A_star)
-        rhoB_hat = np.fft.fft2(rho_B_star)
+        self._rhoA_hat[...] = np.fft.rfft2(rho_A_star)
+        self._rhoB_hat[...] = np.fft.rfft2(rho_B_star)
+        rhoA_zero = self._rhoA_hat[0, 0]
+        rhoB_zero = self._rhoB_hat[0, 0]
 
-        rhoA_new_hat = (m22 * rhoA_hat - m12 * rhoB_hat) / det
-        rhoB_new_hat = (-m21 * rhoA_hat + m11 * rhoB_hat) / det
+        # In-place 2x2 inverse: tmp = A_new, rhoB_hat = B_new, rhoA_hat = tmp.
+        np.multiply(m22, self._rhoA_hat, out=self._stiff_tmp_hat)
+        self._stiff_tmp_hat -= m12 * self._rhoB_hat
+        self._stiff_tmp_hat /= self._stiff_det
 
-        # Preserve exact zero mode => exact conservation of species masses in stiff step.
-        rhoA_new_hat[self._zero_mode] = rhoA_hat[self._zero_mode]
-        rhoB_new_hat[self._zero_mode] = rhoB_hat[self._zero_mode]
+        self._rhoB_hat *= m11
+        self._rhoB_hat += (-m21) * self._rhoA_hat
+        self._rhoB_hat /= self._stiff_det
+        self._rhoA_hat[...] = self._stiff_tmp_hat
 
-        self._rho_A_new[...] = np.real(np.fft.ifft2(rhoA_new_hat))
-        self._rho_B_new[...] = np.real(np.fft.ifft2(rhoB_new_hat))
+        # Preserve the exact zero mode => exact conservation of species masses in
+        # the stiff step, matching the complex FFT implementation.
+        self._rhoA_hat[0, 0] = rhoA_zero
+        self._rhoB_hat[0, 0] = rhoB_zero
+
+        self._rho_A_new[...] = np.fft.irfft2(self._rhoA_hat, s=(self.ny, self.nx))
+        self._rho_B_new[...] = np.fft.irfft2(self._rhoB_hat, s=(self.ny, self.nx))
         return self._rho_A_new, self._rho_B_new
 
     def step(self, dt: float, add_noise: Optional[bool] = None) -> None:
         if add_noise is None:
             add_noise = self.stochastic
 
-        rhs_A, rhs_B = self.explicit_rhs(self.rho_A, self.rho_B)
+        # Compute vacancy once for this timestep and share it between the
+        # deterministic and stochastic kernels. Both increments are evaluated at
+        # the same pre-step state, preserving the original scheme.
+        rho0 = self._compute_rho0_for_state(self.rho_A, self.rho_B)
+        rhs_A, rhs_B = self.explicit_rhs(self.rho_A, self.rho_B, rho0=rho0)
         self._rho_A_star[...] = self.rho_A + dt * rhs_A
         self._rho_B_star[...] = self.rho_B + dt * rhs_B
 
         if add_noise:
-            dW_A, dW_B = self.stochastic_increment(self.rho_A, self.rho_B, dt)
+            dW_A, dW_B = self.stochastic_increment(self.rho_A, self.rho_B, dt, rho0=rho0)
             self._rho_A_star += dW_A
             self._rho_B_star += dW_B
 
@@ -673,29 +980,60 @@ class SchellingVoterFVSolver:
             rho_A_new = self._rho_A_star
             rho_B_new = self._rho_B_star
 
-        self.rho_A[...] = np.where(self.active, rho_A_new, 0.0)
-        self.rho_B[...] = np.where(self.active, rho_B_new, 0.0)
+        if self.fully_active_periodic:
+            self.rho_A[...] = rho_A_new
+            self.rho_B[...] = rho_B_new
+        else:
+            self.rho_A[...] = np.where(self.active, rho_A_new, 0.0)
+            self.rho_B[...] = np.where(self.active, rho_B_new, 0.0)
         if self.simplex_limiter:
             limiter_corrections += self.apply_simplex_limiter()
             self.last_limiter_corrections = limiter_corrections
 
-    def run(self, dt: float, nsteps: int, snapshot_every: int = 0, add_noise: Optional[bool] = None) -> Dict[str, Array]:
+    def run(
+        self,
+        dt: float,
+        nsteps: int,
+        snapshot_every: int = 0,
+        add_noise: Optional[bool] = None,
+        record_masses_every: int = 0,
+        record_snapshots_every: Optional[int] = None,
+    ) -> Dict[str, Array]:
+        """Advance for ``nsteps`` with optional diagnostics decimation.
+
+        ``record_masses_every=1`` reproduces the previous behavior of computing
+        mass diagnostics at every step. The default ``0`` records only the
+        initial and final masses, avoiding an O(ncells) diagnostic pass per step
+        in production runs. ``record_snapshots_every`` is an alias for the older
+        ``snapshot_every`` argument; when omitted, ``snapshot_every`` is used.
+        """
+        if record_snapshots_every is None:
+            record_snapshots_every = snapshot_every
+        if record_masses_every < 0 or record_snapshots_every < 0:
+            raise ValueError("record intervals must be non-negative")
+
         masses_A = []
         masses_B = []
         masses_occ = []
         masses_tot = []
-        times = []
+        mass_times = []
         snapshots = []
 
-        for n in range(nsteps + 1):
-            m = self.total_masses()
-            masses_A.append(m["A"])
-            masses_B.append(m["B"])
-            masses_occ.append(m["occupied"])
-            masses_tot.append(m["total"])
-            times.append(n * dt)
+        def should_record_mass(step_index: int) -> bool:
+            if step_index == 0 or step_index == nsteps:
+                return True
+            return record_masses_every > 0 and step_index % record_masses_every == 0
 
-            if snapshot_every > 0 and n % snapshot_every == 0:
+        for n in range(nsteps + 1):
+            if should_record_mass(n):
+                m = self.total_masses()
+                masses_A.append(m["A"])
+                masses_B.append(m["B"])
+                masses_occ.append(m["occupied"])
+                masses_tot.append(m["total"])
+                mass_times.append(n * dt)
+
+            if record_snapshots_every > 0 and n % record_snapshots_every == 0:
                 snapshots.append((n * dt, self.rho_A.copy(), self.rho_B.copy()))
 
             if n == nsteps:
@@ -703,7 +1041,7 @@ class SchellingVoterFVSolver:
             self.step(dt, add_noise=add_noise)
 
         out = {
-            "time": np.array(times),
+            "time": np.array(mass_times),
             "mass_A": np.array(masses_A),
             "mass_B": np.array(masses_B),
             "mass_occupied": np.array(masses_occ),
@@ -711,7 +1049,7 @@ class SchellingVoterFVSolver:
             "rho_A": self.rho_A.copy(),
             "rho_B": self.rho_B.copy(),
         }
-        if snapshot_every > 0:
+        if record_snapshots_every > 0:
             out["snapshots"] = np.array(snapshots, dtype=object)
         return out
 
@@ -734,6 +1072,66 @@ def make_random_initial_condition(
     rho_A = rhoA0 + noise * rng.standard_normal((ny, nx))
     rho_B = rhoB0 + noise * rng.standard_normal((ny, nx))
     return rho_A, rho_B
+
+
+def benchmark_fast_paths(nx: int = 96, ny: int = 96, nsteps: int = 100, dt: float = 2e-5) -> None:
+    """Compare generic masked periodic and specialized periodic kernels.
+
+    The generic case disables only the fast-path dispatcher while keeping the
+    same fully active periodic state, so timings isolate the hot-kernel speedup.
+    """
+    lx = ly = 1.0
+    params = ModelParameters(
+        D_A=0.1,
+        D_B=0.1,
+        D_v=0.05,
+        beta=10.0,
+        h_noise=min(lx / nx, ly / ny),
+        kappa=np.array([[0.6, -0.2], [-0.2, 0.6]], dtype=float),
+        gamma=np.array([[1.0, 0.0], [0.0, 1.0]], dtype=float),
+    )
+    rho_A0, rho_B0 = make_random_initial_condition(nx, ny, seed=11)
+
+    def build_solver(seed: int, use_fast: bool, stochastic: bool) -> SchellingVoterFVSolver:
+        solver = SchellingVoterFVSolver(
+            nx=nx,
+            ny=ny,
+            lx=lx,
+            ly=ly,
+            params=params,
+            bc="periodic",
+            semi_implicit_stiff=True,
+            stochastic=stochastic,
+            simplex_limiter=False,
+            rng=np.random.default_rng(seed),
+            use_periodic_fast_path=use_fast,
+        )
+        solver.set_state(rho_A0, rho_B0)
+        return solver
+
+    # Trigger Numba compilation outside the timed region for both dispatch paths.
+    for use_fast in (False, True):
+        for stochastic in (False, True):
+            warm = build_solver(123, use_fast, stochastic)
+            warm.step(dt, add_noise=stochastic)
+
+    print(f"Benchmark: {nx}x{ny}, nsteps={nsteps}, dt={dt:g}")
+    for stochastic in (False, True):
+        label = "with stochastic noise" if stochastic else "deterministic only"
+        timings = {}
+        for name, use_fast in (("generic periodic", False), ("fast periodic", True)):
+            solver = build_solver(123, use_fast, stochastic)
+            t0 = time.perf_counter()
+            solver.run(dt=dt, nsteps=nsteps, add_noise=stochastic, record_masses_every=0)
+            elapsed = time.perf_counter() - t0
+            timings[name] = elapsed
+            masses = solver.total_masses()
+            print(
+                f"  {label:24s} | {name:16s}: {elapsed:8.4f} s "
+                f"(M_occ={masses['occupied']:.12g}, M_total={masses['total']:.12g})"
+            )
+        speedup = timings["generic periodic"] / timings["fast periodic"]
+        print(f"  speedup ({label}): {speedup:.3f}x")
 
 
 def main() -> None:
