@@ -1,34 +1,36 @@
 #!/usr/bin/env python3
 """
-Optimized conservative Cartesian finite-volume solver for the stochastic
-Schelling+Voter hydrodynamics on a regular 2D grid.
+Conservative Cartesian finite-volume solver for stochastic Schelling--Voter
+hydrodynamics on a regular two-dimensional grid.
 
-Main optimizations compared to the baseline prototype
-----------------------------------------------------
-1. Vectorized semi-implicit stiff step in Fourier space.
-   The previous Python loop over all Fourier modes has been replaced by an
-   analytic batched inversion of the 2x2 Fourier-space systems.
+The solver evolves two occupied-density fields, ``rho_A`` and ``rho_B``.  The
+vacancy field is defined by ``rho_0 = 1 - rho_A - rho_B``, so physically
+admissible states lie in the cellwise simplex
 
-2. Numba-jitted explicit deterministic RHS and stochastic increment kernels.
-   The hot path now uses conservative face-based updates in compiled loops.
+    rho_A >= 0, rho_B >= 0, rho_A + rho_B <= 1.
 
-3. Reduced memory allocation.
-   Large work arrays are allocated once in __init__ and then filled in-place.
+A positivity/simplex limiter is applied after state assignment and, by default,
+after each time step.  The limiter is local and ratio-preserving: negative
+species densities are clipped to zero and cells with occupied density above one
+are rescaled so that ``rho_A + rho_B == 1``.  This keeps every active cell in the
+admissible set before the next deterministic or stochastic increment is formed.
+Because the limiter is local, it prioritizes admissibility over exact species-mass
+conservation when a step leaves the simplex.
 
-Noise implementation
---------------------
-* Schelling conservative noise: one Gaussian draw per face, shared by the two
-  adjacent cells. This makes the discrete Schelling noise exactly conservative.
-* Voter demographic noise: one Gaussian draw per cell, reused with opposite
-  sign for species A and B. Hence occupied mass rho_A + rho_B is preserved
-  exactly up to floating-point roundoff.
+Numerical scheme
+----------------
+* The deterministic finite-volume update is conservative and face based.  It
+  supports active masks and either periodic or no-flux boundary conditions.
+* Conservative Schelling noise uses one Gaussian draw per face shared by the two
+  adjacent cells, making the discrete stochastic flux exactly conservative.
+* Voter demographic noise uses one Gaussian draw per cell with opposite signs
+  for species A and B, preserving occupied mass up to floating-point roundoff.
+* The optional semi-implicit Gamma step is evaluated in Fourier space.  It is
+  currently available for periodic boundary conditions on a fully active grid.
 
-Notes
------
-* The explicit step supports an active mask and either periodic or no-flux BC.
-* The semi-implicit Gamma step is currently implemented for periodic BC and a
-  fully active regular grid only.
-* This remains a research prototype: no positivity/simplex limiter is included.
+This module is intended as a compact research implementation: it favors clear
+finite-volume structure, reusable scratch buffers, and explicit documentation of
+where conservation and limiting enter the update.
 """
 
 from __future__ import annotations
@@ -66,6 +68,49 @@ def _compute_rho0_inplace(rho_A: Array, rho_B: Array, active: Array, rho0: Array
                 rho0[iy, ix] = 1.0 - rho_A[iy, ix] - rho_B[iy, ix]
             else:
                 rho0[iy, ix] = 0.0
+
+
+@njit(cache=True)
+def _apply_simplex_limiter_numba(rho_A: Array, rho_B: Array, active: Array) -> int:
+    """Project active cells into rho_A >= 0, rho_B >= 0, rho_A + rho_B <= 1."""
+    ny, nx = rho_A.shape
+    corrected = 0
+    for iy in range(ny):
+        for ix in range(nx):
+            if not active[iy, ix]:
+                if rho_A[iy, ix] != 0.0 or rho_B[iy, ix] != 0.0:
+                    corrected += 1
+                rho_A[iy, ix] = 0.0
+                rho_B[iy, ix] = 0.0
+                continue
+
+            ra = rho_A[iy, ix]
+            rb = rho_B[iy, ix]
+            original_ra = ra
+            original_rb = rb
+
+            if not np.isfinite(ra):
+                ra = 0.0
+            if not np.isfinite(rb):
+                rb = 0.0
+
+            if ra < 0.0:
+                ra = 0.0
+            if rb < 0.0:
+                rb = 0.0
+
+            occupied = ra + rb
+            if occupied > 1.0:
+                inv_occupied = 1.0 / occupied
+                ra *= inv_occupied
+                rb *= inv_occupied
+
+            rho_A[iy, ix] = ra
+            rho_B[iy, ix] = rb
+            if ra != original_ra or rb != original_rb:
+                corrected += 1
+
+    return corrected
 
 
 @njit(cache=True)
@@ -316,6 +361,15 @@ def _stochastic_increment_numba(
 
 @dataclass
 class ModelParameters:
+    """Physical and numerical parameters for the finite-volume model.
+
+    ``D_A`` and ``D_B`` set species-vacancy mobility scales, ``D_v`` controls
+    voter exchange, ``beta`` scales utility-driven drift, and ``h_noise`` is the
+    microscopic length scale entering the fluctuation amplitudes.  ``kappa`` is
+    the local linear utility matrix, while ``gamma`` is the matrix used by the
+    optional stiff nonlocal regularization step.
+    """
+
     D_A: float = 0.1
     D_B: float = 0.1
     D_v: float = 0.01
@@ -342,7 +396,37 @@ class ModelParameters:
             raise NotImplementedError("This implementation currently assumes d = 2.")
 
 
-class SchellingVoterFVSolverOptimized:
+class SchellingVoterFVSolver:
+    """Finite-volume integrator for two-species Schelling--Voter fields.
+
+    Parameters
+    ----------
+    nx, ny:
+        Number of finite-volume cells in the x and y directions.
+    lx, ly:
+        Physical domain lengths.
+    params:
+        Transport, interaction, and stochastic-noise parameters.
+    active:
+        Optional boolean mask selecting cells that participate in the update.
+        Inactive cells are forced to zero density by the simplex limiter.
+    bc:
+        Boundary condition for explicit fluxes, either ``"periodic"`` or
+        ``"noflux"``.
+    semi_implicit_stiff:
+        If true, apply the Fourier-space semi-implicit Gamma step after the
+        explicit/stochastic update.
+    stochastic:
+        Default value used by :meth:`step` and :meth:`run` when ``add_noise`` is
+        not provided.
+    simplex_limiter:
+        If true, project fields into the pointwise simplex after state
+        assignment and each step.  The projection is local and may modify
+        species masses when limiting is needed.
+    rng:
+        Optional NumPy random generator used for stochastic increments.
+    """
+
     def __init__(
         self,
         nx: int,
@@ -354,6 +438,7 @@ class SchellingVoterFVSolverOptimized:
         bc: str = "periodic",
         semi_implicit_stiff: bool = True,
         stochastic: bool = True,
+        simplex_limiter: bool = True,
         rng: Optional[np.random.Generator] = None,
     ) -> None:
         self.nx = int(nx)
@@ -368,6 +453,8 @@ class SchellingVoterFVSolverOptimized:
         self.bc_periodic = 1 if self.bc == "periodic" else 0
         self.semi_implicit_stiff = semi_implicit_stiff
         self.stochastic = stochastic
+        self.simplex_limiter = bool(simplex_limiter)
+        self.last_limiter_corrections = 0
         self.rng = np.random.default_rng() if rng is None else rng
 
         if self.bc not in {"periodic", "noflux"}:
@@ -412,13 +499,45 @@ class SchellingVoterFVSolverOptimized:
         self._k4 = self._k2**2
         self._zero_mode = self._k4 == 0.0
 
+    def apply_simplex_limiter(
+        self,
+        rho_A: Optional[Array] = None,
+        rho_B: Optional[Array] = None,
+    ) -> int:
+        """Project density fields into the pointwise physical simplex.
+
+        Parameters
+        ----------
+        rho_A, rho_B:
+            Optional arrays to limit in-place.  When omitted, the solver state
+            arrays are limited.
+
+        Returns
+        -------
+        int
+            Number of cells whose values were modified.
+        """
+        if (rho_A is None) != (rho_B is None):
+            raise ValueError("rho_A and rho_B must be provided together")
+        if rho_A is None:
+            rho_A = self.rho_A
+            rho_B = self.rho_B
+        if rho_A.shape != (self.ny, self.nx) or rho_B.shape != (self.ny, self.nx):
+            raise ValueError("rho_A and rho_B must have shape (ny, nx)")
+        corrections = _apply_simplex_limiter_numba(rho_A, rho_B, self.active)
+        self.last_limiter_corrections = int(corrections)
+        return self.last_limiter_corrections
+
     def set_state(self, rho_A: Array, rho_B: Array) -> None:
+        """Set the solver state and enforce mask/simplex constraints if enabled."""
         rho_A = np.asarray(rho_A, dtype=np.float64)
         rho_B = np.asarray(rho_B, dtype=np.float64)
         if rho_A.shape != (self.ny, self.nx) or rho_B.shape != (self.ny, self.nx):
             raise ValueError("rho_A and rho_B must have shape (ny, nx)")
         self.rho_A[...] = np.where(self.active, rho_A, 0.0)
         self.rho_B[...] = np.where(self.active, rho_B, 0.0)
+        if self.simplex_limiter:
+            self.apply_simplex_limiter()
 
     def rho_0(self) -> Array:
         _compute_rho0_inplace(self.rho_A, self.rho_B, self.active, self._rho0)
@@ -544,6 +663,10 @@ class SchellingVoterFVSolverOptimized:
             self._rho_A_star += dW_A
             self._rho_B_star += dW_B
 
+        limiter_corrections = 0
+        if self.simplex_limiter:
+            limiter_corrections += self.apply_simplex_limiter(self._rho_A_star, self._rho_B_star)
+
         if self.semi_implicit_stiff:
             rho_A_new, rho_B_new = self.semi_implicit_gamma_step(self._rho_A_star, self._rho_B_star, dt)
         else:
@@ -552,6 +675,9 @@ class SchellingVoterFVSolverOptimized:
 
         self.rho_A[...] = np.where(self.active, rho_A_new, 0.0)
         self.rho_B[...] = np.where(self.active, rho_B_new, 0.0)
+        if self.simplex_limiter:
+            limiter_corrections += self.apply_simplex_limiter()
+            self.last_limiter_corrections = limiter_corrections
 
     def run(self, dt: float, nsteps: int, snapshot_every: int = 0, add_noise: Optional[bool] = None) -> Dict[str, Array]:
         masses_A = []
@@ -598,6 +724,12 @@ def make_random_initial_condition(
     noise: float = 1e-2,
     seed: int = 0,
 ) -> Tuple[Array, Array]:
+    """Create a noisy two-species initial condition on a ``(ny, nx)`` grid.
+
+    The returned arrays are intentionally not clipped here so callers can choose
+    whether to inspect raw perturbations or rely on ``SchellingVoterFVSolver`` to
+    apply its simplex limiter during ``set_state``.
+    """
     rng = np.random.default_rng(seed)
     rho_A = rhoA0 + noise * rng.standard_normal((ny, nx))
     rho_B = rhoB0 + noise * rng.standard_normal((ny, nx))
@@ -620,7 +752,7 @@ def main() -> None:
         gamma=np.array([[1.0, 0.0], [0.0, 1.0]], dtype=float),
     )
 
-    solver = SchellingVoterFVSolverOptimized(
+    solver = SchellingVoterFVSolver(
         nx=nx,
         ny=ny,
         lx=lx,
