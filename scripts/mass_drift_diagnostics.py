@@ -24,7 +24,7 @@ import argparse
 import sys
 from pathlib import Path
 from dataclasses import dataclass
-from typing import Callable, Dict, Iterable, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 import numpy as np
 
@@ -45,6 +45,47 @@ from finite_volume_stochastic import (
 Array = np.ndarray
 Masses = Dict[str, float]
 
+
+@dataclass
+class ProjectionStepStats:
+    """Mass and cell accounting for all projection calls in one time step."""
+
+    events: int = 0
+    changed_cells: int = 0
+    negative_A_cells: int = 0
+    negative_B_cells: int = 0
+    occupied_above_one_cells: int = 0
+    dM_A: float = 0.0
+    dM_B: float = 0.0
+    dM_occ: float = 0.0
+    dM_total: float = 0.0
+    abs_dM_A: float = 0.0
+    abs_dM_B: float = 0.0
+    abs_dM_occ: float = 0.0
+    abs_dM_total: float = 0.0
+
+
+@dataclass
+class LongRunResult:
+    name: str
+    projection_enabled: bool
+    dt: float
+    nsteps: int
+    record_every: int
+    times: Array
+    steps: Array
+    masses: Dict[str, Array]
+    drifts: Dict[str, Array]
+    projection_events: int
+    projection_changed_cells: int
+    projection_negative_A_cells: int
+    projection_negative_B_cells: int
+    projection_occupied_above_one_cells: int
+    projection_drift: Masses
+    projection_abs_drift: Masses
+    drift_stats: Dict[str, Dict[str, float]]
+    csv_path: Optional[Path]
+    projection_csv_path: Optional[Path]
 
 @dataclass
 class CaseResult:
@@ -359,6 +400,456 @@ def compare_fast_and_generic_stochastic(
     return 0
 
 
+def user_long_run_params(nx: int, ny: int, lx: float, ly: float) -> ModelParameters:
+    """Parameter set requested for the long-run mass-drift stress diagnostic."""
+    return ModelParameters(
+        D_A=0.1,
+        D_B=0.1,
+        D_v=0.0,
+        beta=10.0,
+        h_noise=min(lx / nx, ly / ny),
+        kappa=np.array([[0.6, -0.4], [-0.4, 0.6]], dtype=float),
+        gamma=np.array([[1.0, 0.0], [0.0, 1.0]], dtype=float),
+    )
+
+
+def clone_params(params: ModelParameters, **overrides: Any) -> ModelParameters:
+    values = {
+        "D_A": params.D_A,
+        "D_B": params.D_B,
+        "D_v": params.D_v,
+        "beta": params.beta,
+        "h_noise": params.h_noise,
+        "spatial_dim": params.spatial_dim,
+        "kappa": params.kappa.copy(),
+        "gamma": params.gamma.copy(),
+    }
+    values.update(overrides)
+    return ModelParameters(**values)
+
+
+def build_long_run_solver(
+    nx: int,
+    ny: int,
+    lx: float,
+    ly: float,
+    seed: int,
+    params: ModelParameters,
+    projection_enabled: bool,
+    rho_A0: Array,
+    rho_B0: Array,
+) -> SchellingVoterFVSolver:
+    solver = SchellingVoterFVSolver(
+        nx=nx,
+        ny=ny,
+        lx=lx,
+        ly=ly,
+        params=params,
+        bc="periodic",
+        semi_implicit_stiff=True,
+        stochastic=True,
+        simplex_limiter=projection_enabled,
+        rng=np.random.default_rng(seed),
+        use_periodic_fast_path=True,
+    )
+    solver.set_state(rho_A0, rho_B0)
+    return solver
+
+
+def make_sharp_interface_initial_condition(nx: int, ny: int, seed: int, total_occ: float = 0.92) -> Tuple[Array, Array]:
+    """Occupied, segregated state used to stress sharp interfaces without changing the scheme."""
+    rng = np.random.default_rng(seed)
+    rho_A = np.empty((ny, nx), dtype=float)
+    rho_B = np.empty((ny, nx), dtype=float)
+    left = np.arange(nx)[None, :] < nx // 2
+    rho_A[...] = np.where(left, 0.86 * total_occ, 0.08 * total_occ)
+    rho_B[...] = np.where(left, 0.08 * total_occ, 0.86 * total_occ)
+    perturb = 2.0e-3 * rng.standard_normal((ny, nx))
+    rho_A += perturb
+    rho_B -= perturb
+    np.maximum(rho_A, 0.0, out=rho_A)
+    np.maximum(rho_B, 0.0, out=rho_B)
+    occ = rho_A + rho_B
+    too_full = occ > total_occ
+    rho_A[too_full] *= total_occ / occ[too_full]
+    rho_B[too_full] *= total_occ / occ[too_full]
+    return rho_A, rho_B
+
+
+def projection_delta_for_arrays(
+    solver: SchellingVoterFVSolver,
+    before_A: Array,
+    before_B: Array,
+    after_A: Array,
+    after_B: Array,
+) -> ProjectionStepStats:
+    before = masses_for(solver, before_A, before_B)
+    after = masses_for(solver, after_A, after_B)
+    delta = mass_delta(after, before)
+    breakdown = projection_breakdown(before_A, before_B, after_A, after_B)
+    changed = int(breakdown["changed_cells"])
+    stats = ProjectionStepStats()
+    if changed > 0:
+        stats.events = 1
+    stats.changed_cells = changed
+    stats.negative_A_cells = int(breakdown["A_negative_cells"])
+    stats.negative_B_cells = int(breakdown["B_negative_cells"])
+    stats.occupied_above_one_cells = int(breakdown["occupied_above_one_after_negative_clip_cells"])
+    stats.dM_A = delta["A"]
+    stats.dM_B = delta["B"]
+    stats.dM_occ = delta["occupied"]
+    stats.dM_total = delta["total"]
+    stats.abs_dM_A = abs(delta["A"])
+    stats.abs_dM_B = abs(delta["B"])
+    stats.abs_dM_occ = abs(delta["occupied"])
+    stats.abs_dM_total = abs(delta["total"])
+    return stats
+
+
+def add_projection_stats(total: ProjectionStepStats, inc: ProjectionStepStats) -> None:
+    for field in (
+        "events", "changed_cells", "negative_A_cells", "negative_B_cells", "occupied_above_one_cells",
+        "dM_A", "dM_B", "dM_occ", "dM_total", "abs_dM_A", "abs_dM_B", "abs_dM_occ", "abs_dM_total",
+    ):
+        setattr(total, field, getattr(total, field) + getattr(inc, field))
+
+
+def diagnostic_full_step(solver: SchellingVoterFVSolver, dt: float, add_noise: bool = True) -> ProjectionStepStats:
+    """Mirror ``SchellingVoterFVSolver.step`` while accounting for projection mass changes."""
+    rho0 = solver._compute_rho0_for_state(solver.rho_A, solver.rho_B)
+    rhs_A, rhs_B = solver.explicit_rhs(solver.rho_A, solver.rho_B, rho0=rho0)
+    solver._rho_A_star[...] = solver.rho_A + dt * rhs_A
+    solver._rho_B_star[...] = solver.rho_B + dt * rhs_B
+
+    if add_noise:
+        dW_A, dW_B = solver.stochastic_increment(solver.rho_A, solver.rho_B, dt, rho0=rho0)
+        solver._rho_A_star += dW_A
+        solver._rho_B_star += dW_B
+
+    projection_stats = ProjectionStepStats()
+    if solver.simplex_limiter:
+        before_A = solver._rho_A_star.copy()
+        before_B = solver._rho_B_star.copy()
+        solver.apply_simplex_limiter(solver._rho_A_star, solver._rho_B_star)
+        add_projection_stats(
+            projection_stats,
+            projection_delta_for_arrays(solver, before_A, before_B, solver._rho_A_star, solver._rho_B_star),
+        )
+
+    if solver.semi_implicit_stiff:
+        rho_A_new, rho_B_new = solver.semi_implicit_gamma_step(solver._rho_A_star, solver._rho_B_star, dt)
+    else:
+        rho_A_new = solver._rho_A_star
+        rho_B_new = solver._rho_B_star
+
+    if solver.fully_active_periodic:
+        solver.rho_A[...] = rho_A_new
+        solver.rho_B[...] = rho_B_new
+    else:
+        solver.rho_A[...] = np.where(solver.active, rho_A_new, 0.0)
+        solver.rho_B[...] = np.where(solver.active, rho_B_new, 0.0)
+
+    if solver.simplex_limiter:
+        before_A = solver.rho_A.copy()
+        before_B = solver.rho_B.copy()
+        solver.apply_simplex_limiter()
+        add_projection_stats(
+            projection_stats,
+            projection_delta_for_arrays(solver, before_A, before_B, solver.rho_A, solver.rho_B),
+        )
+        solver.last_limiter_corrections = projection_stats.changed_cells
+    return projection_stats
+
+
+def drift_series_stats(times: Array, drift: Array) -> Dict[str, float]:
+    if len(drift) == 0:
+        return {"final": 0.0, "max_abs": 0.0, "rms": 0.0, "slope": 0.0}
+    if len(drift) >= 2 and np.ptp(times) > 0.0:
+        slope = float(np.polyfit(times, drift, 1)[0])
+    else:
+        slope = 0.0
+    return {
+        "final": float(drift[-1]),
+        "max_abs": float(np.max(np.abs(drift))),
+        "rms": float(np.sqrt(np.mean(drift * drift))),
+        "slope": slope,
+    }
+
+
+def write_long_run_csv(path: Path, result: LongRunResult) -> None:
+    header = [
+        "step", "time", "M_A", "M_B", "M_occ", "M_0", "M_total",
+        "dM_A", "dM_B", "dM_occ", "dM_0", "dM_total",
+    ]
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as fh:
+        fh.write(",".join(header) + "\n")
+        for i in range(len(result.steps)):
+            row = [
+                result.steps[i], result.times[i],
+                result.masses["A"][i], result.masses["B"][i], result.masses["occupied"][i],
+                result.masses["vacancy"][i], result.masses["total"][i],
+                result.drifts["A"][i], result.drifts["B"][i], result.drifts["occupied"][i],
+                result.drifts["vacancy"][i], result.drifts["total"][i],
+            ]
+            fh.write(",".join(str(x) for x in row) + "\n")
+
+
+def write_projection_activity_csv(path: Path, rows: List[Tuple[int, ProjectionStepStats]]) -> None:
+    """Write one row per step so rare projection activations can be located exactly."""
+    header = [
+        "step", "activated", "changed_cells", "negative_A_cells", "negative_B_cells",
+        "occupied_above_one_cells", "dM_A", "dM_B", "dM_occ", "dM_total",
+        "abs_dM_A", "abs_dM_B", "abs_dM_occ", "abs_dM_total",
+    ]
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as fh:
+        fh.write(",".join(header) + "\n")
+        for step, stats in rows:
+            row = [
+                step,
+                int(stats.events > 0),
+                stats.changed_cells,
+                stats.negative_A_cells,
+                stats.negative_B_cells,
+                stats.occupied_above_one_cells,
+                stats.dM_A,
+                stats.dM_B,
+                stats.dM_occ,
+                stats.dM_total,
+                stats.abs_dM_A,
+                stats.abs_dM_B,
+                stats.abs_dM_occ,
+                stats.abs_dM_total,
+            ]
+            fh.write(",".join(str(x) for x in row) + "\n")
+
+
+def run_long_run_diagnostic(
+    name: str,
+    solver: SchellingVoterFVSolver,
+    dt: float,
+    nsteps: int,
+    record_every: int,
+    output_dir: Optional[Path] = None,
+) -> LongRunResult:
+    print(f"\n=== long-run drift stress: {name} ===")
+    if record_every <= 0:
+        raise ValueError("record_every must be positive")
+    initial = masses_for(solver, solver.rho_A, solver.rho_B)
+    recorded_steps: List[int] = []
+    recorded_times: List[float] = []
+    mass_series: Dict[str, List[float]] = {key: [] for key in initial}
+    projection_total = ProjectionStepStats()
+    projection_rows: List[Tuple[int, ProjectionStepStats]] = []
+
+    def record(step: int) -> None:
+        m = masses_for(solver, solver.rho_A, solver.rho_B)
+        recorded_steps.append(step)
+        recorded_times.append(step * dt)
+        for key, value in m.items():
+            mass_series[key].append(value)
+        delta = mass_delta(m, initial)
+        print(
+            f"  step {step:>8}/{nsteps}: "
+            f"dM_A={delta['A']:+.3e}, dM_B={delta['B']:+.3e}, "
+            f"dM_occ={delta['occupied']:+.3e}, dM_0={delta['vacancy']:+.3e}, "
+            f"dM_total={delta['total']:+.3e}, projection_events={projection_total.events}"
+        )
+
+    record(0)
+    for step in range(1, nsteps + 1):
+        step_projection = diagnostic_full_step(solver, dt, add_noise=True)
+        add_projection_stats(projection_total, step_projection)
+        if solver.simplex_limiter:
+            projection_rows.append((step, step_projection))
+        if step % record_every == 0 or step == nsteps:
+            record(step)
+
+    masses = {key: np.array(values, dtype=float) for key, values in mass_series.items()}
+    drifts = {key: values - initial[key] for key, values in masses.items()}
+    times = np.array(recorded_times, dtype=float)
+    steps = np.array(recorded_steps, dtype=int)
+    stats = {key: drift_series_stats(times, drift) for key, drift in drifts.items()}
+    projection_drift = {
+        "A": projection_total.dM_A,
+        "B": projection_total.dM_B,
+        "occupied": projection_total.dM_occ,
+        "vacancy": -projection_total.dM_occ,
+        "total": projection_total.dM_total,
+    }
+    projection_abs_drift = {
+        "A": projection_total.abs_dM_A,
+        "B": projection_total.abs_dM_B,
+        "occupied": projection_total.abs_dM_occ,
+        "vacancy": projection_total.abs_dM_occ,
+        "total": projection_total.abs_dM_total,
+    }
+    csv_path = None
+    result = LongRunResult(
+        name=name,
+        projection_enabled=solver.simplex_limiter,
+        dt=dt,
+        nsteps=nsteps,
+        record_every=record_every,
+        times=times,
+        steps=steps,
+        masses=masses,
+        drifts=drifts,
+        projection_events=projection_total.events,
+        projection_changed_cells=projection_total.changed_cells,
+        projection_negative_A_cells=projection_total.negative_A_cells,
+        projection_negative_B_cells=projection_total.negative_B_cells,
+        projection_occupied_above_one_cells=projection_total.occupied_above_one_cells,
+        projection_drift=projection_drift,
+        projection_abs_drift=projection_abs_drift,
+        drift_stats=stats,
+        csv_path=None,
+        projection_csv_path=None,
+    )
+    if output_dir is not None:
+        safe_name = "".join(c if c.isalnum() or c in "-_" else "_" for c in name.lower())
+        csv_path = output_dir / f"{safe_name}.csv"
+        result.csv_path = csv_path
+        write_long_run_csv(csv_path, result)
+        print(f"  wrote time series: {csv_path}")
+        if solver.simplex_limiter:
+            projection_csv_path = output_dir / f"{safe_name}.projection_activity.csv"
+            result.projection_csv_path = projection_csv_path
+            write_projection_activity_csv(projection_csv_path, projection_rows)
+            print(f"  wrote projection activity: {projection_csv_path}")
+
+    print_long_run_result(result)
+    return result
+
+
+def print_long_run_result(result: LongRunResult) -> None:
+    print("  drift statistics from recorded time series:")
+    for key, label in (("A", "M_A"), ("B", "M_B"), ("occupied", "M_occ"), ("vacancy", "M_0"), ("total", "M_total")):
+        s = result.drift_stats[key]
+        print(
+            f"    {label:<7} final={s['final']:+.3e}, max_abs={s['max_abs']:.3e}, "
+            f"rms={s['rms']:.3e}, slope={s['slope']:+.3e} per unit time"
+        )
+    print(
+        "  projection summary: "
+        f"events={result.projection_events}, changed_cells={result.projection_changed_cells}, "
+        f"negA={result.projection_negative_A_cells}, negB={result.projection_negative_B_cells}, "
+        f"occ>1={result.projection_occupied_above_one_cells}"
+    )
+    print(
+        "  accumulated projection mass change: "
+        f"dM_A={result.projection_drift['A']:+.3e}, dM_B={result.projection_drift['B']:+.3e}, "
+        f"dM_occ={result.projection_drift['occupied']:+.3e}, dM_total={result.projection_drift['total']:+.3e}"
+    )
+
+
+def projection_consistency_message(result: LongRunResult, key: str = "occupied") -> str:
+    observed = result.drift_stats[key]["final"]
+    projected = result.projection_drift[key]
+    residual = observed - projected
+    scale = max(1.0, abs(observed), abs(projected))
+    if abs(residual) <= 1.0e-10 * scale:
+        return "consistent with projection corrections to roundoff"
+    if abs(projected) > 0.0 and abs(residual) <= 0.05 * max(abs(projected), 1.0e-300):
+        return "consistent with projection corrections within 5%"
+    return f"not fully explained by projection corrections (residual {residual:+.3e})"
+
+
+def run_long_run_suite(args: argparse.Namespace) -> int:
+    lx = args.lx
+    ly = args.ly
+    base_params = user_long_run_params(args.nx, args.ny, lx, ly)
+    base_A0, base_B0 = make_random_initial_condition(
+        args.nx, args.ny, rhoA0=0.31, rhoB0=0.29, noise=2.0e-3, seed=args.seed
+    )
+    sharp_A0, sharp_B0 = make_sharp_interface_initial_condition(args.nx, args.ny, args.seed + 19)
+
+    weak_params = clone_params(base_params, h_noise=0.5 * base_params.h_noise)
+    strong_noise_params = clone_params(base_params, h_noise=2.0 * base_params.h_noise)
+    phase_params = clone_params(
+        base_params,
+        beta=18.0,
+        kappa=np.array([[1.1, -0.9], [-0.9, 1.1]], dtype=float),
+    )
+    trigger_params = clone_params(
+        base_params,
+        D_A=0.25,
+        D_B=0.25,
+        beta=24.0,
+        h_noise=3.0 * base_params.h_noise,
+        kappa=np.array([[1.4, -1.2], [-1.2, 1.4]], dtype=float),
+    )
+    trigger_A0, trigger_B0 = make_sharp_interface_initial_condition(args.nx, args.ny, args.seed + 23, total_occ=0.985)
+
+    case_specs = [
+        ("baseline_projection_disabled", base_params, False, base_A0, base_B0, args.dt),
+        ("baseline_projection_enabled", base_params, True, base_A0, base_B0, args.dt),
+        ("weak_noise_projection_enabled", weak_params, True, base_A0, base_B0, args.dt),
+        ("strong_noise_projection_enabled", strong_noise_params, True, base_A0, base_B0, args.dt),
+        ("phase_separating_sharp_projection_enabled", phase_params, True, sharp_A0, sharp_B0, args.dt),
+        ("smaller_dt_projection_enabled", base_params, True, base_A0, base_B0, 0.5 * args.dt),
+        ("larger_dt_projection_enabled", base_params, True, base_A0, base_B0, 2.0 * args.dt),
+        ("projection_triggering_stress", trigger_params, True, trigger_A0, trigger_B0, max(4.0 * args.dt, args.dt)),
+    ]
+    if args.include_no_projection_variants:
+        case_specs.extend([
+            ("strong_noise_projection_disabled", strong_noise_params, False, base_A0, base_B0, args.dt),
+            ("phase_separating_sharp_projection_disabled", phase_params, False, sharp_A0, sharp_B0, args.dt),
+            ("projection_triggering_stress_projection_disabled", trigger_params, False, trigger_A0, trigger_B0, max(4.0 * args.dt, args.dt)),
+        ])
+
+    output_dir = Path(args.output_dir) if args.output_dir else None
+    results: List[LongRunResult] = []
+    for idx, (name, params, projection, rho_A0, rho_B0, dt) in enumerate(case_specs):
+        solver = build_long_run_solver(
+            args.nx, args.ny, lx, ly, args.seed + 100 * idx, params, projection, rho_A0, rho_B0
+        )
+        results.append(run_long_run_diagnostic(name, solver, dt, args.nsteps, args.record_every, output_dir))
+
+    print("\n=== long-run diagnostic report ===")
+    by_name = {result.name: result for result in results}
+    baseline_off = by_name["baseline_projection_disabled"]
+    baseline_on = by_name["baseline_projection_enabled"]
+    print(
+        "Baseline no-projection final drift: "
+        f"dM_occ={baseline_off.drift_stats['occupied']['final']:+.3e}, "
+        f"dM_total={baseline_off.drift_stats['total']['final']:+.3e}, "
+        f"max_abs dM_occ={baseline_off.drift_stats['occupied']['max_abs']:.3e}, "
+        f"slope dM_occ={baseline_off.drift_stats['occupied']['slope']:+.3e}."
+    )
+    print(
+        "Baseline projection-enabled final drift: "
+        f"dM_occ={baseline_on.drift_stats['occupied']['final']:+.3e}, "
+        f"projection dM_occ={baseline_on.projection_drift['occupied']:+.3e}; "
+        f"{projection_consistency_message(baseline_on, 'occupied')}."
+    )
+    print("Regime scan summary:")
+    for result in results:
+        print(
+            f"  {result.name}: projection={result.projection_enabled}, dt={result.dt:.3e}, "
+            f"events={result.projection_events}, final dM_occ={result.drift_stats['occupied']['final']:+.3e}, "
+            f"max_abs dM_occ={result.drift_stats['occupied']['max_abs']:.3e}, "
+            f"projection dM_occ={result.projection_drift['occupied']:+.3e}, "
+            f"slope={result.drift_stats['occupied']['slope']:+.3e}"
+        )
+
+    no_projection_roundoff = baseline_off.drift_stats["occupied"]["max_abs"] < args.roundoff_drift_tol
+    projection_dominates = (
+        baseline_on.projection_events > 0
+        and abs(baseline_on.drift_stats["occupied"]["final"] - baseline_on.projection_drift["occupied"])
+        <= max(args.projection_match_tol, 0.05 * abs(baseline_on.projection_drift["occupied"]))
+    )
+    if no_projection_roundoff and projection_dominates:
+        conclusion = "Projection is the dominant source of observed long-run occupied-mass drift."
+    elif no_projection_roundoff:
+        conclusion = "No-projection drift is roundoff-scale; any larger drift is regime/projection dependent."
+    else:
+        conclusion = "No-projection drift exceeds the configured roundoff tolerance, suggesting slow accumulation or a regime-specific trend."
+    print(f"Conclusion: {conclusion}")
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--nx", type=int, default=32)
@@ -368,7 +859,30 @@ def main() -> int:
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--tol", type=float, default=1.0e-10)
     parser.add_argument("--projection-stress", action="store_true", help="start projection test from an intentionally invalid state")
+    parser.add_argument("--long-run", action="store_true", help="run long-run drift stress suite instead of short substep diagnostics")
+    parser.add_argument("--lx", type=float, default=50.0, help="long-run domain length in x")
+    parser.add_argument("--ly", type=float, default=50.0, help="long-run domain length in y")
+    parser.add_argument("--nsteps", type=int, default=None, help="long-run step count; defaults to --steps when provided, otherwise 10000")
+    parser.add_argument("--record-every", type=int, default=1000, help="long-run mass/projection reporting interval")
+    parser.add_argument("--output-dir", default="diagnostic_outputs/mass_drift_long_run", help="directory for long-run CSV time series; empty disables CSV output")
+    parser.add_argument("--include-no-projection-variants", action="store_true", help="also run no-projection controls for the stronger-noise and sharp-interface regimes")
+    parser.add_argument("--roundoff-drift-tol", type=float, default=1.0e-9, help="threshold for treating no-projection drift as roundoff-scale")
+    parser.add_argument("--projection-match-tol", type=float, default=1.0e-9, help="absolute tolerance for matching final drift to accumulated projection corrections")
     args = parser.parse_args()
+    if args.long_run:
+        # Long-run defaults follow the requested production-sized diagnostic
+        # setup while preserving the smaller historical defaults for short
+        # substep accounting runs.
+        if args.nx == parser.get_default("nx"):
+            args.nx = 128
+        if args.ny == parser.get_default("ny"):
+            args.ny = 128
+        if args.dt == parser.get_default("dt"):
+            args.dt = 5.0e-4
+    if args.nsteps is None:
+        args.nsteps = args.steps if args.long_run and args.steps != parser.get_default("steps") else 10000
+    if args.long_run:
+        return run_long_run_suite(args)
 
     lx = ly = 1.0
     rho_A0, rho_B0 = make_random_initial_condition(args.nx, args.ny, rhoA0=0.31, rhoB0=0.29, noise=2e-3, seed=args.seed)
