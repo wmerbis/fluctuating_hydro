@@ -9,13 +9,12 @@ admissible states lie in the cellwise simplex
 
     rho_A >= 0, rho_B >= 0, rho_A + rho_B <= 1.
 
-A positivity/simplex limiter is applied after state assignment and, by default,
-after each time step.  The limiter is local and ratio-preserving: negative
-species densities are clipped to zero and cells with occupied density above one
-are rescaled so that ``rho_A + rho_B == 1``.  This keeps every active cell in the
-admissible set before the next deterministic or stochastic increment is formed.
-Because the limiter is local, it prioritizes admissibility over exact species-mass
-conservation when a step leaves the simplex.
+Three limiter modes are available.  ``limiter_mode="none"`` leaves raw
+updates untouched, ``"clip"`` keeps the historical local simplex projection for
+comparison, and ``"conservative"`` uses a face-flux budget limiter on the fully
+active periodic Cartesian path.  The conservative limiter rescales shared face
+increments before committing the update, so admissibility is enforced without the
+occupied-mass drift caused by local post-step clipping.
 
 Numerical scheme
 ----------------
@@ -552,6 +551,309 @@ def _stochastic_increment_periodic_numba(
             dW_A[iy, ix] += source
             dW_B[iy, ix] -= source
 
+
+@njit(cache=True)
+def _conservative_limited_update_periodic_numba(
+    rho_A: Array,
+    rho_B: Array,
+    dx: float,
+    dy: float,
+    vol: float,
+    D_A: float,
+    D_B: float,
+    D_v: float,
+    beta: float,
+    h_noise: float,
+    spatial_dim: int,
+    k00: float,
+    k01: float,
+    k10: float,
+    k11: float,
+    dt: float,
+    add_noise: int,
+    rho0: Array,
+    U_A: Array,
+    U_B: Array,
+    eta_A_x: Array,
+    eta_B_x: Array,
+    eta_A_y: Array,
+    eta_B_y: Array,
+    xi: Array,
+    flux_A_x: Array,
+    flux_B_x: Array,
+    flux_A_y: Array,
+    flux_B_y: Array,
+    delta_A: Array,
+    delta_B: Array,
+    neg_A: Array,
+    neg_B: Array,
+    pos_occ: Array,
+    alpha_A: Array,
+    alpha_B: Array,
+    alpha_occ: Array,
+    rho_A_out: Array,
+    rho_B_out: Array,
+) -> Tuple[int, int, int]:
+    """Bound-preserving conservative flux update for fully-active periodic grids.
+
+    Face arrays store increments with the same sign convention as the RHS
+    kernels: an x-face value is added to cell (iy, ix) and subtracted from its
+    right neighbor; a y-face value is added to cell (iy, ix) and subtracted from
+    its upward neighbor.  A single limiter coefficient is then applied to each
+    shared face increment, so species masses and occupied mass are conserved by
+    construction.  The voter source is handled after the flux step by clipping
+    only the local A<->B exchange amount, which preserves occupied density.
+    """
+    ny, nx = rho_A.shape
+    _compute_rho0_periodic_inplace(rho_A, rho_B, rho0)
+    _compute_linear_utility_periodic_inplace(rho_A, rho_B, k00, k01, k10, k11, U_A, U_B)
+    _zero_array(delta_A)
+    _zero_array(delta_B)
+    _zero_array(neg_A)
+    _zero_array(neg_B)
+    _zero_array(pos_occ)
+
+    inv_dx = 1.0 / dx
+    inv_dy = 1.0 / dy
+    scale_cv = 0.0
+    if add_noise == 1:
+        scale_cv = np.sqrt(dt / vol)
+
+    for iy in range(ny):
+        for ix in range(nx):
+            jx = ix + 1
+            if jx == nx:
+                jx = 0
+
+            rhoA_x = 0.5 * (rho_A[iy, ix] + rho_A[iy, jx])
+            rhoB_x = 0.5 * (rho_B[iy, ix] + rho_B[iy, jx])
+            rho0_x = 0.5 * (rho0[iy, ix] + rho0[iy, jx])
+            d_rhoA_x = (rho_A[iy, jx] - rho_A[iy, ix]) * inv_dx
+            d_rhoB_x = (rho_B[iy, jx] - rho_B[iy, ix]) * inv_dx
+            d_rho0_x = (rho0[iy, jx] - rho0[iy, ix]) * inv_dx
+            d_UA_x = (U_A[iy, jx] - U_A[iy, ix]) * inv_dx
+            d_UB_x = (U_B[iy, jx] - U_B[iy, ix]) * inv_dx
+
+            F_A = D_A * (rho0_x * d_rhoA_x - rhoA_x * d_rho0_x - beta * rho0_x * rhoA_x * d_UA_x)
+            F_A += D_v * (rhoB_x * d_rhoA_x - rhoA_x * d_rhoB_x)
+            F_B = D_B * (rho0_x * d_rhoB_x - rhoB_x * d_rho0_x - beta * rho0_x * rhoB_x * d_UB_x)
+            F_B += D_v * (rhoA_x * d_rhoB_x - rhoB_x * d_rhoA_x)
+            cA = dt * F_A * inv_dx
+            cB = dt * F_B * inv_dx
+            if add_noise == 1:
+                amp_A = h_noise * np.sqrt(max(2.0 * D_A * rho0_x * rhoA_x, 0.0))
+                amp_B = h_noise * np.sqrt(max(2.0 * D_B * rho0_x * rhoB_x, 0.0))
+                cA += scale_cv * amp_A * eta_A_x[iy, ix] * inv_dx
+                cB += scale_cv * amp_B * eta_B_x[iy, ix] * inv_dx
+            flux_A_x[iy, ix] = cA
+            flux_B_x[iy, ix] = cB
+            delta_A[iy, ix] += cA
+            delta_A[iy, jx] -= cA
+            delta_B[iy, ix] += cB
+            delta_B[iy, jx] -= cB
+
+    for iy in range(ny):
+        ky = iy + 1
+        if ky == ny:
+            ky = 0
+        for ix in range(nx):
+            rhoA_y = 0.5 * (rho_A[iy, ix] + rho_A[ky, ix])
+            rhoB_y = 0.5 * (rho_B[iy, ix] + rho_B[ky, ix])
+            rho0_y = 0.5 * (rho0[iy, ix] + rho0[ky, ix])
+            d_rhoA_y = (rho_A[ky, ix] - rho_A[iy, ix]) * inv_dy
+            d_rhoB_y = (rho_B[ky, ix] - rho_B[iy, ix]) * inv_dy
+            d_rho0_y = (rho0[ky, ix] - rho0[iy, ix]) * inv_dy
+            d_UA_y = (U_A[ky, ix] - U_A[iy, ix]) * inv_dy
+            d_UB_y = (U_B[ky, ix] - U_B[iy, ix]) * inv_dy
+
+            F_A = D_A * (rho0_y * d_rhoA_y - rhoA_y * d_rho0_y - beta * rho0_y * rhoA_y * d_UA_y)
+            F_A += D_v * (rhoB_y * d_rhoA_y - rhoA_y * d_rhoB_y)
+            F_B = D_B * (rho0_y * d_rhoB_y - rhoB_y * d_rho0_y - beta * rho0_y * rhoB_y * d_UB_y)
+            F_B += D_v * (rhoA_y * d_rhoB_y - rhoB_y * d_rhoA_y)
+            cA = dt * F_A * inv_dy
+            cB = dt * F_B * inv_dy
+            if add_noise == 1:
+                amp_A = h_noise * np.sqrt(max(2.0 * D_A * rho0_y * rhoA_y, 0.0))
+                amp_B = h_noise * np.sqrt(max(2.0 * D_B * rho0_y * rhoB_y, 0.0))
+                cA += scale_cv * amp_A * eta_A_y[iy, ix] * inv_dy
+                cB += scale_cv * amp_B * eta_B_y[iy, ix] * inv_dy
+            flux_A_y[iy, ix] = cA
+            flux_B_y[iy, ix] = cB
+            delta_A[iy, ix] += cA
+            delta_A[ky, ix] -= cA
+            delta_B[iy, ix] += cB
+            delta_B[ky, ix] -= cB
+
+    # Accumulate the raw negative-species and positive-occupancy demands from
+    # each incident face contribution separately.  This makes the budget limiter
+    # robust even when positive and negative face contributions cancel in a cell.
+    for iy in range(ny):
+        for ix in range(nx):
+            jx = ix + 1
+            if jx == nx:
+                jx = 0
+            cA = flux_A_x[iy, ix]
+            cB = flux_B_x[iy, ix]
+            occ = cA + cB
+            if cA < 0.0:
+                neg_A[iy, ix] += -cA
+            if cB < 0.0:
+                neg_B[iy, ix] += -cB
+            if occ > 0.0:
+                pos_occ[iy, ix] += occ
+            cA = -cA
+            cB = -cB
+            occ = cA + cB
+            if cA < 0.0:
+                neg_A[iy, jx] += -cA
+            if cB < 0.0:
+                neg_B[iy, jx] += -cB
+            if occ > 0.0:
+                pos_occ[iy, jx] += occ
+
+            ky = iy + 1
+            if ky == ny:
+                ky = 0
+            cA = flux_A_y[iy, ix]
+            cB = flux_B_y[iy, ix]
+            occ = cA + cB
+            if cA < 0.0:
+                neg_A[iy, ix] += -cA
+            if cB < 0.0:
+                neg_B[iy, ix] += -cB
+            if occ > 0.0:
+                pos_occ[iy, ix] += occ
+            cA = -cA
+            cB = -cB
+            occ = cA + cB
+            if cA < 0.0:
+                neg_A[ky, ix] += -cA
+            if cB < 0.0:
+                neg_B[ky, ix] += -cB
+            if occ > 0.0:
+                pos_occ[ky, ix] += occ
+
+    limited_cells = 0
+    eps = 1.0e-15
+    for iy in range(ny):
+        for ix in range(nx):
+            a = 1.0
+            if neg_A[iy, ix] > rho_A[iy, ix] + eps:
+                a = max(rho_A[iy, ix], 0.0) / neg_A[iy, ix]
+            alpha_A[iy, ix] = a
+            b = 1.0
+            if neg_B[iy, ix] > rho_B[iy, ix] + eps:
+                b = max(rho_B[iy, ix], 0.0) / neg_B[iy, ix]
+            alpha_B[iy, ix] = b
+            o = 1.0
+            vacancy = 1.0 - rho_A[iy, ix] - rho_B[iy, ix]
+            if pos_occ[iy, ix] > vacancy + eps:
+                o = max(vacancy, 0.0) / pos_occ[iy, ix]
+            alpha_occ[iy, ix] = o
+            if a < 1.0 or b < 1.0 or o < 1.0:
+                limited_cells += 1
+            delta_A[iy, ix] = 0.0
+            delta_B[iy, ix] = 0.0
+
+    limited_faces = 0
+    for iy in range(ny):
+        for ix in range(nx):
+            jx = ix + 1
+            if jx == nx:
+                jx = 0
+            cA = flux_A_x[iy, ix]
+            cB = flux_B_x[iy, ix]
+            theta = 1.0
+            occ = cA + cB
+            if cA < 0.0 and alpha_A[iy, ix] < theta:
+                theta = alpha_A[iy, ix]
+            if cB < 0.0 and alpha_B[iy, ix] < theta:
+                theta = alpha_B[iy, ix]
+            if occ > 0.0 and alpha_occ[iy, ix] < theta:
+                theta = alpha_occ[iy, ix]
+            if cA > 0.0 and alpha_A[iy, jx] < theta:
+                theta = alpha_A[iy, jx]
+            if cB > 0.0 and alpha_B[iy, jx] < theta:
+                theta = alpha_B[iy, jx]
+            if occ < 0.0 and alpha_occ[iy, jx] < theta:
+                theta = alpha_occ[iy, jx]
+            if theta < 1.0:
+                limited_faces += 1
+            cA *= theta
+            cB *= theta
+            delta_A[iy, ix] += cA
+            delta_A[iy, jx] -= cA
+            delta_B[iy, ix] += cB
+            delta_B[iy, jx] -= cB
+
+    for iy in range(ny):
+        ky = iy + 1
+        if ky == ny:
+            ky = 0
+        for ix in range(nx):
+            cA = flux_A_y[iy, ix]
+            cB = flux_B_y[iy, ix]
+            theta = 1.0
+            occ = cA + cB
+            if cA < 0.0 and alpha_A[iy, ix] < theta:
+                theta = alpha_A[iy, ix]
+            if cB < 0.0 and alpha_B[iy, ix] < theta:
+                theta = alpha_B[iy, ix]
+            if occ > 0.0 and alpha_occ[iy, ix] < theta:
+                theta = alpha_occ[iy, ix]
+            if cA > 0.0 and alpha_A[ky, ix] < theta:
+                theta = alpha_A[ky, ix]
+            if cB > 0.0 and alpha_B[ky, ix] < theta:
+                theta = alpha_B[ky, ix]
+            if occ < 0.0 and alpha_occ[ky, ix] < theta:
+                theta = alpha_occ[ky, ix]
+            if theta < 1.0:
+                limited_faces += 1
+            cA *= theta
+            cB *= theta
+            delta_A[iy, ix] += cA
+            delta_A[ky, ix] -= cA
+            delta_B[iy, ix] += cB
+            delta_B[ky, ix] -= cB
+
+    voter_limited_cells = 0
+    voter_prefactor = 2.0 * spatial_dim * D_v * (h_noise ** (spatial_dim - 2))
+    for iy in range(ny):
+        for ix in range(nx):
+            ra = rho_A[iy, ix] + delta_A[iy, ix]
+            rb = rho_B[iy, ix] + delta_B[iy, ix]
+            if add_noise == 1:
+                amp_v = np.sqrt(max(voter_prefactor * rho_A[iy, ix] * rho_B[iy, ix], 0.0))
+                source = scale_cv * amp_v * xi[iy, ix]
+                lo = -ra
+                hi = rb
+                clipped = source
+                if clipped < lo:
+                    clipped = lo
+                if clipped > hi:
+                    clipped = hi
+                if clipped != source:
+                    voter_limited_cells += 1
+                ra += clipped
+                rb -= clipped
+            # Tiny roundoff cleanup inside the simplex.  These assignments should
+            # not change masses except at machine precision after the flux limits.
+            if ra < 0.0 and ra > -1.0e-14:
+                ra = 0.0
+            if rb < 0.0 and rb > -1.0e-14:
+                rb = 0.0
+            occ = ra + rb
+            if occ > 1.0 and occ < 1.0 + 1.0e-14:
+                excess = occ - 1.0
+                if ra >= rb:
+                    ra -= excess
+                else:
+                    rb -= excess
+            rho_A_out[iy, ix] = ra
+            rho_B_out[iy, ix] = rb
+
+    return limited_cells, limited_faces, voter_limited_cells
+
 # Numba parallelization is intentionally not enabled here: the conservative
 # face-scatter updates write to both neighboring cells, so naive prange would
 # introduce races. A parallel two-pass face-flux implementation can be added
@@ -619,9 +921,12 @@ class SchellingVoterFVSolver:
         Default value used by :meth:`step` and :meth:`run` when ``add_noise`` is
         not provided.
     simplex_limiter:
-        If true, project fields into the pointwise simplex after state
-        assignment and each step.  The projection is local and may modify
-        species masses when limiting is needed.
+        Backward-compatible switch for the historical clip projection.  Ignored
+        when ``limiter_mode`` is supplied explicitly.
+    limiter_mode:
+        One of ``"none"``, ``"clip"``, or ``"conservative"``.  The
+        conservative mode is implemented for fully active periodic grids and
+        limits explicit/stochastic face fluxes before committing the step.
     rng:
         Optional NumPy random generator used for stochastic increments.
     use_periodic_fast_path:
@@ -641,6 +946,7 @@ class SchellingVoterFVSolver:
         semi_implicit_stiff: bool = True,
         stochastic: bool = True,
         simplex_limiter: bool = True,
+        limiter_mode: Optional[str] = None,
         rng: Optional[np.random.Generator] = None,
         use_periodic_fast_path: bool = True,
     ) -> None:
@@ -656,8 +962,22 @@ class SchellingVoterFVSolver:
         self.bc_periodic = 1 if self.bc == "periodic" else 0
         self.semi_implicit_stiff = semi_implicit_stiff
         self.stochastic = stochastic
-        self.simplex_limiter = bool(simplex_limiter)
+        if limiter_mode is None:
+            limiter_mode = "clip" if simplex_limiter else "none"
+        self.limiter_mode = str(limiter_mode).lower()
+        if self.limiter_mode not in {"none", "clip", "conservative"}:
+            raise ValueError("limiter_mode must be 'none', 'clip', or 'conservative'")
+        self.simplex_limiter = self.limiter_mode == "clip"
         self.last_limiter_corrections = 0
+        self.last_limiter_stats: Dict[str, int | float | str] = {
+            "mode": self.limiter_mode,
+            "limited_cells": 0,
+            "limited_faces": 0,
+            "voter_limited_cells": 0,
+            "gamma_repair_cells": 0,
+            "activations": 0,
+            "residual_max_violation": 0.0,
+        }
         self.rng = np.random.default_rng() if rng is None else rng
         self.use_periodic_fast_path = bool(use_periodic_fast_path)
 
@@ -690,6 +1010,25 @@ class SchellingVoterFVSolver:
         self._dW_B = np.zeros((self.ny, self.nx), dtype=np.float64)
         self._rho_A_new = np.zeros((self.ny, self.nx), dtype=np.float64)
         self._rho_B_new = np.zeros((self.ny, self.nx), dtype=np.float64)
+
+        # Face and budget scratch for the conservative bound-preserving limiter.
+        # The limiter is slower than clipping because it must assemble face
+        # increments, compute per-cell admissible flux budgets, and revisit each
+        # shared face with a common coefficient.  This extra work preserves the
+        # finite-volume conservation structure and is preferable in regimes where
+        # stochastic kicks or sharp interfaces trigger frequent local projection;
+        # the old clip projection can otherwise remove/add occupied mass cell by
+        # cell and produce long-run mass drift.
+        self._flux_A_x = np.zeros((self.ny, self.nx), dtype=np.float64)
+        self._flux_B_x = np.zeros((self.ny, self.nx), dtype=np.float64)
+        self._flux_A_y = np.zeros((self.ny, self.nx), dtype=np.float64)
+        self._flux_B_y = np.zeros((self.ny, self.nx), dtype=np.float64)
+        self._budget_A = np.zeros((self.ny, self.nx), dtype=np.float64)
+        self._budget_B = np.zeros((self.ny, self.nx), dtype=np.float64)
+        self._budget_occ = np.zeros((self.ny, self.nx), dtype=np.float64)
+        self._alpha_A = np.ones((self.ny, self.nx), dtype=np.float64)
+        self._alpha_B = np.ones((self.ny, self.nx), dtype=np.float64)
+        self._alpha_occ = np.ones((self.ny, self.nx), dtype=np.float64)
 
         # Random buffers; filled each step.
         self._eta_A_x = np.zeros((self.ny, self.nx), dtype=np.float64)
@@ -748,7 +1087,11 @@ class SchellingVoterFVSolver:
             raise ValueError("rho_A and rho_B must have shape (ny, nx)")
         self.rho_A[...] = np.where(self.active, rho_A, 0.0)
         self.rho_B[...] = np.where(self.active, rho_B, 0.0)
-        if self.simplex_limiter:
+        if self.limiter_mode in {"clip", "conservative"}:
+            # Initial data are not produced by solver fluxes; use the historical
+            # simplex projection to sanitize user-provided states in both bounded
+            # modes.  Conservation claims below concern time stepping from an
+            # admissible state.
             self.apply_simplex_limiter()
 
     def rho_0(self) -> Array:
@@ -953,9 +1296,197 @@ class SchellingVoterFVSolver:
         self._rho_B_new[...] = np.fft.irfft2(self._rhoB_hat, s=(self.ny, self.nx))
         return self._rho_A_new, self._rho_B_new
 
+    def _max_simplex_violation(self) -> float:
+        return float(
+            max(
+                0.0,
+                -float(np.min(self.rho_A)),
+                -float(np.min(self.rho_B)),
+                float(np.max(self.rho_A + self.rho_B - 1.0)),
+            )
+        )
+
+    def _conservative_global_simplex_repair(
+        self,
+        rho_A: Array,
+        rho_B: Array,
+        target_mass_A: float,
+        target_mass_B: float,
+    ) -> Tuple[int, float]:
+        """Conservative fallback repair for non-flux substeps such as Gamma.
+
+        The long-term limiter is face based for FV/stochastic increments.  The
+        Fourier Gamma solve has no local face flux representation, so if it
+        creates small bound violations we repair them by redistributing species
+        mass globally over fully active periodic cells while preserving the
+        target species masses.  This path is intentionally slower and is counted
+        as residual correction diagnostics rather than as face limiting.
+        """
+        rho_A[...] = np.where(np.isfinite(rho_A), rho_A, 0.0)
+        rho_B[...] = np.where(np.isfinite(rho_B), rho_B, 0.0)
+        np.maximum(rho_A, 0.0, out=rho_A)
+        np.maximum(rho_B, 0.0, out=rho_B)
+        occ = rho_A + rho_B
+        over = occ > 1.0
+        changed = int(np.count_nonzero(over))
+        if np.any(over):
+            scale = np.ones_like(occ)
+            scale[over] = 1.0 / occ[over]
+            rho_A *= scale
+            rho_B *= scale
+
+        target_sum_A = target_mass_A / self.vol
+        target_sum_B = target_mass_B / self.vol
+        eps = 1.0e-13
+        for _ in range(64):
+            diff_A = target_sum_A - float(np.sum(rho_A))
+            if abs(diff_A) > eps:
+                if diff_A > 0.0:
+                    cap = 1.0 - rho_A - rho_B
+                    total = float(np.sum(np.maximum(cap, 0.0)))
+                    if total <= eps:
+                        break
+                    rho_A += np.maximum(cap, 0.0) * min(1.0, diff_A / total)
+                else:
+                    avail = float(np.sum(rho_A))
+                    if avail <= eps:
+                        break
+                    rho_A *= max(0.0, 1.0 + diff_A / avail)
+                changed += 1
+
+            diff_B = target_sum_B - float(np.sum(rho_B))
+            if abs(diff_B) > eps:
+                if diff_B > 0.0:
+                    cap = 1.0 - rho_A - rho_B
+                    total = float(np.sum(np.maximum(cap, 0.0)))
+                    if total <= eps:
+                        break
+                    rho_B += np.maximum(cap, 0.0) * min(1.0, diff_B / total)
+                else:
+                    avail = float(np.sum(rho_B))
+                    if avail <= eps:
+                        break
+                    rho_B *= max(0.0, 1.0 + diff_B / avail)
+                changed += 1
+
+            violation = max(
+                0.0,
+                -float(np.min(rho_A)),
+                -float(np.min(rho_B)),
+                float(np.max(rho_A + rho_B - 1.0)),
+                abs(target_sum_A - float(np.sum(rho_A))),
+                abs(target_sum_B - float(np.sum(rho_B))),
+            )
+            if violation <= 5.0e-12:
+                return changed, violation * self.vol
+        residual = max(
+            0.0,
+            -float(np.min(rho_A)),
+            -float(np.min(rho_B)),
+            float(np.max(rho_A + rho_B - 1.0)),
+            abs(target_sum_A - float(np.sum(rho_A))),
+            abs(target_sum_B - float(np.sum(rho_B))),
+        )
+        return changed, residual * self.vol
+
+    def conservative_limited_periodic_step(self, dt: float, add_noise: bool) -> None:
+        """Advance one fully-active periodic step with conservative flux limiting.
+
+        The explicit deterministic and Schelling stochastic increments are built
+        as shared face increments and then rescaled by common face coefficients
+        computed from cellwise A, B, and vacancy budgets.  This is deliberately
+        more expensive than the clip limiter, but it keeps all face contributions
+        antisymmetric and therefore preserves the finite-volume mass balances.
+        Voter noise is a cell-local A<->B exchange; clipping only that exchange
+        interval preserves occupied mass exactly up to roundoff.
+        """
+        if not self.fully_active_periodic:
+            raise NotImplementedError(
+                "limiter_mode='conservative' is currently implemented for fully active periodic grids only; "
+                "use limiter_mode='clip' or 'none' for masked/no-flux grids."
+            )
+        if add_noise:
+            self._fill_standard_normal(self._eta_A_x)
+            self._fill_standard_normal(self._eta_B_x)
+            self._fill_standard_normal(self._eta_A_y)
+            self._fill_standard_normal(self._eta_B_y)
+            self._fill_standard_normal(self._xi)
+
+        limited_cells, limited_faces, voter_limited_cells = _conservative_limited_update_periodic_numba(
+            self.rho_A,
+            self.rho_B,
+            self.dx,
+            self.dy,
+            self.vol,
+            self.params.D_A,
+            self.params.D_B,
+            self.params.D_v,
+            self.params.beta,
+            self.params.h_noise,
+            self.params.spatial_dim,
+            self.params.kappa[0, 0],
+            self.params.kappa[0, 1],
+            self.params.kappa[1, 0],
+            self.params.kappa[1, 1],
+            dt,
+            1 if add_noise else 0,
+            self._rho0,
+            self._U_A,
+            self._U_B,
+            self._eta_A_x,
+            self._eta_B_x,
+            self._eta_A_y,
+            self._eta_B_y,
+            self._xi,
+            self._flux_A_x,
+            self._flux_B_x,
+            self._flux_A_y,
+            self._flux_B_y,
+            self._rhs_A,
+            self._rhs_B,
+            self._budget_A,
+            self._budget_B,
+            self._budget_occ,
+            self._alpha_A,
+            self._alpha_B,
+            self._alpha_occ,
+            self._rho_A_new,
+            self._rho_B_new,
+        )
+        gamma_repair_cells = 0
+        gamma_repair_residual = 0.0
+        if self.semi_implicit_stiff:
+            target_A = float(np.sum(self._rho_A_new) * self.vol)
+            target_B = float(np.sum(self._rho_B_new) * self.vol)
+            rho_A_new, rho_B_new = self.semi_implicit_gamma_step(self._rho_A_new, self._rho_B_new, dt)
+            self.rho_A[...] = rho_A_new
+            self.rho_B[...] = rho_B_new
+            gamma_repair_cells, gamma_repair_residual = self._conservative_global_simplex_repair(
+                self.rho_A, self.rho_B, target_A, target_B
+            )
+        else:
+            self.rho_A[...] = self._rho_A_new
+            self.rho_B[...] = self._rho_B_new
+        activations = 1 if (limited_cells > 0 or limited_faces > 0 or voter_limited_cells > 0 or gamma_repair_cells > 0) else 0
+        residual = max(self._max_simplex_violation(), gamma_repair_residual)
+        self.last_limiter_corrections = int(limited_cells + voter_limited_cells + gamma_repair_cells)
+        self.last_limiter_stats = {
+            "mode": self.limiter_mode,
+            "limited_cells": int(limited_cells),
+            "limited_faces": int(limited_faces),
+            "voter_limited_cells": int(voter_limited_cells),
+            "gamma_repair_cells": int(gamma_repair_cells),
+            "activations": activations,
+            "residual_max_violation": residual,
+        }
+
     def step(self, dt: float, add_noise: Optional[bool] = None) -> None:
         if add_noise is None:
             add_noise = self.stochastic
+
+        if self.limiter_mode == "conservative":
+            self.conservative_limited_periodic_step(dt, bool(add_noise))
+            return
 
         # Compute vacancy once for this timestep and share it between the
         # deterministic and stochastic kernels. Both increments are evaluated at
@@ -971,7 +1502,7 @@ class SchellingVoterFVSolver:
             self._rho_B_star += dW_B
 
         limiter_corrections = 0
-        if self.simplex_limiter:
+        if self.limiter_mode == "clip":
             limiter_corrections += self.apply_simplex_limiter(self._rho_A_star, self._rho_B_star)
 
         if self.semi_implicit_stiff:
@@ -986,9 +1517,29 @@ class SchellingVoterFVSolver:
         else:
             self.rho_A[...] = np.where(self.active, rho_A_new, 0.0)
             self.rho_B[...] = np.where(self.active, rho_B_new, 0.0)
-        if self.simplex_limiter:
+        if self.limiter_mode == "clip":
             limiter_corrections += self.apply_simplex_limiter()
             self.last_limiter_corrections = limiter_corrections
+            self.last_limiter_stats = {
+                "mode": self.limiter_mode,
+                "limited_cells": int(limiter_corrections),
+                "limited_faces": 0,
+                "voter_limited_cells": 0,
+                "gamma_repair_cells": 0,
+                "activations": 1 if limiter_corrections > 0 else 0,
+                "residual_max_violation": self._max_simplex_violation(),
+            }
+        else:
+            self.last_limiter_corrections = 0
+            self.last_limiter_stats = {
+                "mode": self.limiter_mode,
+                "limited_cells": 0,
+                "limited_faces": 0,
+                "voter_limited_cells": 0,
+                "gamma_repair_cells": 0,
+                "activations": 0,
+                "residual_max_violation": self._max_simplex_violation(),
+            }
 
     def run(
         self,
@@ -1018,6 +1569,12 @@ class SchellingVoterFVSolver:
         masses_occ = []
         masses_tot = []
         mass_times = []
+        limiter_limited_cells = []
+        limiter_limited_faces = []
+        limiter_voter_limited_cells = []
+        limiter_gamma_repair_cells = []
+        limiter_activations = []
+        limiter_residual_max_violation = []
         snapshots = []
 
         def should_record_mass(step_index: int) -> bool:
@@ -1033,6 +1590,12 @@ class SchellingVoterFVSolver:
                 masses_occ.append(m["occupied"])
                 masses_tot.append(m["total"])
                 mass_times.append(n * dt)
+                limiter_limited_cells.append(int(self.last_limiter_stats.get("limited_cells", 0)))
+                limiter_limited_faces.append(int(self.last_limiter_stats.get("limited_faces", 0)))
+                limiter_voter_limited_cells.append(int(self.last_limiter_stats.get("voter_limited_cells", 0)))
+                limiter_gamma_repair_cells.append(int(self.last_limiter_stats.get("gamma_repair_cells", 0)))
+                limiter_activations.append(int(self.last_limiter_stats.get("activations", 0)))
+                limiter_residual_max_violation.append(float(self.last_limiter_stats.get("residual_max_violation", 0.0)))
                 print(f"step {n}/{nsteps}:    <m_A> = {masses_A[-1]/masses_tot[-1]:.2f},   <m_B> = {masses_B[-1]/masses_tot[-1]:.2f},    <m_occ> = {masses_occ[-1]/masses_tot[-1]:.2f}")
 
             if record_snapshots_every > 0 and n % record_snapshots_every == 0:
@@ -1050,6 +1613,13 @@ class SchellingVoterFVSolver:
             "mass_total": np.array(masses_tot),
             "rho_A": self.rho_A.copy(),
             "rho_B": self.rho_B.copy(),
+            "limiter_mode": self.limiter_mode,
+            "limiter_limited_cells": np.array(limiter_limited_cells),
+            "limiter_limited_faces": np.array(limiter_limited_faces),
+            "limiter_voter_limited_cells": np.array(limiter_voter_limited_cells),
+            "limiter_gamma_repair_cells": np.array(limiter_gamma_repair_cells),
+            "limiter_activations": np.array(limiter_activations),
+            "limiter_residual_max_violation": np.array(limiter_residual_max_violation),
         }
         if record_snapshots_every > 0:
             out["snapshots"] = np.array(snapshots, dtype=object)
