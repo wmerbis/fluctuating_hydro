@@ -2350,9 +2350,9 @@ class SchellingVoterFVSolver:
                 mean_kl_divergence = fhd.mean_relative_entropy(phi)
                 print(
                     f"step {n}/{nsteps}:    "
-                    f"<m_A> = {masses_A[-1]/masses_tot[-1]:.2f},   "
-                    f"<m_B> = {masses_B[-1]/masses_tot[-1]:.2f},    "
-                    f"<m_occ> = {masses_occ[-1]/masses_tot[-1]:.2f},    "
+                    f"<m_A> = {masses_A[-1]/masses_tot[-1]:.6f},   "
+                    f"<m_B> = {masses_B[-1]/masses_tot[-1]:.6f},    "
+                    f"<m_occ> = {masses_occ[-1]/masses_tot[-1]:.6f},    "
                     f"D_index = {dissimilarity_index:.6f},    "
                     f"mean_kl_divergence = {mean_kl_divergence:.6f}"
                 )
