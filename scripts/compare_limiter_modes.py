@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Compare clip and conservative limiter dynamics for matched FV runs.
+"""Compare clip and FCT conservative limiter dynamics for matched FV runs.
 
 The script uses identical initial conditions and RNG seeds for each limiter mode,
 then records mass drift, segregation diagnostics, Fourier peak strength, and the
-new conservative-limiter flux-removal statistics.  An optional beta scan gives a
-quick check of whether the conservative limiter shifts or suppresses the pattern
+new FCT conservative-limiter flux-removal statistics.  An optional beta scan gives a
+quick check of whether the FCT conservative limiter shifts or suppresses the pattern
 onset observed with the historical clip projection.
 """
 
@@ -74,7 +74,7 @@ def summarize(name: str, series: Dict[str, np.ndarray], limiter_totals: Dict[str
     )
     if limiter_totals["limited_faces"] > 0.0:
         print(
-            "conservative limiter means per active step: "
+            "conservative/FCT limiter means per active step: "
             f"theta={limiter_totals['theta_mean_sum'] / max(limiter_totals['theta_samples'], 1):.4f}, "
             f"theta<0.5={limiter_totals['theta_lt_0_5_sum'] / max(limiter_totals['theta_samples'], 1):.3e}, "
             f"removed occ flux={limiter_totals['occ_removed_sum'] / max(limiter_totals['theta_samples'], 1):.3e}, "
@@ -142,7 +142,7 @@ def run_one(args: argparse.Namespace, mode: str, params: ModelParameters, rho_A0
         for key in ("activations", "limited_cells", "limited_faces", "voter_limited_cells", "gamma_repair_cells"):
             totals[key] += float(stats.get(key, 0.0))
         totals["residual_max_violation"] = max(totals["residual_max_violation"], float(stats.get("residual_max_violation", 0.0)))
-        if mode == "conservative":
+        if mode in {"conservative", "fct", "conservative_fct", "conservative_old"}:
             totals["theta_samples"] += 1.0
             totals["theta_mean_sum"] += float(stats.get("theta_mean", 1.0))
             totals["theta_lt_0_5_sum"] += float(stats.get("theta_frac_lt_0_5", 0.0))
@@ -180,7 +180,7 @@ def main() -> int:
     parser.add_argument("--beta", type=float, default=8.0)
     parser.add_argument("--beta-scan", type=str, default="", help="Comma-separated beta values for a small instability-threshold scan.")
     parser.add_argument("--csv", type=Path, default=None, help="Optional CSV path for final mode/scan summary rows.")
-    parser.add_argument("--modes", nargs="+", default=["clip", "conservative"], choices=["none", "clip", "conservative"])
+    parser.add_argument("--modes", nargs="+", default=["clip", "fct"], choices=["none", "clip", "conservative", "fct", "conservative_fct", "conservative_old"])
     args = parser.parse_args()
 
     scan_betas = list(parse_scan(args.beta_scan)) if args.beta_scan else [args.beta]

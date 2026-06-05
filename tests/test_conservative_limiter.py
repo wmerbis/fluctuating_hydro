@@ -128,7 +128,7 @@ def test_conservative_limiter_reports_flux_and_theta_diagnostics():
     solver.step(5.0e-4, add_noise=True)
     stats = solver.last_limiter_stats
 
-    assert stats["mode"] == "conservative"
+    assert stats["mode"] == "fct"
     assert stats["limited_faces"] == stats["limited_faces_x"] + stats["limited_faces_y"]
     assert 0.0 <= stats["theta_min"] <= stats["theta_mean"] <= stats["theta_max"] <= 1.0
     assert 0.0 <= stats["theta_frac_lt_1"] <= 1.0
@@ -140,3 +140,31 @@ def test_conservative_limiter_reports_flux_and_theta_diagnostics():
         assert 0.0 <= stats[f"flux_{prefix}_removed_fraction"] <= 1.0
     for key in ("limiting_corr_rho_A", "limiting_corr_rho_B", "limiting_corr_rho_0", "limiting_corr_grad_rho"):
         assert -1.0 <= stats[key] <= 1.0
+
+
+def test_fct_limiter_preserves_species_without_voter_exchange():
+    nx = ny = 8
+    solver = _solver("fct", nx=nx, ny=ny, seed=41, stochastic=True, D_v=0.0)
+    rho_A0, rho_B0 = make_random_initial_condition(nx, ny, rhoA0=0.44, rhoB0=0.42, noise=3.0e-3, seed=8)
+    solver.set_state(rho_A0, rho_B0)
+    before = solver.total_masses()
+    for _ in range(12):
+        solver.step(2.0e-4, add_noise=True)
+        _assert_simplex(solver, tol=5.0e-12)
+    after = solver.total_masses()
+    assert abs(_drift(after, before, "A")) < 5.0e-13
+    assert abs(_drift(after, before, "B")) < 5.0e-13
+    assert abs(_drift(after, before, "occupied")) < 5.0e-13
+
+
+def test_fct_limiter_keeps_at_least_old_conservative_flux():
+    nx = ny = 8
+    rho_A0, rho_B0 = make_random_initial_condition(nx, ny, rhoA0=0.48, rhoB0=0.47, noise=4.0e-3, seed=6)
+    old = _solver("conservative_old", nx=nx, ny=ny, seed=33, stochastic=True, D_v=0.08)
+    fct = _solver("fct", nx=nx, ny=ny, seed=33, stochastic=True, D_v=0.08)
+    old.set_state(rho_A0, rho_B0)
+    fct.set_state(rho_A0, rho_B0)
+    old.step(5.0e-4, add_noise=True)
+    fct.step(5.0e-4, add_noise=True)
+    assert fct.last_limiter_stats["flux_occupied_l1_limited"] >= old.last_limiter_stats["flux_occupied_l1_limited"] - 1.0e-14
+    _assert_simplex(fct, tol=5.0e-12)

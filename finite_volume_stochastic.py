@@ -9,12 +9,13 @@ admissible states lie in the cellwise simplex
 
     rho_A >= 0, rho_B >= 0, rho_A + rho_B <= 1.
 
-Three limiter modes are available.  ``limiter_mode="none"`` leaves raw
-updates untouched, ``"clip"`` keeps the historical local simplex projection for
-comparison, and ``"conservative"`` uses a face-flux budget limiter on the fully
-active periodic Cartesian path.  The conservative limiter rescales shared face
-increments before committing the update, so admissibility is enforced without the
-occupied-mass drift caused by local post-step clipping.
+Limiter modes include ``limiter_mode="none"`` for raw updates, ``"clip"`` for
+the historical local simplex projection, ``"conservative_old"`` for the
+original face-flux budget limiter, and ``"fct"`` / ``"conservative"`` for the
+fully active periodic Cartesian path.  The FCT limiter first builds a
+conservative admissible low-order update and then limits only the antidiffusive
+correction back toward the raw finite-volume fluxes, so admissibility is enforced
+without the occupied-mass drift caused by local post-step clipping.
 
 Numerical scheme
 ----------------
@@ -855,6 +856,436 @@ def _conservative_limited_update_periodic_numba(
 
     return limited_cells, limited_faces, voter_limited_cells
 
+
+@njit(cache=True)
+def _fct_limited_update_periodic_numba(
+    rho_A: Array,
+    rho_B: Array,
+    dx: float,
+    dy: float,
+    vol: float,
+    D_A: float,
+    D_B: float,
+    D_v: float,
+    beta: float,
+    h_noise: float,
+    spatial_dim: int,
+    k00: float,
+    k01: float,
+    k10: float,
+    k11: float,
+    dt: float,
+    add_noise: int,
+    rho0: Array,
+    U_A: Array,
+    U_B: Array,
+    eta_A_x: Array,
+    eta_B_x: Array,
+    eta_A_y: Array,
+    eta_B_y: Array,
+    xi: Array,
+    flux_A_x: Array,
+    flux_B_x: Array,
+    flux_A_y: Array,
+    flux_B_y: Array,
+    low_A_x: Array,
+    low_B_x: Array,
+    low_A_y: Array,
+    low_B_y: Array,
+    delta_A: Array,
+    delta_B: Array,
+    neg_A: Array,
+    neg_B: Array,
+    pos_occ: Array,
+    alpha_A: Array,
+    alpha_B: Array,
+    alpha_occ: Array,
+    theta_x: Array,
+    theta_y: Array,
+    rho_A_out: Array,
+    rho_B_out: Array,
+) -> Tuple[int, int, int]:
+    """FCT-style conservative bound-preserving update.
+
+    The raw FV/Schelling face increments are the high-order target.  A safe
+    low-order state is obtained by the older budget-limited conservative fluxes;
+    then only the antidiffusive face correction from that low-order state to the
+    raw state is limited.  FCT limiting budgets are computed against the already
+    admissible low-order state, which allows cancellations and safe baseline
+    transport to survive instead of scaling every raw face contribution bluntly.
+    """
+    ny, nx = rho_A.shape
+    _compute_rho0_periodic_inplace(rho_A, rho_B, rho0)
+    _compute_linear_utility_periodic_inplace(rho_A, rho_B, k00, k01, k10, k11, U_A, U_B)
+    _zero_array(delta_A)
+    _zero_array(delta_B)
+    _zero_array(neg_A)
+    _zero_array(neg_B)
+    _zero_array(pos_occ)
+
+    inv_dx = 1.0 / dx
+    inv_dy = 1.0 / dy
+    scale_cv = 0.0
+    if add_noise == 1:
+        scale_cv = np.sqrt(dt / vol)
+
+    # Raw/high-order face increments.
+    for iy in range(ny):
+        for ix in range(nx):
+            jx = ix + 1
+            if jx == nx:
+                jx = 0
+            rhoA_x = 0.5 * (rho_A[iy, ix] + rho_A[iy, jx])
+            rhoB_x = 0.5 * (rho_B[iy, ix] + rho_B[iy, jx])
+            rho0_x = 0.5 * (rho0[iy, ix] + rho0[iy, jx])
+            d_rhoA_x = (rho_A[iy, jx] - rho_A[iy, ix]) * inv_dx
+            d_rhoB_x = (rho_B[iy, jx] - rho_B[iy, ix]) * inv_dx
+            d_rho0_x = (rho0[iy, jx] - rho0[iy, ix]) * inv_dx
+            d_UA_x = (U_A[iy, jx] - U_A[iy, ix]) * inv_dx
+            d_UB_x = (U_B[iy, jx] - U_B[iy, ix]) * inv_dx
+            F_A = D_A * (rho0_x * d_rhoA_x - rhoA_x * d_rho0_x - beta * rho0_x * rhoA_x * d_UA_x)
+            F_A += D_v * (rhoB_x * d_rhoA_x - rhoA_x * d_rhoB_x)
+            F_B = D_B * (rho0_x * d_rhoB_x - rhoB_x * d_rho0_x - beta * rho0_x * rhoB_x * d_UB_x)
+            F_B += D_v * (rhoA_x * d_rhoB_x - rhoB_x * d_rhoA_x)
+            cA = dt * F_A * inv_dx
+            cB = dt * F_B * inv_dx
+            if add_noise == 1:
+                amp_A = h_noise * np.sqrt(max(2.0 * D_A * rho0_x * rhoA_x, 0.0))
+                amp_B = h_noise * np.sqrt(max(2.0 * D_B * rho0_x * rhoB_x, 0.0))
+                cA += scale_cv * amp_A * eta_A_x[iy, ix] * inv_dx
+                cB += scale_cv * amp_B * eta_B_x[iy, ix] * inv_dx
+            flux_A_x[iy, ix] = cA
+            flux_B_x[iy, ix] = cB
+
+    for iy in range(ny):
+        ky = iy + 1
+        if ky == ny:
+            ky = 0
+        for ix in range(nx):
+            rhoA_y = 0.5 * (rho_A[iy, ix] + rho_A[ky, ix])
+            rhoB_y = 0.5 * (rho_B[iy, ix] + rho_B[ky, ix])
+            rho0_y = 0.5 * (rho0[iy, ix] + rho0[ky, ix])
+            d_rhoA_y = (rho_A[ky, ix] - rho_A[iy, ix]) * inv_dy
+            d_rhoB_y = (rho_B[ky, ix] - rho_B[iy, ix]) * inv_dy
+            d_rho0_y = (rho0[ky, ix] - rho0[iy, ix]) * inv_dy
+            d_UA_y = (U_A[ky, ix] - U_A[iy, ix]) * inv_dy
+            d_UB_y = (U_B[ky, ix] - U_B[iy, ix]) * inv_dy
+            F_A = D_A * (rho0_y * d_rhoA_y - rhoA_y * d_rho0_y - beta * rho0_y * rhoA_y * d_UA_y)
+            F_A += D_v * (rhoB_y * d_rhoA_y - rhoA_y * d_rhoB_y)
+            F_B = D_B * (rho0_y * d_rhoB_y - rhoB_y * d_rho0_y - beta * rho0_y * rhoB_y * d_UB_y)
+            F_B += D_v * (rhoA_y * d_rhoB_y - rhoB_y * d_rhoA_y)
+            cA = dt * F_A * inv_dy
+            cB = dt * F_B * inv_dy
+            if add_noise == 1:
+                amp_A = h_noise * np.sqrt(max(2.0 * D_A * rho0_y * rhoA_y, 0.0))
+                amp_B = h_noise * np.sqrt(max(2.0 * D_B * rho0_y * rhoB_y, 0.0))
+                cA += scale_cv * amp_A * eta_A_y[iy, ix] * inv_dy
+                cB += scale_cv * amp_B * eta_B_y[iy, ix] * inv_dy
+            flux_A_y[iy, ix] = cA
+            flux_B_y[iy, ix] = cB
+
+    # Low-order admissible baseline: old conservative budget limiter on raw fluxes.
+    for iy in range(ny):
+        for ix in range(nx):
+            jx = ix + 1
+            if jx == nx:
+                jx = 0
+            cA = flux_A_x[iy, ix]
+            cB = flux_B_x[iy, ix]
+            occ = cA + cB
+            if cA < 0.0:
+                neg_A[iy, ix] += -cA
+            if cB < 0.0:
+                neg_B[iy, ix] += -cB
+            if occ > 0.0:
+                pos_occ[iy, ix] += occ
+            cA = -cA
+            cB = -cB
+            occ = cA + cB
+            if cA < 0.0:
+                neg_A[iy, jx] += -cA
+            if cB < 0.0:
+                neg_B[iy, jx] += -cB
+            if occ > 0.0:
+                pos_occ[iy, jx] += occ
+            ky = iy + 1
+            if ky == ny:
+                ky = 0
+            cA = flux_A_y[iy, ix]
+            cB = flux_B_y[iy, ix]
+            occ = cA + cB
+            if cA < 0.0:
+                neg_A[iy, ix] += -cA
+            if cB < 0.0:
+                neg_B[iy, ix] += -cB
+            if occ > 0.0:
+                pos_occ[iy, ix] += occ
+            cA = -cA
+            cB = -cB
+            occ = cA + cB
+            if cA < 0.0:
+                neg_A[ky, ix] += -cA
+            if cB < 0.0:
+                neg_B[ky, ix] += -cB
+            if occ > 0.0:
+                pos_occ[ky, ix] += occ
+
+    low_limited_cells = 0
+    eps = 1.0e-15
+    for iy in range(ny):
+        for ix in range(nx):
+            a = 1.0
+            if neg_A[iy, ix] > rho_A[iy, ix] + eps:
+                a = max(rho_A[iy, ix], 0.0) / neg_A[iy, ix]
+            alpha_A[iy, ix] = a
+            b = 1.0
+            if neg_B[iy, ix] > rho_B[iy, ix] + eps:
+                b = max(rho_B[iy, ix], 0.0) / neg_B[iy, ix]
+            alpha_B[iy, ix] = b
+            o = 1.0
+            vacancy = 1.0 - rho_A[iy, ix] - rho_B[iy, ix]
+            if pos_occ[iy, ix] > vacancy + eps:
+                o = max(vacancy, 0.0) / pos_occ[iy, ix]
+            alpha_occ[iy, ix] = o
+            if a < 1.0 or b < 1.0 or o < 1.0:
+                low_limited_cells += 1
+            delta_A[iy, ix] = 0.0
+            delta_B[iy, ix] = 0.0
+
+    for iy in range(ny):
+        for ix in range(nx):
+            jx = ix + 1
+            if jx == nx:
+                jx = 0
+            cA = flux_A_x[iy, ix]
+            cB = flux_B_x[iy, ix]
+            th = 1.0
+            occ = cA + cB
+            if cA < 0.0 and alpha_A[iy, ix] < th:
+                th = alpha_A[iy, ix]
+            if cB < 0.0 and alpha_B[iy, ix] < th:
+                th = alpha_B[iy, ix]
+            if occ > 0.0 and alpha_occ[iy, ix] < th:
+                th = alpha_occ[iy, ix]
+            if cA > 0.0 and alpha_A[iy, jx] < th:
+                th = alpha_A[iy, jx]
+            if cB > 0.0 and alpha_B[iy, jx] < th:
+                th = alpha_B[iy, jx]
+            if occ < 0.0 and alpha_occ[iy, jx] < th:
+                th = alpha_occ[iy, jx]
+            cA *= th
+            cB *= th
+            low_A_x[iy, ix] = cA
+            low_B_x[iy, ix] = cB
+            delta_A[iy, ix] += cA
+            delta_A[iy, jx] -= cA
+            delta_B[iy, ix] += cB
+            delta_B[iy, jx] -= cB
+
+    for iy in range(ny):
+        ky = iy + 1
+        if ky == ny:
+            ky = 0
+        for ix in range(nx):
+            cA = flux_A_y[iy, ix]
+            cB = flux_B_y[iy, ix]
+            th = 1.0
+            occ = cA + cB
+            if cA < 0.0 and alpha_A[iy, ix] < th:
+                th = alpha_A[iy, ix]
+            if cB < 0.0 and alpha_B[iy, ix] < th:
+                th = alpha_B[iy, ix]
+            if occ > 0.0 and alpha_occ[iy, ix] < th:
+                th = alpha_occ[iy, ix]
+            if cA > 0.0 and alpha_A[ky, ix] < th:
+                th = alpha_A[ky, ix]
+            if cB > 0.0 and alpha_B[ky, ix] < th:
+                th = alpha_B[ky, ix]
+            if occ < 0.0 and alpha_occ[ky, ix] < th:
+                th = alpha_occ[ky, ix]
+            cA *= th
+            cB *= th
+            low_A_y[iy, ix] = cA
+            low_B_y[iy, ix] = cB
+            delta_A[iy, ix] += cA
+            delta_A[ky, ix] -= cA
+            delta_B[iy, ix] += cB
+            delta_B[ky, ix] -= cB
+
+    for iy in range(ny):
+        for ix in range(nx):
+            rho_A_out[iy, ix] = rho_A[iy, ix] + delta_A[iy, ix]
+            rho_B_out[iy, ix] = rho_B[iy, ix] + delta_B[iy, ix]
+            neg_A[iy, ix] = 0.0
+            neg_B[iy, ix] = 0.0
+            pos_occ[iy, ix] = 0.0
+            delta_A[iy, ix] = 0.0
+            delta_B[iy, ix] = 0.0
+
+    # FCT budgets for antidiffusive correction around the low-order state.
+    for iy in range(ny):
+        for ix in range(nx):
+            jx = ix + 1
+            if jx == nx:
+                jx = 0
+            cA = flux_A_x[iy, ix] - low_A_x[iy, ix]
+            cB = flux_B_x[iy, ix] - low_B_x[iy, ix]
+            occ = cA + cB
+            if cA < 0.0:
+                neg_A[iy, ix] += -cA
+            if cB < 0.0:
+                neg_B[iy, ix] += -cB
+            if occ > 0.0:
+                pos_occ[iy, ix] += occ
+            cA = -cA
+            cB = -cB
+            occ = cA + cB
+            if cA < 0.0:
+                neg_A[iy, jx] += -cA
+            if cB < 0.0:
+                neg_B[iy, jx] += -cB
+            if occ > 0.0:
+                pos_occ[iy, jx] += occ
+            ky = iy + 1
+            if ky == ny:
+                ky = 0
+            cA = flux_A_y[iy, ix] - low_A_y[iy, ix]
+            cB = flux_B_y[iy, ix] - low_B_y[iy, ix]
+            occ = cA + cB
+            if cA < 0.0:
+                neg_A[iy, ix] += -cA
+            if cB < 0.0:
+                neg_B[iy, ix] += -cB
+            if occ > 0.0:
+                pos_occ[iy, ix] += occ
+            cA = -cA
+            cB = -cB
+            occ = cA + cB
+            if cA < 0.0:
+                neg_A[ky, ix] += -cA
+            if cB < 0.0:
+                neg_B[ky, ix] += -cB
+            if occ > 0.0:
+                pos_occ[ky, ix] += occ
+
+    fct_limited_cells = 0
+    for iy in range(ny):
+        for ix in range(nx):
+            a = 1.0
+            if neg_A[iy, ix] > rho_A_out[iy, ix] + eps:
+                a = max(rho_A_out[iy, ix], 0.0) / neg_A[iy, ix]
+            alpha_A[iy, ix] = a
+            b = 1.0
+            if neg_B[iy, ix] > rho_B_out[iy, ix] + eps:
+                b = max(rho_B_out[iy, ix], 0.0) / neg_B[iy, ix]
+            alpha_B[iy, ix] = b
+            o = 1.0
+            vacancy = 1.0 - rho_A_out[iy, ix] - rho_B_out[iy, ix]
+            if pos_occ[iy, ix] > vacancy + eps:
+                o = max(vacancy, 0.0) / pos_occ[iy, ix]
+            alpha_occ[iy, ix] = o
+            if a < 1.0 or b < 1.0 or o < 1.0:
+                fct_limited_cells += 1
+
+    limited_faces = 0
+    for iy in range(ny):
+        for ix in range(nx):
+            jx = ix + 1
+            if jx == nx:
+                jx = 0
+            cA = flux_A_x[iy, ix] - low_A_x[iy, ix]
+            cB = flux_B_x[iy, ix] - low_B_x[iy, ix]
+            th = 1.0
+            occ = cA + cB
+            if cA < 0.0 and alpha_A[iy, ix] < th:
+                th = alpha_A[iy, ix]
+            if cB < 0.0 and alpha_B[iy, ix] < th:
+                th = alpha_B[iy, ix]
+            if occ > 0.0 and alpha_occ[iy, ix] < th:
+                th = alpha_occ[iy, ix]
+            if cA > 0.0 and alpha_A[iy, jx] < th:
+                th = alpha_A[iy, jx]
+            if cB > 0.0 and alpha_B[iy, jx] < th:
+                th = alpha_B[iy, jx]
+            if occ < 0.0 and alpha_occ[iy, jx] < th:
+                th = alpha_occ[iy, jx]
+            theta_x[iy, ix] = th
+            if th < 1.0:
+                limited_faces += 1
+            cA *= th
+            cB *= th
+            rho_A_out[iy, ix] += cA
+            rho_A_out[iy, jx] -= cA
+            rho_B_out[iy, ix] += cB
+            rho_B_out[iy, jx] -= cB
+
+    for iy in range(ny):
+        ky = iy + 1
+        if ky == ny:
+            ky = 0
+        for ix in range(nx):
+            cA = flux_A_y[iy, ix] - low_A_y[iy, ix]
+            cB = flux_B_y[iy, ix] - low_B_y[iy, ix]
+            th = 1.0
+            occ = cA + cB
+            if cA < 0.0 and alpha_A[iy, ix] < th:
+                th = alpha_A[iy, ix]
+            if cB < 0.0 and alpha_B[iy, ix] < th:
+                th = alpha_B[iy, ix]
+            if occ > 0.0 and alpha_occ[iy, ix] < th:
+                th = alpha_occ[iy, ix]
+            if cA > 0.0 and alpha_A[ky, ix] < th:
+                th = alpha_A[ky, ix]
+            if cB > 0.0 and alpha_B[ky, ix] < th:
+                th = alpha_B[ky, ix]
+            if occ < 0.0 and alpha_occ[ky, ix] < th:
+                th = alpha_occ[ky, ix]
+            theta_y[iy, ix] = th
+            if th < 1.0:
+                limited_faces += 1
+            cA *= th
+            cB *= th
+            rho_A_out[iy, ix] += cA
+            rho_A_out[ky, ix] -= cA
+            rho_B_out[iy, ix] += cB
+            rho_B_out[ky, ix] -= cB
+
+    voter_limited_cells = 0
+    voter_prefactor = 2.0 * spatial_dim * D_v * (h_noise ** (spatial_dim - 2))
+    for iy in range(ny):
+        for ix in range(nx):
+            ra = rho_A_out[iy, ix]
+            rb = rho_B_out[iy, ix]
+            if add_noise == 1 and D_v > 0.0:
+                amp_v = np.sqrt(max(voter_prefactor * rho_A[iy, ix] * rho_B[iy, ix], 0.0))
+                source = scale_cv * amp_v * xi[iy, ix]
+                lo = -ra
+                hi = rb
+                clipped = source
+                if clipped < lo:
+                    clipped = lo
+                if clipped > hi:
+                    clipped = hi
+                if clipped != source:
+                    voter_limited_cells += 1
+                ra += clipped
+                rb -= clipped
+            if ra < 0.0 and ra > -1.0e-14:
+                ra = 0.0
+            if rb < 0.0 and rb > -1.0e-14:
+                rb = 0.0
+            occ = ra + rb
+            if occ > 1.0 and occ < 1.0 + 1.0e-14:
+                excess = occ - 1.0
+                if ra >= rb:
+                    ra -= excess
+                else:
+                    rb -= excess
+            rho_A_out[iy, ix] = ra
+            rho_B_out[iy, ix] = rb
+
+    return low_limited_cells + fct_limited_cells, limited_faces, voter_limited_cells
+
 # Numba parallelization is intentionally not enabled here: the conservative
 # face-scatter updates write to both neighboring cells, so naive prange would
 # introduce races. A parallel two-pass face-flux implementation can be added
@@ -925,9 +1356,10 @@ class SchellingVoterFVSolver:
         Backward-compatible switch for the historical clip projection.  Ignored
         when ``limiter_mode`` is supplied explicitly.
     limiter_mode:
-        One of ``"none"``, ``"clip"``, or ``"conservative"``.  The
-        conservative mode is implemented for fully active periodic grids and
-        limits explicit/stochastic face fluxes before committing the step.
+        One of ``"none"``, ``"clip"``, ``"fct"``/``"conservative"``, or
+        ``"conservative_old"``.  The FCT/conservative mode is implemented for
+        fully active periodic grids and limits only antidiffusive face-flux
+        corrections before committing the step.
     rng:
         Optional NumPy random generator used for stochastic increments.
     use_periodic_fast_path:
@@ -1013,8 +1445,10 @@ class SchellingVoterFVSolver:
         if limiter_mode is None:
             limiter_mode = "clip" if simplex_limiter else "none"
         self.limiter_mode = str(limiter_mode).lower()
-        if self.limiter_mode not in {"none", "clip", "conservative"}:
-            raise ValueError("limiter_mode must be 'none', 'clip', or 'conservative'")
+        if self.limiter_mode == "conservative":
+            self.limiter_mode = "fct"
+        if self.limiter_mode not in {"none", "clip", "conservative_old", "fct", "conservative_fct"}:
+            raise ValueError("limiter_mode must be 'none', 'clip', 'conservative_old', 'fct', or 'conservative_fct'")
         self.simplex_limiter = self.limiter_mode == "clip"
         self.last_limiter_corrections = 0
         self.last_limiter_stats: Dict[str, int | float | str] = self._empty_limiter_stats(self.limiter_mode)
@@ -1071,6 +1505,10 @@ class SchellingVoterFVSolver:
         self._alpha_occ = np.ones((self.ny, self.nx), dtype=np.float64)
         self._theta_x = np.ones((self.ny, self.nx), dtype=np.float64)
         self._theta_y = np.ones((self.ny, self.nx), dtype=np.float64)
+        self._low_flux_A_x = np.zeros((self.ny, self.nx), dtype=np.float64)
+        self._low_flux_B_x = np.zeros((self.ny, self.nx), dtype=np.float64)
+        self._low_flux_A_y = np.zeros((self.ny, self.nx), dtype=np.float64)
+        self._low_flux_B_y = np.zeros((self.ny, self.nx), dtype=np.float64)
 
         # Random buffers; filled each step.
         self._eta_A_x = np.zeros((self.ny, self.nx), dtype=np.float64)
@@ -1129,7 +1567,7 @@ class SchellingVoterFVSolver:
             raise ValueError("rho_A and rho_B must have shape (ny, nx)")
         self.rho_A[...] = np.where(self.active, rho_A, 0.0)
         self.rho_B[...] = np.where(self.active, rho_B, 0.0)
-        if self.limiter_mode in {"clip", "conservative"}:
+        if self.limiter_mode in {"clip", "conservative_old", "fct", "conservative_fct"}:
             # Initial data are not produced by solver fluxes; use the historical
             # simplex projection to sanitize user-provided states in both bounded
             # modes.  Conservation claims below concern time stepping from an
@@ -1442,9 +1880,7 @@ class SchellingVoterFVSolver:
         return float(np.mean((x_flat - float(np.mean(x_flat))) * (y_flat - float(np.mean(y_flat)))) / (x_std * y_std))
 
     @staticmethod
-    def _add_flux_norm_stats(stats: Dict[str, int | float | str], prefix: str, raw_x: Array, raw_y: Array, theta_x: Array, theta_y: Array) -> None:
-        limited_x = theta_x * raw_x
-        limited_y = theta_y * raw_y
+    def _add_flux_pair_norm_stats(stats: Dict[str, int | float | str], prefix: str, raw_x: Array, raw_y: Array, limited_x: Array, limited_y: Array) -> None:
         l1_raw = float(np.sum(np.abs(raw_x)) + np.sum(np.abs(raw_y)))
         l1_limited = float(np.sum(np.abs(limited_x)) + np.sum(np.abs(limited_y)))
         l2_raw = float(np.sqrt(np.sum(raw_x * raw_x) + np.sum(raw_y * raw_y)))
@@ -1454,6 +1890,10 @@ class SchellingVoterFVSolver:
         stats[f"flux_{prefix}_l2_raw"] = l2_raw
         stats[f"flux_{prefix}_l2_limited"] = l2_limited
         stats[f"flux_{prefix}_removed_fraction"] = 0.0 if l1_raw <= 0.0 else max(0.0, (l1_raw - l1_limited) / l1_raw)
+
+    @staticmethod
+    def _add_flux_norm_stats(stats: Dict[str, int | float | str], prefix: str, raw_x: Array, raw_y: Array, theta_x: Array, theta_y: Array) -> None:
+        SchellingVoterFVSolver._add_flux_pair_norm_stats(stats, prefix, raw_x, raw_y, theta_x * raw_x, theta_y * raw_y)
 
     def _compute_theta_from_alpha(self) -> Tuple[Array, Array]:
         ax_r = np.roll(self._alpha_A, -1, axis=1)
@@ -1496,7 +1936,10 @@ class SchellingVoterFVSolver:
         gamma_repair_cells: int,
         gamma_repair_residual: float,
     ) -> Dict[str, int | float | str]:
-        theta_x, theta_y = self._compute_theta_from_alpha()
+        if self.limiter_mode in {"fct", "conservative_fct"}:
+            theta_x, theta_y = self._theta_x, self._theta_y
+        else:
+            theta_x, theta_y = self._compute_theta_from_alpha()
         theta = np.concatenate((theta_x.ravel(), theta_y.ravel()))
         stats = self._empty_limiter_stats(self.limiter_mode)
         stats.update(
@@ -1529,9 +1972,26 @@ class SchellingVoterFVSolver:
         for q in (1, 5, 10, 25, 75, 90, 95, 99):
             stats[f"theta_p{q:02d}"] = float(np.percentile(theta, q))
 
-        self._add_flux_norm_stats(stats, "A", self._flux_A_x, self._flux_A_y, theta_x, theta_y)
-        self._add_flux_norm_stats(stats, "B", self._flux_B_x, self._flux_B_y, theta_x, theta_y)
-        self._add_flux_norm_stats(stats, "occupied", self._flux_A_x + self._flux_B_x, self._flux_A_y + self._flux_B_y, theta_x, theta_y)
+        if self.limiter_mode in {"fct", "conservative_fct"}:
+            limited_A_x = self._low_flux_A_x + theta_x * (self._flux_A_x - self._low_flux_A_x)
+            limited_A_y = self._low_flux_A_y + theta_y * (self._flux_A_y - self._low_flux_A_y)
+            limited_B_x = self._low_flux_B_x + theta_x * (self._flux_B_x - self._low_flux_B_x)
+            limited_B_y = self._low_flux_B_y + theta_y * (self._flux_B_y - self._low_flux_B_y)
+            limited_occ_x = limited_A_x + limited_B_x
+            limited_occ_y = limited_A_y + limited_B_y
+            self._add_flux_pair_norm_stats(stats, "A", self._flux_A_x, self._flux_A_y, limited_A_x, limited_A_y)
+            self._add_flux_pair_norm_stats(stats, "B", self._flux_B_x, self._flux_B_y, limited_B_x, limited_B_y)
+            self._add_flux_pair_norm_stats(stats, "occupied", self._flux_A_x + self._flux_B_x, self._flux_A_y + self._flux_B_y, limited_occ_x, limited_occ_y)
+        else:
+            limited_A_x = theta_x * self._flux_A_x
+            limited_A_y = theta_y * self._flux_A_y
+            limited_B_x = theta_x * self._flux_B_x
+            limited_B_y = theta_y * self._flux_B_y
+            limited_occ_x = limited_A_x + limited_B_x
+            limited_occ_y = limited_A_y + limited_B_y
+            self._add_flux_norm_stats(stats, "A", self._flux_A_x, self._flux_A_y, theta_x, theta_y)
+            self._add_flux_norm_stats(stats, "B", self._flux_B_x, self._flux_B_y, theta_x, theta_y)
+            self._add_flux_norm_stats(stats, "occupied", self._flux_A_x + self._flux_B_x, self._flux_A_y + self._flux_B_y, theta_x, theta_y)
 
         rho_A = self.rho_A
         rho_B = self.rho_B
@@ -1570,16 +2030,36 @@ class SchellingVoterFVSolver:
         det_A_y *= dt * inv_dy
         det_B_y *= dt * inv_dy
 
-        self._add_flux_norm_stats(stats, "deterministic_A", det_A_x, det_A_y, theta_x, theta_y)
-        self._add_flux_norm_stats(stats, "deterministic_B", det_B_x, det_B_y, theta_x, theta_y)
-        self._add_flux_norm_stats(stats, "deterministic_occupied", det_A_x + det_B_x, det_A_y + det_B_y, theta_x, theta_y)
-        noise_A_x = self._flux_A_x - det_A_x if add_noise else np.zeros_like(det_A_x)
-        noise_A_y = self._flux_A_y - det_A_y if add_noise else np.zeros_like(det_A_y)
-        noise_B_x = self._flux_B_x - det_B_x if add_noise else np.zeros_like(det_B_x)
-        noise_B_y = self._flux_B_y - det_B_y if add_noise else np.zeros_like(det_B_y)
-        self._add_flux_norm_stats(stats, "schelling_noise_A", noise_A_x, noise_A_y, theta_x, theta_y)
-        self._add_flux_norm_stats(stats, "schelling_noise_B", noise_B_x, noise_B_y, theta_x, theta_y)
-        self._add_flux_norm_stats(stats, "schelling_noise_occupied", noise_A_x + noise_B_x, noise_A_y + noise_B_y, theta_x, theta_y)
+        if self.limiter_mode in {"fct", "conservative_fct"}:
+            ratio_A_x = np.divide(limited_A_x, self._flux_A_x, out=np.ones_like(limited_A_x), where=np.abs(self._flux_A_x) > 0.0)
+            ratio_A_y = np.divide(limited_A_y, self._flux_A_y, out=np.ones_like(limited_A_y), where=np.abs(self._flux_A_y) > 0.0)
+            ratio_B_x = np.divide(limited_B_x, self._flux_B_x, out=np.ones_like(limited_B_x), where=np.abs(self._flux_B_x) > 0.0)
+            ratio_B_y = np.divide(limited_B_y, self._flux_B_y, out=np.ones_like(limited_B_y), where=np.abs(self._flux_B_y) > 0.0)
+            raw_occ_x = self._flux_A_x + self._flux_B_x
+            raw_occ_y = self._flux_A_y + self._flux_B_y
+            ratio_occ_x = np.divide(limited_occ_x, raw_occ_x, out=np.ones_like(limited_occ_x), where=np.abs(raw_occ_x) > 0.0)
+            ratio_occ_y = np.divide(limited_occ_y, raw_occ_y, out=np.ones_like(limited_occ_y), where=np.abs(raw_occ_y) > 0.0)
+            self._add_flux_pair_norm_stats(stats, "deterministic_A", det_A_x, det_A_y, ratio_A_x * det_A_x, ratio_A_y * det_A_y)
+            self._add_flux_pair_norm_stats(stats, "deterministic_B", det_B_x, det_B_y, ratio_B_x * det_B_x, ratio_B_y * det_B_y)
+            self._add_flux_pair_norm_stats(stats, "deterministic_occupied", det_A_x + det_B_x, det_A_y + det_B_y, ratio_occ_x * (det_A_x + det_B_x), ratio_occ_y * (det_A_y + det_B_y))
+            noise_A_x = self._flux_A_x - det_A_x if add_noise else np.zeros_like(det_A_x)
+            noise_A_y = self._flux_A_y - det_A_y if add_noise else np.zeros_like(det_A_y)
+            noise_B_x = self._flux_B_x - det_B_x if add_noise else np.zeros_like(det_B_x)
+            noise_B_y = self._flux_B_y - det_B_y if add_noise else np.zeros_like(det_B_y)
+            self._add_flux_pair_norm_stats(stats, "schelling_noise_A", noise_A_x, noise_A_y, ratio_A_x * noise_A_x, ratio_A_y * noise_A_y)
+            self._add_flux_pair_norm_stats(stats, "schelling_noise_B", noise_B_x, noise_B_y, ratio_B_x * noise_B_x, ratio_B_y * noise_B_y)
+            self._add_flux_pair_norm_stats(stats, "schelling_noise_occupied", noise_A_x + noise_B_x, noise_A_y + noise_B_y, ratio_occ_x * (noise_A_x + noise_B_x), ratio_occ_y * (noise_A_y + noise_B_y))
+        else:
+            self._add_flux_norm_stats(stats, "deterministic_A", det_A_x, det_A_y, theta_x, theta_y)
+            self._add_flux_norm_stats(stats, "deterministic_B", det_B_x, det_B_y, theta_x, theta_y)
+            self._add_flux_norm_stats(stats, "deterministic_occupied", det_A_x + det_B_x, det_A_y + det_B_y, theta_x, theta_y)
+            noise_A_x = self._flux_A_x - det_A_x if add_noise else np.zeros_like(det_A_x)
+            noise_A_y = self._flux_A_y - det_A_y if add_noise else np.zeros_like(det_A_y)
+            noise_B_x = self._flux_B_x - det_B_x if add_noise else np.zeros_like(det_B_x)
+            noise_B_y = self._flux_B_y - det_B_y if add_noise else np.zeros_like(det_B_y)
+            self._add_flux_norm_stats(stats, "schelling_noise_A", noise_A_x, noise_A_y, theta_x, theta_y)
+            self._add_flux_norm_stats(stats, "schelling_noise_B", noise_B_x, noise_B_y, theta_x, theta_y)
+            self._add_flux_norm_stats(stats, "schelling_noise_occupied", noise_A_x + noise_B_x, noise_A_y + noise_B_y, theta_x, theta_y)
 
         limiting_activity = ((1.0 - theta_x) + np.roll(1.0 - theta_x, 1, axis=1) + (1.0 - theta_y) + np.roll(1.0 - theta_y, 1, axis=0)) * 0.25
         occ = rho_A + rho_B
@@ -1605,7 +2085,7 @@ class SchellingVoterFVSolver:
         """
         if not self.fully_active_periodic:
             raise NotImplementedError(
-                "limiter_mode='conservative' is currently implemented for fully active periodic grids only; "
+                "conservative/FCT limiter is currently implemented for fully active periodic grids only; "
                 "use limiter_mode='clip' or 'none' for masked/no-flux grids."
             )
         if add_noise:
@@ -1615,47 +2095,96 @@ class SchellingVoterFVSolver:
             self._fill_standard_normal(self._eta_B_y)
             self._fill_standard_normal(self._xi)
 
-        limited_cells, limited_faces, voter_limited_cells = _conservative_limited_update_periodic_numba(
-            self.rho_A,
-            self.rho_B,
-            self.dx,
-            self.dy,
-            self.vol,
-            self.params.D_A,
-            self.params.D_B,
-            self.params.D_v,
-            self.params.beta,
-            self.params.h_noise,
-            self.params.spatial_dim,
-            self.params.kappa[0, 0],
-            self.params.kappa[0, 1],
-            self.params.kappa[1, 0],
-            self.params.kappa[1, 1],
-            dt,
-            1 if add_noise else 0,
-            self._rho0,
-            self._U_A,
-            self._U_B,
-            self._eta_A_x,
-            self._eta_B_x,
-            self._eta_A_y,
-            self._eta_B_y,
-            self._xi,
-            self._flux_A_x,
-            self._flux_B_x,
-            self._flux_A_y,
-            self._flux_B_y,
-            self._rhs_A,
-            self._rhs_B,
-            self._budget_A,
-            self._budget_B,
-            self._budget_occ,
-            self._alpha_A,
-            self._alpha_B,
-            self._alpha_occ,
-            self._rho_A_new,
-            self._rho_B_new,
-        )
+        if self.limiter_mode in {"fct", "conservative_fct"}:
+            limited_cells, limited_faces, voter_limited_cells = _fct_limited_update_periodic_numba(
+                self.rho_A,
+                self.rho_B,
+                self.dx,
+                self.dy,
+                self.vol,
+                self.params.D_A,
+                self.params.D_B,
+                self.params.D_v,
+                self.params.beta,
+                self.params.h_noise,
+                self.params.spatial_dim,
+                self.params.kappa[0, 0],
+                self.params.kappa[0, 1],
+                self.params.kappa[1, 0],
+                self.params.kappa[1, 1],
+                dt,
+                1 if add_noise else 0,
+                self._rho0,
+                self._U_A,
+                self._U_B,
+                self._eta_A_x,
+                self._eta_B_x,
+                self._eta_A_y,
+                self._eta_B_y,
+                self._xi,
+                self._flux_A_x,
+                self._flux_B_x,
+                self._flux_A_y,
+                self._flux_B_y,
+                self._low_flux_A_x,
+                self._low_flux_B_x,
+                self._low_flux_A_y,
+                self._low_flux_B_y,
+                self._rhs_A,
+                self._rhs_B,
+                self._budget_A,
+                self._budget_B,
+                self._budget_occ,
+                self._alpha_A,
+                self._alpha_B,
+                self._alpha_occ,
+                self._theta_x,
+                self._theta_y,
+                self._rho_A_new,
+                self._rho_B_new,
+            )
+        else:
+            limited_cells, limited_faces, voter_limited_cells = _conservative_limited_update_periodic_numba(
+                self.rho_A,
+                self.rho_B,
+                self.dx,
+                self.dy,
+                self.vol,
+                self.params.D_A,
+                self.params.D_B,
+                self.params.D_v,
+                self.params.beta,
+                self.params.h_noise,
+                self.params.spatial_dim,
+                self.params.kappa[0, 0],
+                self.params.kappa[0, 1],
+                self.params.kappa[1, 0],
+                self.params.kappa[1, 1],
+                dt,
+                1 if add_noise else 0,
+                self._rho0,
+                self._U_A,
+                self._U_B,
+                self._eta_A_x,
+                self._eta_B_x,
+                self._eta_A_y,
+                self._eta_B_y,
+                self._xi,
+                self._flux_A_x,
+                self._flux_B_x,
+                self._flux_A_y,
+                self._flux_B_y,
+                self._rhs_A,
+                self._rhs_B,
+                self._budget_A,
+                self._budget_B,
+                self._budget_occ,
+                self._alpha_A,
+                self._alpha_B,
+                self._alpha_occ,
+                self._rho_A_new,
+                self._rho_B_new,
+            )
         # Collect face-based diagnostics before committing the output state so
         # localization and deterministic/noise decomposition use the pre-step
         # densities that generated the raw face increments.
@@ -1691,7 +2220,7 @@ class SchellingVoterFVSolver:
         if add_noise is None:
             add_noise = self.stochastic
 
-        if self.limiter_mode == "conservative":
+        if self.limiter_mode in {"conservative_old", "fct", "conservative_fct"}:
             self.conservative_limited_periodic_step(dt, bool(add_noise))
             return
 
