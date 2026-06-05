@@ -118,3 +118,25 @@ def test_conservative_limiter_substantially_reduces_clip_occupied_drift():
     assert clip_drift > 10.0 * conservative_drift + 1.0e-8
     _assert_simplex(clip)
     _assert_simplex(conservative)
+
+
+def test_conservative_limiter_reports_flux_and_theta_diagnostics():
+    nx = ny = 8
+    solver = _solver("conservative", nx=nx, ny=ny, seed=33, stochastic=True, D_v=0.08)
+    rho_A0, rho_B0 = make_random_initial_condition(nx, ny, rhoA0=0.48, rhoB0=0.47, noise=4.0e-3, seed=6)
+    solver.set_state(rho_A0, rho_B0)
+    solver.step(5.0e-4, add_noise=True)
+    stats = solver.last_limiter_stats
+
+    assert stats["mode"] == "conservative"
+    assert stats["limited_faces"] == stats["limited_faces_x"] + stats["limited_faces_y"]
+    assert 0.0 <= stats["theta_min"] <= stats["theta_mean"] <= stats["theta_max"] <= 1.0
+    assert 0.0 <= stats["theta_frac_lt_1"] <= 1.0
+    assert 0.0 <= stats["theta_frac_lt_0_5"] <= stats["theta_frac_lt_1"]
+    assert 0.0 <= stats["theta_frac_lt_0_1"] <= stats["theta_frac_lt_0_5"]
+    for prefix in ("A", "B", "occupied", "deterministic_occupied", "schelling_noise_occupied"):
+        assert stats[f"flux_{prefix}_l1_raw"] >= stats[f"flux_{prefix}_l1_limited"] >= 0.0
+        assert stats[f"flux_{prefix}_l2_raw"] >= stats[f"flux_{prefix}_l2_limited"] >= 0.0
+        assert 0.0 <= stats[f"flux_{prefix}_removed_fraction"] <= 1.0
+    for key in ("limiting_corr_rho_A", "limiting_corr_rho_B", "limiting_corr_rho_0", "limiting_corr_grad_rho"):
+        assert -1.0 <= stats[key] <= 1.0
