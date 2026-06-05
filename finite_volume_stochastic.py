@@ -38,6 +38,7 @@ from dataclasses import dataclass
 from typing import Dict, Optional, Tuple
 import time
 
+import fhd
 import numpy as np
 
 try:
@@ -1596,7 +1597,18 @@ class SchellingVoterFVSolver:
                 limiter_gamma_repair_cells.append(int(self.last_limiter_stats.get("gamma_repair_cells", 0)))
                 limiter_activations.append(int(self.last_limiter_stats.get("activations", 0)))
                 limiter_residual_max_violation.append(float(self.last_limiter_stats.get("residual_max_violation", 0.0)))
-                print(f"step {n}/{nsteps}:    <m_A> = {masses_A[-1]/masses_tot[-1]:.2f},   <m_B> = {masses_B[-1]/masses_tot[-1]:.2f},    <m_occ> = {masses_occ[-1]/masses_tot[-1]:.2f}")
+                # fhd diagnostics expect species-first fields with shape (2, nx, ny).
+                phi = np.array([self.rho_A.T, self.rho_B.T])
+                dissimilarity_index = fhd.dissimilarity(phi)
+                mean_kl_divergence = fhd.mean_relative_entropy(phi)
+                print(
+                    f"step {n}/{nsteps}:    "
+                    f"<m_A> = {masses_A[-1]/masses_tot[-1]:.2f},   "
+                    f"<m_B> = {masses_B[-1]/masses_tot[-1]:.2f},    "
+                    f"<m_occ> = {masses_occ[-1]/masses_tot[-1]:.2f},    "
+                    f"D_index = {dissimilarity_index:.6f},    "
+                    f"mean_kl_divergence = {mean_kl_divergence:.6f}"
+                )
 
             if record_snapshots_every > 0 and n % record_snapshots_every == 0:
                 snapshots.append((n * dt, self.rho_A.copy(), self.rho_B.copy()))
