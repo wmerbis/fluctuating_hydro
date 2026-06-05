@@ -935,6 +935,53 @@ class SchellingVoterFVSolver:
         specialized kernels; disable for benchmarking the generic path.
     """
 
+    @staticmethod
+    def _empty_limiter_stats(mode: str) -> Dict[str, int | float | str]:
+        """Return a complete zero-valued limiter diagnostics dictionary."""
+        stats: Dict[str, int | float | str] = {
+            "mode": mode,
+            "limited_cells": 0,
+            "limited_faces": 0,
+            "limited_faces_x": 0,
+            "limited_faces_y": 0,
+            "voter_limited_cells": 0,
+            "gamma_repair_cells": 0,
+            "activations": 0,
+            "residual_max_violation": 0.0,
+            "theta_min": 1.0,
+            "theta_mean": 1.0,
+            "theta_median": 1.0,
+            "theta_max": 1.0,
+            "theta_x_min": 1.0,
+            "theta_x_mean": 1.0,
+            "theta_x_median": 1.0,
+            "theta_x_max": 1.0,
+            "theta_y_min": 1.0,
+            "theta_y_mean": 1.0,
+            "theta_y_median": 1.0,
+            "theta_y_max": 1.0,
+            "theta_frac_lt_1": 0.0,
+            "theta_frac_lt_0_5": 0.0,
+            "theta_frac_lt_0_1": 0.0,
+            "theta_p01": 1.0,
+            "theta_p05": 1.0,
+            "theta_p10": 1.0,
+            "theta_p25": 1.0,
+            "theta_p75": 1.0,
+            "theta_p90": 1.0,
+            "theta_p95": 1.0,
+            "theta_p99": 1.0,
+        }
+        for prefix in ("A", "B", "occupied", "deterministic_A", "deterministic_B", "deterministic_occupied", "schelling_noise_A", "schelling_noise_B", "schelling_noise_occupied"):
+            stats[f"flux_{prefix}_l1_raw"] = 0.0
+            stats[f"flux_{prefix}_l1_limited"] = 0.0
+            stats[f"flux_{prefix}_l2_raw"] = 0.0
+            stats[f"flux_{prefix}_l2_limited"] = 0.0
+            stats[f"flux_{prefix}_removed_fraction"] = 0.0
+        for name in ("rho_A", "rho_B", "rho_0", "grad_rho"):
+            stats[f"limiting_corr_{name}"] = 0.0
+        return stats
+
     def __init__(
         self,
         nx: int,
@@ -970,15 +1017,7 @@ class SchellingVoterFVSolver:
             raise ValueError("limiter_mode must be 'none', 'clip', or 'conservative'")
         self.simplex_limiter = self.limiter_mode == "clip"
         self.last_limiter_corrections = 0
-        self.last_limiter_stats: Dict[str, int | float | str] = {
-            "mode": self.limiter_mode,
-            "limited_cells": 0,
-            "limited_faces": 0,
-            "voter_limited_cells": 0,
-            "gamma_repair_cells": 0,
-            "activations": 0,
-            "residual_max_violation": 0.0,
-        }
+        self.last_limiter_stats: Dict[str, int | float | str] = self._empty_limiter_stats(self.limiter_mode)
         self.rng = np.random.default_rng() if rng is None else rng
         self.use_periodic_fast_path = bool(use_periodic_fast_path)
 
@@ -1030,6 +1069,8 @@ class SchellingVoterFVSolver:
         self._alpha_A = np.ones((self.ny, self.nx), dtype=np.float64)
         self._alpha_B = np.ones((self.ny, self.nx), dtype=np.float64)
         self._alpha_occ = np.ones((self.ny, self.nx), dtype=np.float64)
+        self._theta_x = np.ones((self.ny, self.nx), dtype=np.float64)
+        self._theta_y = np.ones((self.ny, self.nx), dtype=np.float64)
 
         # Random buffers; filled each step.
         self._eta_A_x = np.zeros((self.ny, self.nx), dtype=np.float64)
@@ -1390,6 +1431,167 @@ class SchellingVoterFVSolver:
         )
         return changed, residual * self.vol
 
+    @staticmethod
+    def _safe_corrcoef(x: Array, y: Array) -> float:
+        x_flat = np.asarray(x, dtype=np.float64).ravel()
+        y_flat = np.asarray(y, dtype=np.float64).ravel()
+        x_std = float(np.std(x_flat))
+        y_std = float(np.std(y_flat))
+        if x_std <= 0.0 or y_std <= 0.0:
+            return 0.0
+        return float(np.mean((x_flat - float(np.mean(x_flat))) * (y_flat - float(np.mean(y_flat)))) / (x_std * y_std))
+
+    @staticmethod
+    def _add_flux_norm_stats(stats: Dict[str, int | float | str], prefix: str, raw_x: Array, raw_y: Array, theta_x: Array, theta_y: Array) -> None:
+        limited_x = theta_x * raw_x
+        limited_y = theta_y * raw_y
+        l1_raw = float(np.sum(np.abs(raw_x)) + np.sum(np.abs(raw_y)))
+        l1_limited = float(np.sum(np.abs(limited_x)) + np.sum(np.abs(limited_y)))
+        l2_raw = float(np.sqrt(np.sum(raw_x * raw_x) + np.sum(raw_y * raw_y)))
+        l2_limited = float(np.sqrt(np.sum(limited_x * limited_x) + np.sum(limited_y * limited_y)))
+        stats[f"flux_{prefix}_l1_raw"] = l1_raw
+        stats[f"flux_{prefix}_l1_limited"] = l1_limited
+        stats[f"flux_{prefix}_l2_raw"] = l2_raw
+        stats[f"flux_{prefix}_l2_limited"] = l2_limited
+        stats[f"flux_{prefix}_removed_fraction"] = 0.0 if l1_raw <= 0.0 else max(0.0, (l1_raw - l1_limited) / l1_raw)
+
+    def _compute_theta_from_alpha(self) -> Tuple[Array, Array]:
+        ax_r = np.roll(self._alpha_A, -1, axis=1)
+        bx_r = np.roll(self._alpha_B, -1, axis=1)
+        ox_r = np.roll(self._alpha_occ, -1, axis=1)
+        ay_u = np.roll(self._alpha_A, -1, axis=0)
+        by_u = np.roll(self._alpha_B, -1, axis=0)
+        oy_u = np.roll(self._alpha_occ, -1, axis=0)
+
+        np.copyto(self._theta_x, 1.0)
+        cA = self._flux_A_x
+        cB = self._flux_B_x
+        occ = cA + cB
+        np.minimum(self._theta_x, np.where(cA < 0.0, self._alpha_A, 1.0), out=self._theta_x)
+        np.minimum(self._theta_x, np.where(cB < 0.0, self._alpha_B, 1.0), out=self._theta_x)
+        np.minimum(self._theta_x, np.where(occ > 0.0, self._alpha_occ, 1.0), out=self._theta_x)
+        np.minimum(self._theta_x, np.where(cA > 0.0, ax_r, 1.0), out=self._theta_x)
+        np.minimum(self._theta_x, np.where(cB > 0.0, bx_r, 1.0), out=self._theta_x)
+        np.minimum(self._theta_x, np.where(occ < 0.0, ox_r, 1.0), out=self._theta_x)
+
+        np.copyto(self._theta_y, 1.0)
+        cA = self._flux_A_y
+        cB = self._flux_B_y
+        occ = cA + cB
+        np.minimum(self._theta_y, np.where(cA < 0.0, self._alpha_A, 1.0), out=self._theta_y)
+        np.minimum(self._theta_y, np.where(cB < 0.0, self._alpha_B, 1.0), out=self._theta_y)
+        np.minimum(self._theta_y, np.where(occ > 0.0, self._alpha_occ, 1.0), out=self._theta_y)
+        np.minimum(self._theta_y, np.where(cA > 0.0, ay_u, 1.0), out=self._theta_y)
+        np.minimum(self._theta_y, np.where(cB > 0.0, by_u, 1.0), out=self._theta_y)
+        np.minimum(self._theta_y, np.where(occ < 0.0, oy_u, 1.0), out=self._theta_y)
+        return self._theta_x, self._theta_y
+
+    def _collect_conservative_limiter_diagnostics(
+        self,
+        dt: float,
+        add_noise: bool,
+        limited_cells: int,
+        limited_faces: int,
+        voter_limited_cells: int,
+        gamma_repair_cells: int,
+        gamma_repair_residual: float,
+    ) -> Dict[str, int | float | str]:
+        theta_x, theta_y = self._compute_theta_from_alpha()
+        theta = np.concatenate((theta_x.ravel(), theta_y.ravel()))
+        stats = self._empty_limiter_stats(self.limiter_mode)
+        stats.update(
+            {
+                "limited_cells": int(limited_cells),
+                "limited_faces": int(limited_faces),
+                "limited_faces_x": int(np.count_nonzero(theta_x < 1.0)),
+                "limited_faces_y": int(np.count_nonzero(theta_y < 1.0)),
+                "voter_limited_cells": int(voter_limited_cells),
+                "gamma_repair_cells": int(gamma_repair_cells),
+                "activations": 1 if (limited_cells > 0 or limited_faces > 0 or voter_limited_cells > 0 or gamma_repair_cells > 0) else 0,
+                "residual_max_violation": max(self._max_simplex_violation(), gamma_repair_residual),
+                "theta_min": float(np.min(theta)),
+                "theta_mean": float(np.mean(theta)),
+                "theta_median": float(np.median(theta)),
+                "theta_max": float(np.max(theta)),
+                "theta_x_min": float(np.min(theta_x)),
+                "theta_x_mean": float(np.mean(theta_x)),
+                "theta_x_median": float(np.median(theta_x)),
+                "theta_x_max": float(np.max(theta_x)),
+                "theta_y_min": float(np.min(theta_y)),
+                "theta_y_mean": float(np.mean(theta_y)),
+                "theta_y_median": float(np.median(theta_y)),
+                "theta_y_max": float(np.max(theta_y)),
+                "theta_frac_lt_1": float(np.mean(theta < 1.0)),
+                "theta_frac_lt_0_5": float(np.mean(theta < 0.5)),
+                "theta_frac_lt_0_1": float(np.mean(theta < 0.1)),
+            }
+        )
+        for q in (1, 5, 10, 25, 75, 90, 95, 99):
+            stats[f"theta_p{q:02d}"] = float(np.percentile(theta, q))
+
+        self._add_flux_norm_stats(stats, "A", self._flux_A_x, self._flux_A_y, theta_x, theta_y)
+        self._add_flux_norm_stats(stats, "B", self._flux_B_x, self._flux_B_y, theta_x, theta_y)
+        self._add_flux_norm_stats(stats, "occupied", self._flux_A_x + self._flux_B_x, self._flux_A_y + self._flux_B_y, theta_x, theta_y)
+
+        rho_A = self.rho_A
+        rho_B = self.rho_B
+        rho0 = self._rho0
+        U_A = self._U_A
+        U_B = self._U_B
+        inv_dx = 1.0 / self.dx
+        inv_dy = 1.0 / self.dy
+        rhoA_r = np.roll(rho_A, -1, axis=1)
+        rhoB_r = np.roll(rho_B, -1, axis=1)
+        rho0_r = np.roll(rho0, -1, axis=1)
+        UA_r = np.roll(U_A, -1, axis=1)
+        UB_r = np.roll(U_B, -1, axis=1)
+        rhoA_x = 0.5 * (rho_A + rhoA_r)
+        rhoB_x = 0.5 * (rho_B + rhoB_r)
+        rho0_x = 0.5 * (rho0 + rho0_r)
+        det_A_x = self.params.D_A * (rho0_x * (rhoA_r - rho_A) * inv_dx - rhoA_x * (rho0_r - rho0) * inv_dx - self.params.beta * rho0_x * rhoA_x * (UA_r - U_A) * inv_dx)
+        det_A_x += self.params.D_v * (rhoB_x * (rhoA_r - rho_A) * inv_dx - rhoA_x * (rhoB_r - rho_B) * inv_dx)
+        det_B_x = self.params.D_B * (rho0_x * (rhoB_r - rho_B) * inv_dx - rhoB_x * (rho0_r - rho0) * inv_dx - self.params.beta * rho0_x * rhoB_x * (UB_r - U_B) * inv_dx)
+        det_B_x += self.params.D_v * (rhoA_x * (rhoB_r - rho_B) * inv_dx - rhoB_x * (rhoA_r - rho_A) * inv_dx)
+        det_A_x *= dt * inv_dx
+        det_B_x *= dt * inv_dx
+
+        rhoA_u = np.roll(rho_A, -1, axis=0)
+        rhoB_u = np.roll(rho_B, -1, axis=0)
+        rho0_u = np.roll(rho0, -1, axis=0)
+        UA_u = np.roll(U_A, -1, axis=0)
+        UB_u = np.roll(U_B, -1, axis=0)
+        rhoA_y = 0.5 * (rho_A + rhoA_u)
+        rhoB_y = 0.5 * (rho_B + rhoB_u)
+        rho0_y = 0.5 * (rho0 + rho0_u)
+        det_A_y = self.params.D_A * (rho0_y * (rhoA_u - rho_A) * inv_dy - rhoA_y * (rho0_u - rho0) * inv_dy - self.params.beta * rho0_y * rhoA_y * (UA_u - U_A) * inv_dy)
+        det_A_y += self.params.D_v * (rhoB_y * (rhoA_u - rho_A) * inv_dy - rhoA_y * (rhoB_u - rho_B) * inv_dy)
+        det_B_y = self.params.D_B * (rho0_y * (rhoB_u - rho_B) * inv_dy - rhoB_y * (rho0_u - rho0) * inv_dy - self.params.beta * rho0_y * rhoB_y * (UB_u - U_B) * inv_dy)
+        det_B_y += self.params.D_v * (rhoA_y * (rhoB_u - rho_B) * inv_dy - rhoB_y * (rhoA_u - rho_A) * inv_dy)
+        det_A_y *= dt * inv_dy
+        det_B_y *= dt * inv_dy
+
+        self._add_flux_norm_stats(stats, "deterministic_A", det_A_x, det_A_y, theta_x, theta_y)
+        self._add_flux_norm_stats(stats, "deterministic_B", det_B_x, det_B_y, theta_x, theta_y)
+        self._add_flux_norm_stats(stats, "deterministic_occupied", det_A_x + det_B_x, det_A_y + det_B_y, theta_x, theta_y)
+        noise_A_x = self._flux_A_x - det_A_x if add_noise else np.zeros_like(det_A_x)
+        noise_A_y = self._flux_A_y - det_A_y if add_noise else np.zeros_like(det_A_y)
+        noise_B_x = self._flux_B_x - det_B_x if add_noise else np.zeros_like(det_B_x)
+        noise_B_y = self._flux_B_y - det_B_y if add_noise else np.zeros_like(det_B_y)
+        self._add_flux_norm_stats(stats, "schelling_noise_A", noise_A_x, noise_A_y, theta_x, theta_y)
+        self._add_flux_norm_stats(stats, "schelling_noise_B", noise_B_x, noise_B_y, theta_x, theta_y)
+        self._add_flux_norm_stats(stats, "schelling_noise_occupied", noise_A_x + noise_B_x, noise_A_y + noise_B_y, theta_x, theta_y)
+
+        limiting_activity = ((1.0 - theta_x) + np.roll(1.0 - theta_x, 1, axis=1) + (1.0 - theta_y) + np.roll(1.0 - theta_y, 1, axis=0)) * 0.25
+        occ = rho_A + rho_B
+        grad_x = (np.roll(occ, -1, axis=1) - np.roll(occ, 1, axis=1)) * (0.5 * inv_dx)
+        grad_y = (np.roll(occ, -1, axis=0) - np.roll(occ, 1, axis=0)) * (0.5 * inv_dy)
+        grad_rho = np.sqrt(grad_x * grad_x + grad_y * grad_y)
+        stats["limiting_corr_rho_A"] = self._safe_corrcoef(limiting_activity, rho_A)
+        stats["limiting_corr_rho_B"] = self._safe_corrcoef(limiting_activity, rho_B)
+        stats["limiting_corr_rho_0"] = self._safe_corrcoef(limiting_activity, rho0)
+        stats["limiting_corr_grad_rho"] = self._safe_corrcoef(limiting_activity, grad_rho)
+        return stats
+
     def conservative_limited_periodic_step(self, dt: float, add_noise: bool) -> None:
         """Advance one fully-active periodic step with conservative flux limiting.
 
@@ -1454,6 +1656,18 @@ class SchellingVoterFVSolver:
             self._rho_A_new,
             self._rho_B_new,
         )
+        # Collect face-based diagnostics before committing the output state so
+        # localization and deterministic/noise decomposition use the pre-step
+        # densities that generated the raw face increments.
+        self.last_limiter_stats = self._collect_conservative_limiter_diagnostics(
+            dt,
+            add_noise,
+            int(limited_cells),
+            int(limited_faces),
+            int(voter_limited_cells),
+            0,
+            0.0,
+        )
         gamma_repair_cells = 0
         gamma_repair_residual = 0.0
         if self.semi_implicit_stiff:
@@ -1468,18 +1682,10 @@ class SchellingVoterFVSolver:
         else:
             self.rho_A[...] = self._rho_A_new
             self.rho_B[...] = self._rho_B_new
-        activations = 1 if (limited_cells > 0 or limited_faces > 0 or voter_limited_cells > 0 or gamma_repair_cells > 0) else 0
-        residual = max(self._max_simplex_violation(), gamma_repair_residual)
         self.last_limiter_corrections = int(limited_cells + voter_limited_cells + gamma_repair_cells)
-        self.last_limiter_stats = {
-            "mode": self.limiter_mode,
-            "limited_cells": int(limited_cells),
-            "limited_faces": int(limited_faces),
-            "voter_limited_cells": int(voter_limited_cells),
-            "gamma_repair_cells": int(gamma_repair_cells),
-            "activations": activations,
-            "residual_max_violation": residual,
-        }
+        self.last_limiter_stats["gamma_repair_cells"] = int(gamma_repair_cells)
+        self.last_limiter_stats["activations"] = 1 if (limited_cells > 0 or limited_faces > 0 or voter_limited_cells > 0 or gamma_repair_cells > 0) else 0
+        self.last_limiter_stats["residual_max_violation"] = max(self._max_simplex_violation(), float(gamma_repair_residual))
 
     def step(self, dt: float, add_noise: Optional[bool] = None) -> None:
         if add_noise is None:
@@ -1521,26 +1727,18 @@ class SchellingVoterFVSolver:
         if self.limiter_mode == "clip":
             limiter_corrections += self.apply_simplex_limiter()
             self.last_limiter_corrections = limiter_corrections
-            self.last_limiter_stats = {
-                "mode": self.limiter_mode,
-                "limited_cells": int(limiter_corrections),
-                "limited_faces": 0,
-                "voter_limited_cells": 0,
-                "gamma_repair_cells": 0,
-                "activations": 1 if limiter_corrections > 0 else 0,
-                "residual_max_violation": self._max_simplex_violation(),
-            }
+            self.last_limiter_stats = self._empty_limiter_stats(self.limiter_mode)
+            self.last_limiter_stats.update(
+                {
+                    "limited_cells": int(limiter_corrections),
+                    "activations": 1 if limiter_corrections > 0 else 0,
+                    "residual_max_violation": self._max_simplex_violation(),
+                }
+            )
         else:
             self.last_limiter_corrections = 0
-            self.last_limiter_stats = {
-                "mode": self.limiter_mode,
-                "limited_cells": 0,
-                "limited_faces": 0,
-                "voter_limited_cells": 0,
-                "gamma_repair_cells": 0,
-                "activations": 0,
-                "residual_max_violation": self._max_simplex_violation(),
-            }
+            self.last_limiter_stats = self._empty_limiter_stats(self.limiter_mode)
+            self.last_limiter_stats["residual_max_violation"] = self._max_simplex_violation()
 
     def run(
         self,
@@ -1576,6 +1774,24 @@ class SchellingVoterFVSolver:
         limiter_gamma_repair_cells = []
         limiter_activations = []
         limiter_residual_max_violation = []
+        limiter_diagnostic_keys = [
+            "theta_min",
+            "theta_mean",
+            "theta_median",
+            "theta_frac_lt_1",
+            "theta_frac_lt_0_5",
+            "theta_frac_lt_0_1",
+            "flux_A_removed_fraction",
+            "flux_B_removed_fraction",
+            "flux_occupied_removed_fraction",
+            "flux_deterministic_occupied_removed_fraction",
+            "flux_schelling_noise_occupied_removed_fraction",
+            "limiting_corr_rho_A",
+            "limiting_corr_rho_B",
+            "limiting_corr_rho_0",
+            "limiting_corr_grad_rho",
+        ]
+        limiter_diagnostics = {key: [] for key in limiter_diagnostic_keys}
         snapshots = []
 
         def should_record_mass(step_index: int) -> bool:
@@ -1597,6 +1813,8 @@ class SchellingVoterFVSolver:
                 limiter_gamma_repair_cells.append(int(self.last_limiter_stats.get("gamma_repair_cells", 0)))
                 limiter_activations.append(int(self.last_limiter_stats.get("activations", 0)))
                 limiter_residual_max_violation.append(float(self.last_limiter_stats.get("residual_max_violation", 0.0)))
+                for key in limiter_diagnostic_keys:
+                    limiter_diagnostics[key].append(float(self.last_limiter_stats.get(key, 0.0)))
                 # fhd diagnostics expect species-first fields with shape (2, nx, ny).
                 phi = np.array([self.rho_A.T, self.rho_B.T])
                 dissimilarity_index = fhd.dissimilarity(phi)
@@ -1633,6 +1851,8 @@ class SchellingVoterFVSolver:
             "limiter_activations": np.array(limiter_activations),
             "limiter_residual_max_violation": np.array(limiter_residual_max_violation),
         }
+        for key, values in limiter_diagnostics.items():
+            out[f"limiter_{key}"] = np.array(values)
         if record_snapshots_every > 0:
             out["snapshots"] = np.array(snapshots, dtype=object)
         return out
