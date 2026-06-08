@@ -1,11 +1,9 @@
 #!/usr/bin/env python3
-"""Compare clip and FCT conservative limiter dynamics for matched FV runs.
+"""Compare ``none`` and ``clip`` limiter dynamics for matched FV runs.
 
 The script uses identical initial conditions and RNG seeds for each limiter mode,
 then records mass drift, segregation diagnostics, Fourier peak strength, and the
-new FCT conservative-limiter flux-removal statistics.  An optional beta scan gives a
-quick check of whether the FCT conservative limiter shifts or suppresses the pattern
-onset observed with the historical clip projection.
+clip projection activity that remains in the simplified solver.
 """
 
 from __future__ import annotations
@@ -67,27 +65,9 @@ def summarize(name: str, series: Dict[str, np.ndarray], limiter_totals: Dict[str
         "limiter activity: "
         f"activations={limiter_totals['activations']:.0f}, "
         f"limited_cells={limiter_totals['limited_cells']:.0f}, "
-        f"limited_faces={limiter_totals['limited_faces']:.0f}, "
-        f"voter_limited_cells={limiter_totals['voter_limited_cells']:.0f}, "
-        f"gamma_repair_cells={limiter_totals['gamma_repair_cells']:.0f}, "
-        f"max residual violation={limiter_totals['residual_max_violation']:.3e}"
+        f"max residual violation={limiter_totals['residual_max_violation']:.3e}, "
+        f"projection ΔM_occ={limiter_totals['projection_delta_occupied']:+.6e}"
     )
-    if limiter_totals["limited_faces"] > 0.0:
-        print(
-            "conservative/FCT limiter means per active step: "
-            f"theta={limiter_totals['theta_mean_sum'] / max(limiter_totals['theta_samples'], 1):.4f}, "
-            f"theta<0.5={limiter_totals['theta_lt_0_5_sum'] / max(limiter_totals['theta_samples'], 1):.3e}, "
-            f"removed occ flux={limiter_totals['occ_removed_sum'] / max(limiter_totals['theta_samples'], 1):.3e}, "
-            f"removed deterministic occ={limiter_totals['det_occ_removed_sum'] / max(limiter_totals['theta_samples'], 1):.3e}, "
-            f"removed Schelling-noise occ={limiter_totals['noise_occ_removed_sum'] / max(limiter_totals['theta_samples'], 1):.3e}"
-        )
-        print(
-            "localization correlations: "
-            f"rho_A={limiter_totals['corr_A_sum'] / max(limiter_totals['theta_samples'], 1):+.3f}, "
-            f"rho_B={limiter_totals['corr_B_sum'] / max(limiter_totals['theta_samples'], 1):+.3f}, "
-            f"rho_0={limiter_totals['corr_0_sum'] / max(limiter_totals['theta_samples'], 1):+.3f}, "
-            f"|grad rho|={limiter_totals['corr_grad_sum'] / max(limiter_totals['theta_samples'], 1):+.3f}"
-        )
 
 
 def run_one(args: argparse.Namespace, mode: str, params: ModelParameters, rho_A0: np.ndarray, rho_B0: np.ndarray) -> tuple[Dict[str, np.ndarray], Dict[str, float]]:
@@ -108,20 +88,8 @@ def run_one(args: argparse.Namespace, mode: str, params: ModelParameters, rho_A0
     totals = {
         "activations": 0.0,
         "limited_cells": 0.0,
-        "limited_faces": 0.0,
-        "voter_limited_cells": 0.0,
-        "gamma_repair_cells": 0.0,
         "residual_max_violation": 0.0,
-        "theta_samples": 0.0,
-        "theta_mean_sum": 0.0,
-        "theta_lt_0_5_sum": 0.0,
-        "occ_removed_sum": 0.0,
-        "det_occ_removed_sum": 0.0,
-        "noise_occ_removed_sum": 0.0,
-        "corr_A_sum": 0.0,
-        "corr_B_sum": 0.0,
-        "corr_0_sum": 0.0,
-        "corr_grad_sum": 0.0,
+        "projection_delta_occupied": 0.0,
     }
     series: Dict[str, list[float]] = {"time": [], "mass_A": [], "mass_B": [], "mass_occupied": [], "mass_total": []}
     for key in structure_metrics(solver.rho_A, solver.rho_B):
@@ -139,20 +107,10 @@ def run_one(args: argparse.Namespace, mode: str, params: ModelParameters, rho_A0
             break
         solver.step(args.dt, add_noise=True)
         stats = solver.last_limiter_stats
-        for key in ("activations", "limited_cells", "limited_faces", "voter_limited_cells", "gamma_repair_cells"):
-            totals[key] += float(stats.get(key, 0.0))
+        totals["activations"] += float(stats.get("activations", 0.0))
+        totals["limited_cells"] += float(stats.get("limited_cells", 0.0))
+        totals["projection_delta_occupied"] += float(stats.get("projection_delta_occupied", 0.0))
         totals["residual_max_violation"] = max(totals["residual_max_violation"], float(stats.get("residual_max_violation", 0.0)))
-        if mode in {"conservative", "fct", "conservative_fct", "conservative_old"}:
-            totals["theta_samples"] += 1.0
-            totals["theta_mean_sum"] += float(stats.get("theta_mean", 1.0))
-            totals["theta_lt_0_5_sum"] += float(stats.get("theta_frac_lt_0_5", 0.0))
-            totals["occ_removed_sum"] += float(stats.get("flux_occupied_removed_fraction", 0.0))
-            totals["det_occ_removed_sum"] += float(stats.get("flux_deterministic_occupied_removed_fraction", 0.0))
-            totals["noise_occ_removed_sum"] += float(stats.get("flux_schelling_noise_occupied_removed_fraction", 0.0))
-            totals["corr_A_sum"] += float(stats.get("limiting_corr_rho_A", 0.0))
-            totals["corr_B_sum"] += float(stats.get("limiting_corr_rho_B", 0.0))
-            totals["corr_0_sum"] += float(stats.get("limiting_corr_rho_0", 0.0))
-            totals["corr_grad_sum"] += float(stats.get("limiting_corr_grad_rho", 0.0))
     return {k: np.asarray(v) for k, v in series.items()}, totals
 
 
@@ -180,7 +138,7 @@ def main() -> int:
     parser.add_argument("--beta", type=float, default=8.0)
     parser.add_argument("--beta-scan", type=str, default="", help="Comma-separated beta values for a small instability-threshold scan.")
     parser.add_argument("--csv", type=Path, default=None, help="Optional CSV path for final mode/scan summary rows.")
-    parser.add_argument("--modes", nargs="+", default=["clip", "fct"], choices=["none", "clip", "conservative", "fct", "conservative_fct", "conservative_old"])
+    parser.add_argument("--modes", nargs="+", default=["none", "clip"], choices=["none", "clip"])
     args = parser.parse_args()
 
     scan_betas = list(parse_scan(args.beta_scan)) if args.beta_scan else [args.beta]
@@ -201,9 +159,8 @@ def main() -> int:
                     "max_order_variance": np.max(series["order_variance"]),
                     "final_fourier_peak_amplitude": series["fourier_peak_amplitude"][-1],
                     "occupied_mass_drift": series["mass_occupied"][-1] - series["mass_occupied"][0],
-                    "limited_faces": totals["limited_faces"],
-                    "mean_theta": totals["theta_mean_sum"] / max(totals["theta_samples"], 1.0),
-                    "mean_occ_flux_removed": totals["occ_removed_sum"] / max(totals["theta_samples"], 1.0),
+                    "limited_cells": totals["limited_cells"],
+                    "projection_delta_occupied": totals["projection_delta_occupied"],
                 }
             )
     if args.csv is not None:
