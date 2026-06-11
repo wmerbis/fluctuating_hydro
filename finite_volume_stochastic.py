@@ -1054,6 +1054,7 @@ class SchellingVoterFVSolver:
         add_noise: Optional[bool] = None,
         record_masses_every: int = 0,
         record_snapshots_every: Optional[int] = None,
+        verbatum: Optional[bool] = False
     ) -> Dict[str, Array]:
         """Advance for ``nsteps`` with optional diagnostics decimation.
 
@@ -1105,16 +1106,17 @@ class SchellingVoterFVSolver:
                 limiter_projection_delta_total.append(float(self.last_limiter_stats.get("projection_delta_total", 0.0)))
                 # fhd diagnostics expect species-first fields with shape (2, nx, ny).
                 phi = np.array([self.rho_A.T, self.rho_B.T])
-                dissimilarity_index = fhd.dissimilarity(phi)
-                mean_kl_divergence = fhd.mean_relative_entropy(phi)
-                print(
-                    f"step {n}/{nsteps}:    "
-                    f"<m_A> = {masses_A[-1]/masses_tot[-1]:.6f},   "
-                    f"<m_B> = {masses_B[-1]/masses_tot[-1]:.6f},    "
-                    f"<m_occ> = {masses_occ[-1]/masses_tot[-1]:.6f},    "
-                    f"D_index = {dissimilarity_index:.6f},    "
-                    f"mean_kl_divergence = {mean_kl_divergence:.6f}"
-                )
+                if verbatum:
+                    dissimilarity_index = fhd.dissimilarity(phi)
+                    mean_kl_divergence = fhd.mean_relative_entropy(phi)
+                    print(
+                        f"step {n}/{nsteps}:    "
+                        f"<m_A> = {masses_A[-1]/masses_tot[-1]:.6f},   "
+                        f"<m_B> = {masses_B[-1]/masses_tot[-1]:.6f},    "
+                        f"<m_occ> = {masses_occ[-1]/masses_tot[-1]:.6f},    "
+                        f"D_index = {dissimilarity_index:.6f},    "
+                        f"mean_kl_divergence = {mean_kl_divergence:.6f}"
+                    )
 
             if record_snapshots_every > 0 and n % record_snapshots_every == 0:
                 snapshots.append((n * dt, self.rho_A.copy(), self.rho_B.copy()))
