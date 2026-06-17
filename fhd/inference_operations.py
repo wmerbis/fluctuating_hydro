@@ -30,6 +30,99 @@ def crop_and_rescale(
     half = side / 2
 
     square_bounds = (
+<<<<<<< HEAD
+=======
+        cx - half,
+        cy - half,
+        cx + half,
+        cy + half,
+    )
+
+    # --- 2. Optional padding ---
+    padding = padding_factor * cell_size
+    square_bounds = (
+        square_bounds[0] - padding,
+        square_bounds[1] - padding,
+        square_bounds[2] + padding,
+        square_bounds[3] + padding,
+    )
+
+    # --- 3. Crop ---
+    clipped = gdf.cx[
+        square_bounds[0]:square_bounds[2], 
+        square_bounds[1]:square_bounds[3]
+    ].copy()
+
+
+    gemeenten_clipped = gemeenten.cx[
+        square_bounds[0]:square_bounds[2],  
+        square_bounds[1]:square_bounds[3]
+    ]
+    
+    # --- 4. Add middle income if needed ---
+    if (
+        cols[2][index] not in clipped.columns
+        and cols[1][index] in clipped.columns
+        and cols[3][index] in clipped.columns
+    ):
+        clipped[cols[2][index]] = (
+            100
+            - clipped[cols[1][index]]
+            - clipped[cols[3][index]]
+        )
+
+    # --- 5. Reduce columns ---
+    keep_cols = [col[index] for col in cols if col[index] in clipped.columns]
+    clipped = clipped[keep_cols + ["geometry"]].copy()
+
+    # --- 6. Rescale ---
+    clipped["percentage_leeg"] = (clipped[cols[5][index]] / clipped[cols[4][index]]) 
+    
+    clipped["percentage_vol"] = 1 - clipped["percentage_leeg"]
+    
+
+    for col in [
+        cols[index][1],
+        cols[index][2],
+        cols[index][3],
+    ]:
+        if col in clipped.columns:
+            clipped[f"{col}_rs"] = (
+                clipped[col] * clipped["percentage_vol"]
+            ) / 100
+
+    return clipped, square_bounds, gemeenten_clipped
+
+def crop_and_rescale_rdh(
+    year,
+    gdf,
+    corop_gdf,
+    corop_names,
+    cols,
+    gemeenten,
+    cell_size = 500,
+    padding_factor = 0, ):
+    # Specific boundaries for The Hague-Rotterdam area
+
+    if year >= 2015 and year < 2017:
+        index = 1
+    if year >= 2017:  
+        index = 0
+
+    # --- 1. Get boundary ---
+    boundary = corop_gdf[corop_gdf["statnaam"].isin(corop_names)]
+    minx, miny, maxx, maxy = boundary.total_bounds
+
+    width  = maxx - minx
+    height = maxy - miny
+    side = max(width, height)
+
+    cx = (minx + maxx) / 2
+    cy = (miny + maxy) / 2
+    half = side / 2
+
+    square_bounds = (
+>>>>>>> e0c82f42 (Update thesis code)
         cx - half/2,
         cy - half/2,
         cx + half,

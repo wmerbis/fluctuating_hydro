@@ -110,7 +110,7 @@ class fhd_2d_3species:
         return phi
 
     def grad(self, u):
-        if self.fft:
+        if self.fft: 
             u_hat = np.fft.fft2(u)
         
             grad_x_hat = 1j * self.kx * u_hat
