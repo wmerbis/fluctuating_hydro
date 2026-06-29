@@ -29,7 +29,7 @@ L = (50,50)
 Lx, Ly = L
 simulator = fhd.fhd_2d(L,N, bc= 'periodic', fft=False)
 
-regimes = ["segregating"] #, "integrating", "migrating", "well-mixed"]
+regimes = ["segregating", "integrating", "migrating", "well-mixed"]
 # regimes = ["migrating", "well-mixed"]
 kappas = [np.array([[0.6, -0.4],[-0.4, 0.6]]), np.array([[0.6, 1], [1, 0.6]]),
 np.array([[1, 1], [-1, 1]]), np.array([[0.6, 0.4], [0.6, 0.4]])]
@@ -47,7 +47,7 @@ D_v = 0.00
 noise_v = 1
 beta = 10
 
-param = {'D': D, 'Gamma': Gamma, 'D_v' : D_v, 'beta': beta, 'noise_v': noise_v, 'h': 0.1}
+param = {'D': D, 'Gamma': Gamma, 'D_v' : D_v, 'beta': beta, 'noise_v': noise_v}
 
 # Parameter values for D - D_v sweep 
 Dv_vals = np.linspace(0.01,0.2,20) # D range between 0 and 0.1
