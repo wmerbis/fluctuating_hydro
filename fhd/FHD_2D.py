@@ -228,9 +228,10 @@ class fhd_2d:
         """Compute grad J =  D rho_0 ∂^2 rho - D rho ∂^2 rho_0  - ∂( rho*rho_0 ∂U_a) """
         rhorho0dUdx = phi*phi0*dUdx
         lapphi = self.lapl(phi)
+        lap_phi0 = - lapphi.sum(axis=0)
         div_dUdx = self.div2d(rhorho0dUdx) 
         D = param['D']
-        divJ = np.einsum("a,aij -> aij", D, phi0*lapphi - phi*self.lapl(phi0) - param['beta']*div_dUdx)
+        divJ = np.einsum("a,aij -> aij", D, phi0*lapphi - phi*lap_phi0 - param['beta']*div_dUdx)
         voter_current = param['D_v']*(phi[1]*lapphi[0] - phi[0]*lapphi[1])
         divJ[0] += voter_current
         divJ[1] += -voter_current
@@ -419,7 +420,7 @@ class fhd_2d:
         
             if n % plot_every == 0:
                 if verbatum:
-                    print(f"Step {n}/{nsteps}: mean rho = {phi_current.mean():.6f}, min = {phi_current.min():.6e}, KL_divergence = {dissimilarity(phi_current):.6f}, H_index = {mean_relative_entropy(phi_current):.6f}")
+                    print(f"Step {n}/{nsteps}: mean rho = {phi_current.mean():.6f}, min = {phi_current.min():.6e}, D_index = {dissimilarity(phi_current):.6f}, mean_kl_div = {mean_relative_entropy(phi_current):.6f}")
                 phi_run[:,n//plot_every,:,:] = phi_current
 
         if verbatum:
@@ -432,7 +433,7 @@ class fhd_2d:
             title = fr"$D = [{D[0]:.1f}, {D[1]:.1f}],\, \kappa = [[{kappa[0,0]:.1f}, {kappa[0,1]:.1f}], [{kappa[1,0]:.1f} , {kappa[1,1]:.1f}]] \,, \Gamma = [[{Gamma[0,0]:.1f}, {Gamma[0,1]:.1f}], [{Gamma[1,0]:.1f} , {Gamma[1,1]:.1f}]], \, D_v = {D_v} $"
             plt.title(title)
             plt.xlabel("x")
-            plt.ylabel("t")
+            plt.ylabel("y")
             cbar = plt.colorbar(im, fraction=0.046)
             cbar.set_label(r"$\phi_a - \phi_b$",size=14)
             plt.show()
