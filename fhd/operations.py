@@ -1,5 +1,6 @@
 import numpy as np
 import scipy as sp
+import numba as nb
 
 
 def fraction_unhappy(theta, phi):
@@ -58,6 +59,110 @@ def entropy_index(phi):
     f_i = phi_tot/np.sum(phi_tot)
     S_H = 1/H*np.sum(f_i*kl_divergence)
     return S_H
+
+import numpy as np
+import scipy as sp
+
+
+def makeD_second_order(Nx, dx, bc="periodic"):
+    Dx = np.zeros((Nx, Nx))
+
+    if bc == "periodic":
+        for i in range(Nx):
+            Dx[i, (i - 1) % Nx] = -0.5
+            Dx[i, (i + 1) % Nx] = 0.5
+
+    elif bc == "Neumann":
+        for i in range(Nx):
+            Dx[i, np.abs(i - 1)] += -0.5
+            Dx[i, Nx - 1 - np.abs(Nx - 1 - (i + 1))] += 0.5
+
+    else:
+        raise ValueError(
+            f"Boundary conditions {bc} not implemented, try 'periodic' or 'Neumann'"
+        )
+
+    return sp.sparse.csc_array(Dx / dx)
+
+def measure_mode_growth(sim, rho_bar, param, kx_index, ky_index):
+    Nx, Ny = sim.N
+    x = np.arange(Nx)[:, None]
+    y = np.arange(Ny)[None, :]
+
+    mode = np.cos(2*np.pi*kx_index*x/Nx + 2*np.pi*ky_index*y/Ny)
+
+    eps = 1e-6
+
+    phi0 = np.empty((2, Nx, Ny))
+    phi0[0] = rho_bar
+    phi0[1] = rho_bar
+
+    # composition/polarization perturbation
+    phi = phi0.copy()
+    phi[0] += eps * mode
+    phi[1] -= eps * mode
+
+    work = sim._ensure_work(phi.dtype)
+
+    rhs = sim.rhs_SchellingwithVoter(
+        phi, param, dt=1.0, toggle_noise=False, work=work
+    ).copy()
+
+    # project RHS onto the perturbation direction
+    amp_rhs = np.sum((rhs[0] - rhs[1]) * mode) / np.sum(mode**2)
+
+    # because perturbation in rho_A-rho_B has amplitude 2 eps
+    growth_rate = amp_rhs / (2 * eps)
+
+    return growth_rate
+
+
+def makeD2_second_order(Nx, dx, bc="periodic"):
+    D2x = np.zeros((Nx, Nx))
+
+    if bc == "periodic":
+        for i in range(Nx):
+            D2x[i, (i - 1) % Nx] = 1.0
+            D2x[i, i] = -2.0
+            D2x[i, (i + 1) % Nx] = 1.0
+
+    elif bc == "Neumann":
+        for i in range(Nx):
+            D2x[i, np.abs(i - 1)] += 1.0
+            D2x[i, i] += -2.0
+            D2x[i, Nx - 1 - np.abs(Nx - 1 - (i + 1))] += 1.0
+
+    else:
+        raise ValueError(
+            f"Boundary conditions {bc} not implemented, try 'periodic' or 'Neumann'"
+        )
+
+    return sp.sparse.csc_array(D2x / dx**2)
+
+
+def makeD3_second_order(Nx, dx, bc="periodic"):
+    D3x = np.zeros((Nx, Nx))
+
+    if bc == "periodic":
+        for i in range(Nx):
+            D3x[i, (i - 2) % Nx] = -0.5
+            D3x[i, (i - 1) % Nx] = 1.0
+            D3x[i, (i + 1) % Nx] = -1.0
+            D3x[i, (i + 2) % Nx] = 0.5
+
+    elif bc == "Neumann":
+        for i in range(Nx):
+            D3x[i, np.abs(i - 2)] += -0.5
+            D3x[i, np.abs(i - 1)] += 1.0
+            D3x[i, Nx - 1 - np.abs(Nx - 1 - (i + 1))] += -1.0
+            D3x[i, Nx - 1 - np.abs(Nx - 1 - (i + 2))] += 0.5
+
+    else:
+        raise ValueError(
+            f"Boundary conditions {bc} not implemented, try 'periodic' or 'Neumann'"
+        )
+
+    return sp.sparse.csc_array(D3x / dx**3)
 
 def makeD(Nx,dx, bc = "periodic"):
     Dx = np.zeros((Nx, Nx))
