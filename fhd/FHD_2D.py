@@ -95,6 +95,7 @@ class fhd_2d:
         self.ky = np.fft.fftfreq(self.Ny, d=self.dy)*2*np.pi
         self.kx, self.ky = np.meshgrid(self.kx, self.ky, indexing='ij')
         
+        self.projection_floor = 0
         self.phi_floor = 1e-14
         self.nspecies = 2
 
@@ -102,10 +103,14 @@ class fhd_2d:
         self.Dx = makeD(self.Nx, self.dx, self.bc)
         self.Dy = makeD(self.Ny, self.dy, self.bc)
         if not fft:
-            self.D2x = makeD2(self.Nx, self.dx, self.bc)
+            if bc == "Neumann" and schelling_flux=="finite_volume":
+                self.D2x = makeD2_fv_neumann(self.Nx, self.dx)
+                self.D2y = makeD2_fv_neumann(self.Ny, self.dy)
+            else:
+                self.D2x = makeD2(self.Nx, self.dx, bc=self.bc)
+                self.D2y = makeD2(self.Ny, self.dy, bc=self.bc)
+
             self.D3x = makeD3(self.Nx, self.dx, self.bc)
-            
-            self.D2y = makeD2(self.Ny, self.dy, self.bc)
             self.D3y = makeD3(self.Ny, self.dy, self.bc)
 
 
@@ -183,22 +188,22 @@ class fhd_2d:
         ''' Scales down phi[a] on sites where sum_a phi[a] > 1
         '''
         sumphi = np.sum(phi, axis=0)
-        divisor = np.maximum(sumphi+self.phi_floor,1)
+        divisor = np.maximum(sumphi+self.projection_floor,1)
         # scale down phi only at point where sum exceeds one
         phi = phi/divisor
         return phi
     
     def project_density(self, rho):
         # Always clip in-place; avoids separate np.any scans.
-        np.maximum(rho, self.phi_floor, out=rho)
-        np.minimum(rho, 1.0 - self.phi_floor, out=rho)
+        np.maximum(rho, self.projection_floor, out=rho)
+        np.minimum(rho, 1.0 - self.projection_floor, out=rho)
 
         sumrho = rho[0] + rho[1]
         mask = sumrho > 1.0
 
         if np.any(mask):
-            rho[0, mask] /= sumrho[mask] + self.phi_floor
-            rho[1, mask] /= sumrho[mask] + self.phi_floor
+            rho[0, mask] /= sumrho[mask] + self.projection_floor
+            rho[1, mask] /= sumrho[mask] + self.projection_floor
 
         return rho
 
@@ -759,18 +764,16 @@ class fhd_2d:
             demo_noise *= xi2
 
             # Apply your old clipping/capping logic, but in-place-ish.
-            noise_v = param.get("noise_v", 1.0)
 
             # Reuse rho_ab as temporary lower/upper clipped noise.
-            # rho_ab = max(-phi_A/dt, noise_v * demo_noise)
-            np.multiply(demo_noise, noise_v, out=rho_ab)
-            np.maximum(rho_ab, -phi[0] / dt, out=rho_ab)
+            # rho_ab = max(-phi_A/dt, demo_noise)
+            # np.maximum(demo_noise, -phi[0] / dt, out=demo_noise)
 
             # rho_ab = min(rho_ab, phi_B/dt)
-            np.minimum(rho_ab, phi[1] / dt, out=rho_ab)
+            # np.minimum(demo_noise, phi[1] / dt, out=demo_noise)
 
-            divJ[0] += rho_ab
-            divJ[1] -= rho_ab
+            divJ[0] += demo_noise
+            divJ[1] -= demo_noise
         
         return divJ
     
@@ -967,7 +970,6 @@ class fhd_2d:
                         'Gamma': numpy array of shape (nspecies, nspecies) for the lapl(phi) term in the utility \Gamma^{ab} \nabla^2 \phi_b
                         'nu':    Optional np.array of shape (nspecies, nspecies, nspecies) for the quadratic term in the utility: nu^{abc} \phi_b \phi_c
                         'D_v':   float: coefficient for voter model diffusion term
-                        'noise_v': float: strength of voter model noise (default is one)
             verbatum: If True print and plot stuff
 
         Returns:

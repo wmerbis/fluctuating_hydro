@@ -60,30 +60,6 @@ def entropy_index(phi):
     S_H = 1/H*np.sum(f_i*kl_divergence)
     return S_H
 
-import numpy as np
-import scipy as sp
-
-
-def makeD_second_order(Nx, dx, bc="periodic"):
-    Dx = np.zeros((Nx, Nx))
-
-    if bc == "periodic":
-        for i in range(Nx):
-            Dx[i, (i - 1) % Nx] = -0.5
-            Dx[i, (i + 1) % Nx] = 0.5
-
-    elif bc == "Neumann":
-        for i in range(Nx):
-            Dx[i, np.abs(i - 1)] += -0.5
-            Dx[i, Nx - 1 - np.abs(Nx - 1 - (i + 1))] += 0.5
-
-    else:
-        raise ValueError(
-            f"Boundary conditions {bc} not implemented, try 'periodic' or 'Neumann'"
-        )
-
-    return sp.sparse.csc_array(Dx / dx)
-
 def measure_mode_growth(sim, rho_bar, param, kx_index, ky_index):
     Nx, Ny = sim.N
     x = np.arange(Nx)[:, None]
@@ -116,6 +92,26 @@ def measure_mode_growth(sim, rho_bar, param, kx_index, ky_index):
 
     return growth_rate
 
+
+def makeD_second_order(Nx, dx, bc="periodic"):
+    Dx = np.zeros((Nx, Nx))
+
+    if bc == "periodic":
+        for i in range(Nx):
+            Dx[i, (i - 1) % Nx] = -0.5
+            Dx[i, (i + 1) % Nx] = 0.5
+
+    elif bc == "Neumann":
+        for i in range(Nx):
+            Dx[i, np.abs(i - 1)] += -0.5
+            Dx[i, Nx - 1 - np.abs(Nx - 1 - (i + 1))] += 0.5
+
+    else:
+        raise ValueError(
+            f"Boundary conditions {bc} not implemented, try 'periodic' or 'Neumann'"
+        )
+
+    return sp.sparse.csc_array(Dx / dx)
 
 def makeD2_second_order(Nx, dx, bc="periodic"):
     D2x = np.zeros((Nx, Nx))
@@ -221,6 +217,31 @@ def makeD2(Nx, dx, bc = 'periodic'):
     else:
         raise ValueError(f"Boundary conditions {bc} not implemented, try 'periodic' or 'Neumann' ")
     return sp.sparse.csc_array(D2x/dx**2)
+
+def makeD2_fv_neumann(N, dx):
+    rows = []
+    cols = []
+    data = []
+
+    inv_dx2 = 1.0 / dx**2
+
+    # left boundary cell
+    rows += [0, 0]
+    cols += [0, 1]
+    data += [-inv_dx2, inv_dx2]
+
+    # interior cells
+    for i in range(1, N - 1):
+        rows += [i, i, i]
+        cols += [i - 1, i, i + 1]
+        data += [inv_dx2, -2.0 * inv_dx2, inv_dx2]
+
+    # right boundary cell
+    rows += [N - 1, N - 1]
+    cols += [N - 2, N - 1]
+    data += [inv_dx2, -inv_dx2]
+
+    return sp.sparse.csc_matrix((data, (rows, cols)), shape=(N, N))
 
 def makeD3(Nx, dx, bc = 'periodic'):
     D3x = np.zeros((Nx,Nx))
