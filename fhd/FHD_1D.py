@@ -252,7 +252,7 @@ class fhd:
             #     xi2[:,0] = 0
             #     xi2[:,-1] = 0
             rho_face     = np.maximum(phi[0]*phi[1], self.phi_floor**2) # Changed to noise_floor^2 because phi*phi0 is also a square!
-            demographic_noise = np.einsum("i,i->i", np.sqrt(4*param['D_v']*rho_face/dt/h), xi2)
+            demographic_noise = np.einsum("i,i->i", np.sqrt(4*2*param['D_v']*rho_face/dt/h), xi2)
             
             noise_ceiling = np.maximum(-phi[0]/dt,param['noise_v']*demographic_noise)
             noise_floor = np.minimum(noise_ceiling, phi[1]/dt)

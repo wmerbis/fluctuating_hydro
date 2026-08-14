@@ -48,7 +48,14 @@ class fhd_2d:
     '''Defines the 2-D fluctuating hydrodynamics class for simulating the sociohydrodynamic equations including noise and reactions:
 
     '''
-    def __init__(self, L, N, bc = "periodic", fft = False, schelling_flux="collocated"):
+    def __init__(self, L, N, 
+                 bc = "periodic", 
+                 fft = False, 
+                 schelling_flux="collocated",
+                 projection_floor=0.0,
+                 projection_mode="clip",
+                 redistribute_radius=1,
+                 redistribute_fallback="global",):
         '''
         Initializes instance of the fhd class object
 
@@ -57,6 +64,20 @@ class fhd_2d:
             N:   tuple (Nx, Ny): number of discretization steps per coordinate
             bc:  boundary conditions, choose "periodic" or "Neumann"
             fft: Bool: when True derivatives are computed using FFT (only compatible with periodic bc's)
+            schelling_flux: string: "collocated" for using 8-th order derivative stencils 
+                            or "finite_volume" for using finite-volume implementation of the utility term
+            projection_floor: float: densities below the projection_floor or above 1-projection_floor will be 
+                            handled according to projection_mode
+            projection_mode: string: select methodology for handling unphysical densities (simplex violations)
+                "clip":              clips densities below projection_floor or above 1-projection_floor. Does not conserve species mass
+                "transfer_to_other": transfers lower density violations to the other species type. 
+                                     Upper bound violations are tranferred to vacant sites, so this method does not conserve species mass
+                "redistribute":      Redistribute local simplex violations by pushing or pulling density to neighboring cells of the same type
+                                     This method conserves mass density
+            redistribute_radius: int: radius for neighboring cells used in "redistribute" projection mode
+            redistribute_fallback: string: if no vacancy is available locally, redistribute projection_mode may fallback to
+                "global":            redistribute globally across the entire lattice.
+                "transfer_to_other": transfer species mass to other species.
         '''
         self.N = N
         self.L = L
@@ -90,12 +111,40 @@ class fhd_2d:
             raise ValueError(
                 "schelling_flux should be 'collocated' or 'finite_volume'"
             )
+        
+        self.projection_floor = projection_floor
+        self.projection_mode = projection_mode
+        self.redistribute_radius = redistribute_radius
+        self.redistribute_fallback = redistribute_fallback
+
+        allowed_projection_modes = (
+            "clip",
+            "transfer_to_other",
+            "redistribute",
+        )
+
+        if self.projection_mode not in allowed_projection_modes:
+            raise ValueError(
+                f"projection_mode must be one of {allowed_projection_modes}, "
+                f"got {self.projection_mode}"
+            )
+
+        allowed_fallbacks = (
+            "clip",
+            "global",
+            "transfer_to_other",
+        )
+
+        if self.redistribute_fallback not in allowed_fallbacks:
+            raise ValueError(
+                f"redistribute_fallback must be one of {allowed_fallbacks}, "
+                f"got {self.redistribute_fallback}"
+            )
 
         self.kx = np.fft.fftfreq(self.Nx, d=self.dx)*2*np.pi
         self.ky = np.fft.fftfreq(self.Ny, d=self.dy)*2*np.pi
         self.kx, self.ky = np.meshgrid(self.kx, self.ky, indexing='ij')
         
-        self.projection_floor = 0
         self.phi_floor = 1e-14
         self.nspecies = 2
 
@@ -113,6 +162,61 @@ class fhd_2d:
             self.D3x = makeD3(self.Nx, self.dx, self.bc)
             self.D3y = makeD3(self.Ny, self.dy, self.bc)
 
+    def _init_projection_diagnostics(self):
+        return {
+            "n_calls": 0,
+
+            # Lower clipping / repair
+            "n_low_entries": 0,
+            "mass_added_low": 0.0,
+            "max_low_violation": 0.0,
+
+            # Upper clipping / repair
+            "n_high_entries": 0,
+            "mass_removed_high": 0.0,
+            "max_high_violation": 0.0,
+
+            # Simplex projection / repair
+            "n_simplex_cells": 0,
+            "mass_removed_simplex": 0.0,
+            "max_simplex_violation": 0.0,
+
+            # Transfer-to-other diagnostics
+            "mass_transferred_low": 0.0,
+            "mass_transferred_AtoB": 0.0,
+            "mass_transferred_BtoA": 0.0,
+            "n_transfer_fallback_entries": 0,
+            "mass_added_transfer_fallback": 0.0,
+            "mass_transferred_to_vacancy": 0.0,
+            "mass_transferred_A_to_vacancy": 0.0,
+            "mass_transferred_B_to_vacancy": 0.0,
+
+            "mass_transferred_high_to_vacancy": 0.0,
+            "mass_transferred_simplex_to_vacancy": 0.0,
+
+            # Local redistribution diagnostics
+            "mass_redistributed_low_local": 0.0,
+            "mass_redistributed_low_global": 0.0,
+            "mass_redistributed_high_local": 0.0,
+            "mass_redistributed_high_global": 0.0,
+            "mass_redistributed_simplex_local": 0.0,
+            "mass_redistributed_simplex_global": 0.0,
+
+            "redistribute_low_leftover": 0.0,
+            "redistribute_high_leftover": 0.0,
+            "redistribute_simplex_leftover": 0.0,
+
+            "n_redistribute_low_failures": 0,
+            "n_redistribute_high_failures": 0,
+            "n_redistribute_simplex_failures": 0,
+
+            # Total bookkeeping
+            "mass_before_projection": 0.0,
+            "mass_after_projection": 0.0,
+            "net_mass_change_projection": 0.0,
+
+            "history": [],
+        }
 
     def _ensure_work(self, dtype=np.float64):
         shape2 = (self.nspecies,) + self.N
@@ -179,21 +283,535 @@ class fhd_2d:
                 "det_flux_y": np.empty(det_face_y_shape, dtype=dtype),
             })
 
+            if "projection_diag" not in self._work:
+                self._work["projection_diag"] = self._init_projection_diagnostics()
+
         return self._work
         
     def set_seed(self, seed):
         self.rng = np.random.default_rng(seed)
 
-    def scale_down_pointwise(self, phi):
-        ''' Scales down phi[a] on sites where sum_a phi[a] > 1
-        '''
-        sumphi = np.sum(phi, axis=0)
-        divisor = np.maximum(sumphi+self.projection_floor,1)
-        # scale down phi only at point where sum exceeds one
-        phi = phi/divisor
-        return phi
+    def _shift2d(self, arr, di, dj, fill_value=0.0):
+        """
+        Shift a 2D array by (di, dj).
+
+        For periodic boundaries, wrap.
+        For Neumann/nonperiodic redistribution diagnostics, values shifted
+        from outside are filled with fill_value.
+        """
+        if self.bc == "periodic":
+            return np.roll(np.roll(arr, di, axis=0), dj, axis=1)
+
+        out = np.full_like(arr, fill_value)
+
+        Nx, Ny = arr.shape
+
+        src_i0 = max(0, -di)
+        src_i1 = min(Nx, Nx - di)
+        dst_i0 = max(0, di)
+        dst_i1 = min(Nx, Nx + di)
+
+        src_j0 = max(0, -dj)
+        src_j1 = min(Ny, Ny - dj)
+        dst_j0 = max(0, dj)
+        dst_j1 = min(Ny, Ny + dj)
+
+        if src_i1 > src_i0 and src_j1 > src_j0:
+            out[dst_i0:dst_i1, dst_j0:dst_j1] = arr[src_i0:src_i1, src_j0:src_j1]
+
+        return out
     
-    def project_density(self, rho):
+    def _redistribution_offsets(self, radius=1, include_center=False):
+        offsets = []
+        for di in range(-radius, radius + 1):
+            for dj in range(-radius, radius + 1):
+                if not include_center and di == 0 and dj == 0:
+                    continue
+                offsets.append((di, dj))
+        return offsets
+
+    def _neighbor_indices(self, i, j, radius=1, include_center=False):
+        """
+        Return local neighbor indices around (i, j).
+
+        For periodic boundaries, neighbors wrap.
+        For Neumann boundaries, out-of-domain neighbors are skipped.
+        """
+        Nx, Ny = self.N
+        inds = []
+
+        for di in range(-radius, radius + 1):
+            for dj in range(-radius, radius + 1):
+                if not include_center and di == 0 and dj == 0:
+                    continue
+
+                ii = i + di
+                jj = j + dj
+
+                if self.bc == "periodic":
+                    ii %= Nx
+                    jj %= Ny
+                else:
+                    if ii < 0 or ii >= Nx or jj < 0 or jj >= Ny:
+                        continue
+
+                inds.append((ii, jj))
+
+        return inds
+    
+    def _pull_species_mass_from_neighbors(self, rho, a, i, j, amount, 
+                                          projection_floor=0.0, 
+                                          radius=1,):
+        """
+        Increase rho[a, i, j] by taking the same species from nearby cells.
+
+        This preserves species mass if enough local same-species mass is available.
+
+        Returns
+        -------
+        moved : float
+            Amount successfully moved locally.
+        leftover : float
+            Amount not moved.
+        """
+        if amount <= 0.0:
+            return 0.0, 0.0
+
+        neigh = self._neighbor_indices(i, j, radius=radius, include_center=False)
+
+        if len(neigh) == 0:
+            return 0.0, amount
+
+        available = np.array(
+            [
+                max(rho[a, ii, jj] - projection_floor, 0.0)
+                for ii, jj in neigh
+            ],
+            dtype=float,
+        )
+
+        total_available = float(available.sum())
+
+        if total_available <= 0.0:
+            return 0.0, amount
+
+        moved = min(amount, total_available)
+        weights = available / total_available
+
+        for w, (ii, jj) in zip(weights, neigh):
+            rho[a, ii, jj] -= moved * w
+
+        rho[a, i, j] += moved
+
+        return moved, amount - moved
+    
+    def _redistribute_low_species_vectorized(
+        self,
+        rho,
+        a,
+        projection_floor=0.0,
+        radius=1,
+        n_iter=2,
+        eps=1e-300,
+    ):
+        """
+        Vectorized local same-species redistribution for rho[a] < projection_floor.
+
+        Positive cells donate same-species mass to nearby deficient cells.
+
+        Returns
+        -------
+        moved_total : float
+        leftover_total : float
+        """
+        u = rho[a]
+        offsets = self._redistribution_offsets(radius=radius, include_center=False)
+
+        moved_total_all = 0.0
+
+        for _ in range(n_iter):
+            deficit = np.maximum(projection_floor - u, 0.0)
+            total_deficit = float(deficit.sum())
+
+            if total_deficit <= 0.0:
+                return moved_total_all, 0.0
+
+            available = np.maximum(u - projection_floor, 0.0)
+
+            # For each donor cell, compute total deficit in its neighborhood.
+            local_deficit_seen = np.zeros_like(u)
+            for di, dj in offsets:
+                # donor at (i,j) sees deficit at neighbor (i+di,j+dj)
+                local_deficit_seen += self._shift2d(deficit, -di, -dj, fill_value=0.0)
+
+            donor_mass = np.minimum(available, local_deficit_seen)
+            donor_mass[local_deficit_seen <= 0.0] = 0.0
+
+            moved_total = float(donor_mass.sum())
+
+            if moved_total <= 0.0:
+                break
+
+            # Subtract donor mass.
+            u -= donor_mass
+
+            # Add donor mass to neighboring deficit cells, proportionally.
+            received = np.zeros_like(u)
+
+            for di, dj in offsets:
+                neighbor_deficit = self._shift2d(deficit, -di, -dj, fill_value=0.0)
+
+                # Fraction of donor mass sent in direction (di,dj).
+                frac = np.zeros_like(u)
+                mask = local_deficit_seen > eps
+                frac[mask] = neighbor_deficit[mask] / local_deficit_seen[mask]
+
+                sent_from_donor = donor_mass * frac
+
+                # Shift donor contribution to receiver cells.
+                received += self._shift2d(sent_from_donor, di, dj, fill_value=0.0)
+
+            u += received
+
+            moved_total_all += moved_total
+
+        leftover = float(np.maximum(projection_floor - u, 0.0).sum())
+        return moved_total_all, leftover
+
+    def _pull_species_mass_global(self, rho, a, i, j, amount, projection_floor=0.0):
+        """
+        Increase rho[a, i, j] by taking same-species mass globally.
+
+        Nonlocal fallback, but species-mass conserving.
+        """
+        if amount <= 0.0:
+            return 0.0, 0.0
+
+        available = rho[a] - projection_floor
+        available = np.maximum(available, 0.0)
+
+        # Do not take from the target cell.
+        available[i, j] = 0.0
+
+        total_available = float(available.sum())
+
+        if total_available <= 0.0:
+            return 0.0, amount
+
+        moved = min(amount, total_available)
+        weights = available / total_available
+
+        rho[a] -= moved * weights
+        rho[a, i, j] += moved
+
+        return moved, amount - moved
+
+    def _push_species_to_vacancy_neighbors(self, rho, species_amounts, i, j, radius=1,):
+        """
+        Move species masses from cell (i, j) to nearby cells with vacancy capacity.
+
+        Parameters
+        ----------
+        rho : array, shape (nspecies, Nx, Ny)
+
+        species_amounts : array, shape (nspecies,)
+            Amount of each species to move out of cell (i, j).
+
+        Returns
+        -------
+        moved_total : float
+        leftover_total : float
+        """
+        species_amounts = np.asarray(species_amounts, dtype=float)
+        total_amount = float(species_amounts.sum())
+
+        if total_amount <= 0.0:
+            return 0.0, 0.0
+
+        neigh = self._neighbor_indices(i, j, radius=radius, include_center=False)
+
+        if len(neigh) == 0:
+            return 0.0, total_amount
+
+        capacities = np.array(
+            [
+                max(1.0 - float(rho[:, ii, jj].sum()), 0.0)
+                for ii, jj in neigh
+            ],
+            dtype=float,
+        )
+
+        total_capacity = float(capacities.sum())
+
+        if total_capacity <= 0.0:
+            return 0.0, total_amount
+
+        moved_total = min(total_amount, total_capacity)
+        leftover_total = total_amount - moved_total
+
+        neighbor_weights = capacities / total_capacity
+
+        species_weights = species_amounts / total_amount
+        moved_species = moved_total * species_weights
+
+        # Remove from source cell.
+        for a in range(rho.shape[0]):
+            rho[a, i, j] -= moved_species[a]
+
+        # Add to neighboring cells according to vacancy capacity.
+        for w, (ii, jj) in zip(neighbor_weights, neigh):
+            for a in range(rho.shape[0]):
+                rho[a, ii, jj] += moved_species[a] * w
+
+        return moved_total, leftover_total
+
+    def _push_species_to_vacancy_global(self, rho, species_amounts, source_i=None, source_j=None,):
+        """
+        Move species masses to cells with vacancy capacity globally.
+
+        Nonlocal fallback, but conserves species masses if enough capacity exists.
+        """
+        species_amounts = np.asarray(species_amounts, dtype=float)
+        total_amount = float(species_amounts.sum())
+
+        if total_amount <= 0.0:
+            return 0.0, 0.0
+
+        capacity = 1.0 - rho.sum(axis=0)
+        capacity = np.maximum(capacity, 0.0)
+
+        if source_i is not None and source_j is not None:
+            capacity[source_i, source_j] = 0.0
+
+        total_capacity = float(capacity.sum())
+
+        if total_capacity <= 0.0:
+            return 0.0, total_amount
+
+        moved_total = min(total_amount, total_capacity)
+        leftover_total = total_amount - moved_total
+
+        weights = capacity / total_capacity
+        species_weights = species_amounts / total_amount
+        moved_species = moved_total * species_weights
+
+        for a in range(rho.shape[0]):
+            rho[a] += moved_species[a] * weights
+
+        return moved_total, leftover_total
+
+    def _project_density_redistribute(self, rho, diag, projection_floor=0.0):
+        """
+        Conservative local redistribution projection.
+
+        Attempts to preserve species masses and total occupied mass by moving
+        offending density to/from nearby cells.
+
+        Any remaining unrepairable amount falls back according to
+        self.redistribute_fallback.
+        """
+        nspecies, Nx, Ny = rho.shape
+        radius = self.redistribute_radius
+        upper_bound = 1.0 - projection_floor
+
+        # ------------------------------------------------------------
+        # 1. Repair negative densities by pulling same-species mass
+        #    from neighbors.
+        # ------------------------------------------------------------
+        low_positions = np.argwhere(rho < projection_floor)
+
+        for a, i, j in low_positions:
+            current = rho[a, i, j]
+
+            if current >= projection_floor:
+                continue
+
+            deficit = float(projection_floor - current)
+
+            # First set to current value and add by pulling mass.
+            moved_local, leftover = self._pull_species_mass_from_neighbors(
+                rho,
+                a,
+                i,
+                j,
+                deficit,
+                projection_floor=projection_floor,
+                radius=radius,
+            )
+
+            diag["mass_redistributed_low_local"] += moved_local
+
+            if leftover > 0.0 and self.redistribute_fallback == "global":
+                moved_global, leftover = self._pull_species_mass_global(
+                    rho,
+                    a,
+                    i,
+                    j,
+                    leftover,
+                    projection_floor=projection_floor,
+                )
+                diag["mass_redistributed_low_global"] += moved_global
+
+            if leftover > 0.0 and self.redistribute_fallback == "transfer_to_other":
+                if nspecies != 2:
+                    raise NotImplementedError(
+                        "transfer_to_other fallback is implemented only "
+                        "for two species."
+                    )
+
+                other = 1 - a
+                available_other = rho[other, i, j] - projection_floor
+                take = min(leftover, max(float(available_other), 0.0))
+
+                if take > 0.0:
+                    rho[other, i, j] -= take
+                    rho[a, i, j] += take
+                    leftover -= take
+
+                    diag["mass_transferred_low"] += take
+                    if a == 0:
+                        diag["mass_transferred_BtoA"] += take
+                    else:
+                        diag["mass_transferred_AtoB"] += take
+
+            if leftover > 0.0:
+                # Final fallback: nonconservative clipping.
+                # This should be rare. Track it explicitly.
+                rho[a, i, j] += leftover
+                diag["mass_added_low"] += leftover
+                diag["redistribute_low_leftover"] += leftover
+                diag["n_redistribute_low_failures"] += 1
+
+        # ------------------------------------------------------------
+        # 2. Repair individual species above upper_bound by pushing that
+        #    species into neighboring vacancy capacity.
+        # ------------------------------------------------------------
+        high_positions = np.argwhere(rho > upper_bound)
+
+        for a, i, j in high_positions:
+            current = rho[a, i, j]
+
+            if current <= upper_bound:
+                continue
+
+            excess = float(current - upper_bound)
+
+            species_amounts = np.zeros(nspecies)
+            species_amounts[a] = excess
+
+            moved_local, leftover = self._push_species_to_vacancy_neighbors(
+                rho,
+                species_amounts,
+                i,
+                j,
+                radius=radius,
+            )
+
+            diag["mass_redistributed_high_local"] += moved_local
+
+            if leftover > 0.0 and self.redistribute_fallback == "global":
+                # Remove any remaining excess from the source cell before
+                # pushing it globally.
+                take = min(leftover, max(float(rho[a, i, j] - upper_bound), 0.0))
+                if take > 0.0:
+                    rho[a, i, j] -= take
+                    species_amounts2 = np.zeros(nspecies)
+                    species_amounts2[a] = take
+
+                    moved_global, global_leftover = self._push_species_to_vacancy_global(
+                        rho,
+                        species_amounts2,
+                        source_i=i,
+                        source_j=j,
+                    )
+
+                    diag["mass_redistributed_high_global"] += moved_global
+                    leftover = global_leftover
+
+            if leftover > 0.0:
+                # Final fallback: remove excess mass.
+                removable = max(float(rho[a, i, j] - upper_bound), 0.0)
+                removed = min(leftover, removable)
+                rho[a, i, j] -= removed
+
+                diag["mass_removed_high"] += removed
+                diag["redistribute_high_leftover"] += removed
+                diag["n_redistribute_high_failures"] += 1
+
+        # ------------------------------------------------------------
+        # 3. Repair simplex violations: sum_a rho_a > 1.
+        #    Move excess occupied density to nearby vacancy capacity,
+        #    preserving the source-cell composition of the excess.
+        # ------------------------------------------------------------
+        sumrho = rho.sum(axis=0)
+        simplex_positions = np.argwhere(sumrho > 1.0)
+
+        for i, j in simplex_positions:
+            local_sum = float(rho[:, i, j].sum())
+
+            if local_sum <= 1.0:
+                continue
+
+            excess = local_sum - 1.0
+
+            # Remove excess proportionally to local composition.
+            # Guard against tiny numerical issues.
+            if local_sum <= 0.0:
+                continue
+
+            species_amounts = excess * rho[:, i, j] / local_sum
+
+            moved_local, leftover = self._push_species_to_vacancy_neighbors(
+                rho,
+                species_amounts,
+                i,
+                j,
+                radius=radius,
+            )
+
+            diag["mass_redistributed_simplex_local"] += moved_local
+
+            if leftover > 0.0 and self.redistribute_fallback == "global":
+                # Remove remaining excess from source cell proportionally to
+                # current local composition, then push globally.
+                local_sum = float(rho[:, i, j].sum())
+
+                if local_sum > 1.0:
+                    remaining_excess = local_sum - 1.0
+                    take_total = min(leftover, remaining_excess)
+
+                    species_amounts2 = take_total * rho[:, i, j] / local_sum
+                    rho[:, i, j] -= species_amounts2
+
+                    moved_global, global_leftover = self._push_species_to_vacancy_global(
+                        rho,
+                        species_amounts2,
+                        source_i=i,
+                        source_j=j,
+                    )
+
+                    diag["mass_redistributed_simplex_global"] += moved_global
+                    leftover = global_leftover
+
+            if leftover > 0.0:
+                # Final fallback: local simplex rescaling, which removes mass.
+                local_sum = float(rho[:, i, j].sum())
+
+                if local_sum > 1.0:
+                    old_mass = local_sum
+                    rho[:, i, j] /= local_sum
+                    removed = old_mass - float(rho[:, i, j].sum())
+
+                    diag["mass_removed_simplex"] += removed
+                    diag["redistribute_simplex_leftover"] += removed
+                    diag["n_redistribute_simplex_failures"] += 1
+
+    def project_density_fast(self, rho):
+        '''
+        Projects rho to physical simplex 0 <= rho_a  <= 1 and rho_A + rho_B < 1. 
+        Does not conserve probability mass, but clips invalid values.
+        
+        '''
         # Always clip in-place; avoids separate np.any scans.
         np.maximum(rho, self.projection_floor, out=rho)
         np.minimum(rho, 1.0 - self.projection_floor, out=rho)
@@ -204,6 +822,473 @@ class fhd_2d:
         if np.any(mask):
             rho[0, mask] /= sumrho[mask] + self.projection_floor
             rho[1, mask] /= sumrho[mask] + self.projection_floor
+
+        return rho
+    
+    def _project_lower_transfer_to_other_2species(
+        self,
+        rho,
+        projection_floor=0.0,
+    ):
+        """
+        Returns
+        -------
+        transferred_mass : float
+            Amount of negative deficit compensated by the other species.
+
+        fallback_added_mass : float
+            Mass that still had to be added because local compensation failed.
+
+        n_fallback_entries : int
+            Number of entries still below projection_floor after local transfer.
+        """
+        A = rho[0]
+        B = rho[1]
+
+        transferred_mass = 0.0
+        transferred_A_to_B = 0.0
+        transferred_B_to_A = 0.0
+
+        # Repair A by taking from B: B -> A
+        mask_A = A < projection_floor
+        if np.any(mask_A):
+            deficit_A = projection_floor - A[mask_A]
+            transferred_B_to_A = float(deficit_A.sum())
+            A[mask_A] = projection_floor
+            B[mask_A] -= deficit_A
+            transferred_mass += transferred_B_to_A
+
+        # Repair B by taking from A: A -> B
+        mask_B = B < projection_floor
+        if np.any(mask_B):
+            deficit_B = projection_floor - B[mask_B]
+            transferred_A_to_B = float(deficit_B.sum())
+            B[mask_B] = projection_floor
+            A[mask_B] -= deficit_B
+            transferred_mass += transferred_A_to_B
+
+        # Fallback if compensation made the other species negative.
+        fallback_added_mass = 0.0
+        n_fallback_entries = 0
+
+        mask_A_again = A < projection_floor
+        if np.any(mask_A_again):
+            old = float(A[mask_A_again].sum())
+            n = int(np.count_nonzero(mask_A_again))
+            added = n * projection_floor - old
+            fallback_added_mass += float(added)
+            n_fallback_entries += n
+            A[mask_A_again] = projection_floor
+
+        mask_B_again = B < projection_floor
+        if np.any(mask_B_again):
+            old = float(B[mask_B_again].sum())
+            n = int(np.count_nonzero(mask_B_again))
+            added = n * projection_floor - old
+            fallback_added_mass += float(added)
+            n_fallback_entries += n
+            B[mask_B_again] = projection_floor
+
+        return transferred_mass, fallback_added_mass, n_fallback_entries, transferred_B_to_A, transferred_A_to_B
+    
+    def _project_high_transfer_to_vacancy(
+        self,
+        rho,
+        projection_floor=0.0,
+    ):
+        """
+        Repair rho_a > 1 - projection_floor by transferring excess occupied
+        density to vacancy.
+
+        This is local and simplex-compatible, but it removes occupied mass.
+        """
+        upper_bound = 1.0 - projection_floor
+        nspecies = rho.shape[0]
+
+        high_mask = rho > upper_bound
+
+        removed_total = 0.0
+        removed_species = np.zeros(nspecies, dtype=float)
+        n_high = 0
+        max_violation = 0.0
+
+        if not np.any(high_mask):
+            return removed_total, removed_species, n_high, max_violation
+
+        n_high = int(np.count_nonzero(high_mask))
+        max_violation = float(np.max(rho[high_mask] - upper_bound))
+
+        for a in range(nspecies):
+            mask_a = rho[a] > upper_bound
+
+            if not np.any(mask_a):
+                continue
+
+            excess_a = rho[a, mask_a] - upper_bound
+            removed_a = float(excess_a.sum())
+
+            rho[a, mask_a] = upper_bound
+
+            removed_species[a] += removed_a
+            removed_total += removed_a
+
+        return removed_total, removed_species, n_high, max_violation
+
+    def _project_simplex_transfer_to_vacancy(
+        self,
+        rho,
+        ):
+        """
+        Repair sum_a rho_a > 1 by transferring excess occupied density
+        to vacancy, preserving local species composition.
+
+        This is exactly local simplex rescaling:
+            rho_a <- rho_a / sumrho
+
+        but returns species-resolved removed masses.
+        """
+        nspecies = rho.shape[0]
+
+        sumrho = rho.sum(axis=0)
+        simplex_mask = sumrho > 1.0
+
+        removed_total = 0.0
+        removed_species = np.zeros(nspecies, dtype=float)
+        n_simplex = 0
+        max_violation = 0.0
+
+        if not np.any(simplex_mask):
+            return removed_total, removed_species, n_simplex, max_violation
+
+        n_simplex = int(np.count_nonzero(simplex_mask))
+        excess = sumrho[simplex_mask] - 1.0
+
+        removed_total = float(excess.sum())
+        max_violation = float(excess.max())
+
+        old_species_mass = rho[:, simplex_mask].sum(axis=1).copy()
+
+        rho[:, simplex_mask] /= sumrho[simplex_mask][np.newaxis, :]
+
+        new_species_mass = rho[:, simplex_mask].sum(axis=1).copy()
+        removed_species[:] = old_species_mass - new_species_mass
+
+        return removed_total, removed_species, n_simplex, max_violation
+
+    def _project_density_transfer_to_other(
+        self,
+        rho,
+        diag,
+        projection_floor=0.0,
+    ):
+        """
+        Project densities back to the local physical simplex for two species.
+
+            rho_a >= projection_floor
+            rho_a <= 1 - projection_floor
+            sum_a rho_a <= 1
+
+        Interpretation
+        --------------
+        Lower violations:
+            transfer density between A and B.
+
+        Upper and simplex violations:
+            transfer occupied density to vacancy.
+
+        This preserves local occupied density for lower violations, but removes
+        occupied density for upper/simplex violations because vacancy is not an
+        explicitly stored conserved field.
+        """
+        if rho.shape[0] != 2:
+            raise NotImplementedError(
+                "projection_mode='transfer_to_other' is currently implemented "
+                "only for two species."
+            )
+
+        upper_bound = 1.0 - projection_floor
+
+        # ------------------------------------------------------------
+        # 1. Lower repair: A < floor or B < floor.
+        #    Transfer between A and B.
+        # ------------------------------------------------------------
+        low_mask = rho < projection_floor
+
+        if np.any(low_mask):
+            n_low_this = int(np.count_nonzero(low_mask))
+            max_low_violation_this = float(
+                np.max(projection_floor - rho[low_mask])
+            )
+
+            transferred, fallback_added, n_fallback, transferred_B_to_A, transferred_A_to_B = (
+                self._project_lower_transfer_to_other_2species(
+                    rho,
+                    projection_floor=projection_floor,
+                )
+            )
+
+            diag["n_low_entries"] += n_low_this
+            diag["max_low_violation"] = max(
+                diag["max_low_violation"],
+                max_low_violation_this,
+            )
+
+            diag["mass_transferred_low"] += transferred
+            diag["mass_transferred_B_to_A"] += transferred_B_to_A
+            diag["mass_transferred_A_to_B"] += transferred_A_to_B
+
+            diag["n_transfer_fallback_entries"] += n_fallback
+            diag["mass_added_transfer_fallback"] += fallback_added
+
+            # Only fallback clipping actually adds occupied mass.
+            diag["mass_added_low"] += fallback_added
+
+        # ------------------------------------------------------------
+        # 2. Upper repair: rho_a > 1 - floor.
+        #    Transfer excess occupied species density to vacancy.
+        # ------------------------------------------------------------
+        high_mask = rho > upper_bound
+
+        if np.any(high_mask):
+            removed_high, removed_high_species, n_high_this, max_high_violation_this = (
+                self._project_high_transfer_to_vacancy(
+                    rho,
+                    projection_floor=projection_floor,
+                )
+            )
+
+            diag["n_high_entries"] += n_high_this
+            diag["mass_removed_high"] += removed_high
+            diag["max_high_violation"] = max(
+                diag["max_high_violation"],
+                max_high_violation_this,
+            )
+
+            diag["mass_transferred_to_vacancy"] += removed_high
+            diag["mass_transferred_high_to_vacancy"] += removed_high
+            diag["mass_transferred_A_to_vacancy"] += removed_high_species[0]
+            diag["mass_transferred_B_to_vacancy"] += removed_high_species[1]
+
+        # ------------------------------------------------------------
+        # 3. Simplex repair: rho_A + rho_B > 1.
+        #    Transfer occupied excess to vacancy, preserving composition.
+        # ------------------------------------------------------------
+        sumrho = rho.sum(axis=0)
+        simplex_mask = sumrho > 1.0
+
+        if np.any(simplex_mask):
+            removed_simplex, removed_simplex_species, n_simplex_this, max_simplex_violation_this = (
+                self._project_simplex_transfer_to_vacancy(rho)
+            )
+
+            diag["n_simplex_cells"] += n_simplex_this
+            diag["mass_removed_simplex"] += removed_simplex
+            diag["max_simplex_violation"] = max(
+                diag["max_simplex_violation"],
+                max_simplex_violation_this,
+            )
+
+            diag["mass_transferred_to_vacancy"] += removed_simplex
+            diag["mass_transferred_simplex_to_vacancy"] += removed_simplex
+            diag["mass_transferred_A_to_vacancy"] += removed_simplex_species[0]
+            diag["mass_transferred_B_to_vacancy"] += removed_simplex_species[1]
+
+    def project_density(self, rho, work=None, step=None, record_history=False,):
+        """
+        Project densities back to the physical simplex.
+
+        Modes
+        -----
+        clip:
+            Ordinary nonconservative clipping.
+
+        transfer_to_other:
+            Two-species local repair for negative densities by transferring
+            mass between A and B.
+
+        redistribute:
+            Local species-conserving redistribution of negative, high, and
+            simplex-violating densities.
+        """
+        if work is None:
+            work = self._work
+
+        diag = work.get("projection_diag", None)
+        if diag is None:
+            work["projection_diag"] = self._init_projection_diagnostics()
+            diag = work["projection_diag"]
+
+        projection_floor = getattr(self, "projection_floor", 0.0)
+        upper_bound = 1.0 - projection_floor
+
+        mass_before_all = float(rho.sum())
+
+        diag["n_calls"] += 1
+        diag["mass_before_projection"] += mass_before_all
+
+        min_pre_projection = float(rho.min())
+        max_pre_projection = float(rho.max())
+        max_sum_pre_projection = float(rho.sum(axis=0).max())
+
+        # Count violations before repair.
+        low_mask_pre = rho < projection_floor
+        high_mask_pre = rho > upper_bound
+        sumrho_pre = rho.sum(axis=0)
+        simplex_mask_pre = sumrho_pre > 1.0
+
+        n_low_this = int(np.count_nonzero(low_mask_pre))
+        n_high_this = int(np.count_nonzero(high_mask_pre))
+        n_simplex_this = int(np.count_nonzero(simplex_mask_pre))
+
+        max_low_violation_this = 0.0
+        max_high_violation_this = 0.0
+        max_simplex_violation_this = 0.0
+
+        if n_low_this > 0:
+            max_low_violation_this = float(
+                np.max(projection_floor - rho[low_mask_pre])
+            )
+
+        if n_high_this > 0:
+            max_high_violation_this = float(
+                np.max(rho[high_mask_pre] - upper_bound)
+            )
+
+        if n_simplex_this > 0:
+            max_simplex_violation_this = float(
+                np.max(sumrho_pre[simplex_mask_pre] - 1.0)
+            )
+
+        diag["n_low_entries"] += n_low_this
+        diag["n_high_entries"] += n_high_this
+        diag["n_simplex_cells"] += n_simplex_this
+
+        diag["max_low_violation"] = max(
+            diag["max_low_violation"],
+            max_low_violation_this,
+        )
+        diag["max_high_violation"] = max(
+            diag["max_high_violation"],
+            max_high_violation_this,
+        )
+        diag["max_simplex_violation"] = max(
+            diag["max_simplex_violation"],
+            max_simplex_violation_this,
+        )
+
+        # Per-call mass changes for history.
+        mass_added_low_before = diag["mass_added_low"]
+        mass_removed_high_before = diag["mass_removed_high"]
+        mass_removed_simplex_before = diag["mass_removed_simplex"]
+
+        # ------------------------------------------------------------
+        # Projection mode dispatch
+        # ------------------------------------------------------------
+        if self.projection_mode == "redistribute":
+            self._project_density_redistribute(
+                rho,
+                diag,
+                projection_floor=projection_floor,
+            )
+
+        elif self.projection_mode == "transfer_to_other":
+            self._project_density_transfer_to_other(
+                rho,
+                diag,
+                projection_floor=projection_floor,
+            )
+
+        elif self.projection_mode == "clip":
+            # -------------------------
+            # Lower clipping
+            # -------------------------
+            low_mask = rho < projection_floor
+            if np.any(low_mask):
+                old_low_mass = float(rho[low_mask].sum())
+                n_low = int(np.count_nonzero(low_mask))
+                added = float(n_low * projection_floor - old_low_mass)
+
+                rho[low_mask] = projection_floor
+                diag["mass_added_low"] += added
+
+            # -------------------------
+            # Upper clipping
+            # -------------------------
+            high_mask = rho > upper_bound
+            if np.any(high_mask):
+                old_high_mass = float(rho[high_mask].sum())
+                n_high = int(np.count_nonzero(high_mask))
+                removed = float(old_high_mass - n_high * upper_bound)
+
+                rho[high_mask] = upper_bound
+                diag["mass_removed_high"] += removed
+
+            # -------------------------
+            # Simplex projection
+            # -------------------------
+            sumrho = rho.sum(axis=0)
+            simplex_mask = sumrho > 1.0
+
+            if np.any(simplex_mask):
+                excess = sumrho[simplex_mask] - 1.0
+                removed = float(excess.sum())
+
+                rho[:, simplex_mask] /= sumrho[simplex_mask][np.newaxis, :]
+                diag["mass_removed_simplex"] += removed
+
+        else:
+            raise ValueError(f"Unknown projection_mode: {self.projection_mode}")
+
+        # ------------------------------------------------------------
+        # Final bookkeeping
+        # ------------------------------------------------------------
+        mass_after_all = float(rho.sum())
+        net_change = mass_after_all - mass_before_all
+
+        diag["mass_after_projection"] += mass_after_all
+        diag["net_mass_change_projection"] += net_change
+
+        mass_added_low_this = (
+            diag["mass_added_low"] - mass_added_low_before
+        )
+        mass_removed_high_this = (
+            diag["mass_removed_high"] - mass_removed_high_before
+        )
+        mass_removed_simplex_this = (
+            diag["mass_removed_simplex"] - mass_removed_simplex_before
+        )
+
+        if record_history:
+            diag["history"].append({
+                "step": step,
+
+                "mass_before": mass_before_all,
+                "mass_after": mass_after_all,
+                "net_change": net_change,
+
+                "n_low_entries": n_low_this,
+                "n_high_entries": n_high_this,
+                "n_simplex_cells": n_simplex_this,
+
+                "mass_added_low": mass_added_low_this,
+                "mass_removed_high": mass_removed_high_this,
+                "mass_removed_simplex": mass_removed_simplex_this,
+
+                "max_low_violation": max_low_violation_this,
+                "max_high_violation": max_high_violation_this,
+                "max_simplex_violation": max_simplex_violation_this,
+
+                "min_pre_projection": min_pre_projection,
+                "max_pre_projection": max_pre_projection,
+                "max_sum_pre_projection": max_sum_pre_projection,
+
+                "mass_redistributed_low_local": diag["mass_redistributed_low_local"],
+                "mass_redistributed_low_global": diag["mass_redistributed_low_global"],
+                "mass_redistributed_high_local": diag["mass_redistributed_high_local"],
+                "mass_redistributed_high_global": diag["mass_redistributed_high_global"],
+                "mass_redistributed_simplex_local": diag["mass_redistributed_simplex_local"],
+                "mass_redistributed_simplex_global": diag["mass_redistributed_simplex_global"],
+            })
 
         return rho
 
@@ -758,19 +1843,10 @@ class fhd_2d:
             np.multiply(phi[0], phi[1], out=rho_ab)
             np.maximum(rho_ab, self.phi_floor**2, out=rho_ab)
 
-            # demo_noise = sqrt(4 D_v rho_ab / dt) * xi2
-            np.multiply(rho_ab, 4.0 * D_v / dt, out=demo_noise)
+            # demo_noise = sqrt(4 d D_v rho_ab / dt) * xi2
+            np.multiply(rho_ab, 4.0 * 2 * D_v / dt, out=demo_noise)
             np.sqrt(demo_noise, out=demo_noise)
             demo_noise *= xi2
-
-            # Apply your old clipping/capping logic, but in-place-ish.
-
-            # Reuse rho_ab as temporary lower/upper clipped noise.
-            # rho_ab = max(-phi_A/dt, demo_noise)
-            # np.maximum(demo_noise, -phi[0] / dt, out=demo_noise)
-
-            # rho_ab = min(rho_ab, phi_B/dt)
-            # np.minimum(demo_noise, phi[1] / dt, out=demo_noise)
 
             divJ[0] += demo_noise
             divJ[1] -= demo_noise
@@ -825,7 +1901,9 @@ class fhd_2d:
         
         return divJ
         
-    def step(self, rhs, phi, param, dt, toggle_noise, scheme, work = None):
+    def step(self, rhs, phi, param, dt, toggle_noise, scheme, work = None, 
+             step=None,
+             record_projection_history=False,):
         phi_tot = np.sum(phi, axis=0)
         dphidt = rhs(phi, param, dt, toggle_noise, work)
         rho_pred = phi + dt * dphidt
@@ -845,7 +1923,12 @@ class fhd_2d:
             rho_next = phi + 1/6*(k1 + 2*k2 + 2*k3 + k4)
             # rho_next +=  dt * phi*(param['b']*(1-phi_tot) - param['d'])
 
-        return self.project_density(rho_next)
+        return self.project_density(
+                        rho_next,
+                        work=work,
+                        step=step,
+                        record_history=record_projection_history,
+                    )
 
     def scale_down(self, phi):
         ''' Scales down phi such that  sum_a phi[a] < 1 for all x 
@@ -860,7 +1943,9 @@ class fhd_2d:
             no_frames = 100,
             scheme = "FE", 
             model = "Vitelli",
-            verbatum = True):
+            verbatum = True,
+            diagnostic_interval=100,
+            reset_projection_diag=True,):
         ''' Runs the FHD simulation with specified parameters for nsteps, recording no_frames equally timed frames.
 
         Arg:
@@ -896,9 +1981,14 @@ class fhd_2d:
                     
         '''
         plot_every = nsteps//no_frames
-        phi = self.project_density(phi)
+        phi = self.project_density_fast(phi)
         phi = np.maximum(phi, self.phi_floor)
+
+        work = self._ensure_work(phi.dtype)
         
+        if reset_projection_diag:
+            work["projection_diag"] = self._init_projection_diagnostics()
+
         phi_current = phi.copy()
         phi_run = np.zeros((self.nspecies, no_frames+1)+self.N)
         phi_run[:,0,:,:] = phi_current
@@ -911,7 +2001,23 @@ class fhd_2d:
                 phi_current = self.step(self.rhs_Schelling, phi_current, param, dt, toggle_noise, scheme)
             elif model == "Schelling+Voter":
                 work = self._ensure_work(phi_current.dtype)
-                phi_current = self.step(self.rhs_SchellingwithVoter, phi_current, param, dt, toggle_noise, scheme, work)
+                record_projection_history = (
+                    diagnostic_interval is not None
+                    and n % diagnostic_interval == 0
+                )
+
+                phi_current = self.step(
+                    self.rhs_SchellingwithVoter,
+                    phi_current,
+                    param,
+                    dt,
+                    toggle_noise,
+                    scheme,
+                    work=work,
+                    step=n,
+                    record_projection_history=record_projection_history,
+                )
+                # phi_current = self.step(self.rhs_SchellingwithVoter, phi_current, param, dt, toggle_noise, scheme, work)
             else:
                 raise ValueError(f"Model {model} is unknown, please choose 'Vitelli', 'Schelling' or 'Schelling+Voter'") 
         
@@ -977,7 +2083,7 @@ class fhd_2d:
                     
         '''
         plot_every = save_every
-        phi = self.project_density(phi)
+        phi = self.project_density_fast(phi)
         phi = np.maximum(phi, self.phi_floor)
         
         phi_current = phi.copy()
@@ -1031,5 +2137,78 @@ class fhd_2d:
             cbar = plt.colorbar(im, fraction=0.046)
             cbar.set_label(r"$\phi_a - \phi_b$",size=14)
             plt.show()
-            
+        
         return phi_run
+
+    def print_projection_diagnostics(self, work=None):
+        if work is None:
+            work = self._work
+
+        diag = work["projection_diag"]
+
+        expected_net = (
+            diag["mass_added_low"]
+            - diag["mass_removed_high"]
+            - diag["mass_removed_simplex"]
+        )
+
+        print("Projection diagnostics")
+        print("----------------------")
+        print(f"calls:                 {diag['n_calls']}")
+
+        print(f"low entries:           {diag['n_low_entries']}")
+        print(f"mass added low:        {diag['mass_added_low']:.8e}")
+        print(f"max low violation:     {diag['max_low_violation']:.8e}")
+
+        print(f"high entries:          {diag['n_high_entries']}")
+        print(f"mass removed high:     {diag['mass_removed_high']:.8e}")
+        print(f"max high violation:    {diag['max_high_violation']:.8e}")
+
+        print(f"simplex cells:         {diag['n_simplex_cells']}")
+        print(f"mass removed simplex:  {diag['mass_removed_simplex']:.8e}")
+        print(f"max simplex violation: {diag['max_simplex_violation']:.8e}")
+
+        print(f"net mass change:       {diag['net_mass_change_projection']:.8e}")
+        print(f"expected net change:   {expected_net:.8e}")
+        print(
+            f"bookkeeping error:     "
+            f"{diag['net_mass_change_projection'] - expected_net:.8e}"
+        )
+
+        print(f"mass transferred low:  {diag['mass_transferred_low']:.8e}")
+        print(f"mass transferred AtoB: {diag['mass_transferred_AtoB']:.8e}")
+        print(f"mass transferred BtoA: {diag['mass_transferred_BtoA']:.8e}")
+        print(f"transfer fallback n:   {diag['n_transfer_fallback_entries']}")
+        print(f"transfer fallback add: {diag['mass_added_transfer_fallback']:.8e}")
+
+        print(f"redis low local:       {diag['mass_redistributed_low_local']:.8e}")
+        print(f"redis low global:      {diag['mass_redistributed_low_global']:.8e}")
+        print(f"redis high local:      {diag['mass_redistributed_high_local']:.8e}")
+        print(f"redis high global:     {diag['mass_redistributed_high_global']:.8e}")
+        print(f"redis simplex local:   {diag['mass_redistributed_simplex_local']:.8e}")
+        print(f"redis simplex global:  {diag['mass_redistributed_simplex_global']:.8e}")
+
+        print(f"redis low leftover:    {diag['redistribute_low_leftover']:.8e}")
+        print(f"redis high leftover:   {diag['redistribute_high_leftover']:.8e}")
+        print(f"redis simplex leftover:{diag['redistribute_simplex_leftover']:.8e}")
+
+        print(f"redis low failures:    {diag['n_redistribute_low_failures']}")
+        print(f"redis high failures:   {diag['n_redistribute_high_failures']}")
+        print(f"redis simplex failures:{diag['n_redistribute_simplex_failures']}")
+
+
+
+    def projection_history_as_dict(self, work=None):
+        if work is None:
+            work = self._work
+
+        hist = work["projection_diag"]["history"]
+
+        if len(hist) == 0:
+            return {}
+
+        keys = hist[0].keys()
+        return {
+            key: np.array([h[key] for h in hist])
+            for key in keys
+        }

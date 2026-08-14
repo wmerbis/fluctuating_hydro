@@ -9,9 +9,9 @@ def noise_matrix(k, a0, b0, param):
     h = param['h']
     k2 = k**2
     r0 = 1-a0-b0
-    q11 = DA * h**2 * r0 * a0 * k2 + 2.0 * Dv * a0* b0
-    q22 = DB * h**2 * r0 * b0 * k2 + 2.0 * Dv * a0 * b0
-    q12 = -2.0 * Dv * a0* b0
+    q11 = DA * h**2 * r0 * a0 * k2 + 4.0 * Dv * a0* b0
+    q22 = DB * h**2 * r0 * b0 * k2 + 4.0 * Dv * a0 * b0
+    q12 = -4.0 * Dv * a0* b0
     return np.array([[q11, q12],
                      [q12, q22]], dtype=float)
 
