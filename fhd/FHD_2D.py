@@ -410,13 +410,13 @@ class fhd_2d:
     def __init__(self, L, N, 
                  bc = "periodic", 
                  fft = False, 
-                 schelling_flux="collocated",
+                 schelling_flux="finite_volume",
                  projection_floor=0.0,
-                 projection_mode="clip",
+                 projection_mode="redistribute",
                  projection_tol = 1e-14,
                  redistribute_radius=1,
                  redistribute_fallback="global",
-                 use_numba_projection=False,
+                 use_numba_projection=True,
                  numba_projection_threads=4,):
         '''
         Initializes instance of the fhd class object
@@ -480,6 +480,8 @@ class fhd_2d:
         self.projection_mass_tol = 1e-10   # accumulated leftover tolerance
         self.redistribute_radius = redistribute_radius
         self.redistribute_fallback = redistribute_fallback
+        self.redistribute_n_iter = 1
+        
 
         self.use_numba_projection = use_numba_projection
         self.numba_projection_threads = numba_projection_threads
@@ -580,6 +582,8 @@ class fhd_2d:
             "n_redistribute_simplex_failures": 0,
 
             # Total bookkeeping
+            "n_expensive_projection_calls": 0,
+            "n_roundoff_cleanup_calls": 0,
             "mass_roundoff_cleanup": 0.0,
             "mass_before_projection": 0.0,
             "mass_after_projection": 0.0,
@@ -624,6 +628,9 @@ class fhd_2d:
                 "xi2": np.empty(self.N, dtype=dtype),
                 "demo_noise": np.empty(self.N, dtype=dtype),
                 "rho_ab": np.empty(self.N, dtype=dtype),
+
+                # Integration step
+                "phi_next": np.empty(shape2, dtype=dtype),
             }
 
             if self.bc == "periodic":
@@ -1971,6 +1978,9 @@ class fhd_2d:
             # Only roundoff-level violations are present. Use the cheap clipping
             # projection but record its total mass effect separately from the real
             # projection diagnostics.
+            diag["n_roundoff_cleanup_calls"] = (
+                diag.get("n_roundoff_cleanup_calls", 0) + 1
+            )
             mass_before_cleanup = float(rho.sum())
             self.project_density_fast(rho)
             mass_after_cleanup = float(rho.sum())
@@ -1983,6 +1993,10 @@ class fhd_2d:
             )
 
         elif self.projection_mode == "redistribute":
+            diag["n_expensive_projection_calls"] = (
+               diag.get("n_expensive_projection_calls", 0) + 1
+            )
+
             self._project_density_redistribute(
                 rho,
                 diag,
@@ -1990,6 +2004,10 @@ class fhd_2d:
             )
 
         elif self.projection_mode == "transfer_to_other":
+            diag["n_expensive_projection_calls"] = (
+                diag.get("n_expensive_projection_calls", 0) + 1
+            )
+
             self._project_density_transfer_to_other(
                 rho,
                 diag,
@@ -1999,7 +2017,9 @@ class fhd_2d:
         elif self.projection_mode == "clip":
             # Use the existing fast nonconservative projection, but count the
             # corresponding mass changes explicitly for diagnostics.
-
+            diag["n_expensive_projection_calls"] = (
+                diag.get("n_expensive_projection_calls", 0) + 1
+            )
             low_mask = rho < projection_floor
             if np.any(low_mask):
                 old_low_mass = float(rho[low_mask].sum())
@@ -2734,13 +2754,121 @@ class fhd_2d:
             phi *= (1.0 / (sumphi.max() + self.phi_floor))
         return phi
 
+    def _warmup_projection_kernels(self, phi, work=None):
+        if not getattr(self, "use_numba_projection", False):
+            return
+
+        if work is None:
+            work = self._ensure_work(phi.dtype)
+
+        rho_tmp = phi.copy()
+
+        diag_tmp = self._init_projection_diagnostics()
+
+        # Force tiny artificial violations so both kernels compile.
+        rho_tmp[0, 0, 0] = -1e-12
+        rho_tmp[0, 0, 1] += 1e-12
+
+        rho_tmp[0, 1, 1] = 0.7
+        rho_tmp[1, 1, 1] = 0.7
+
+        self._project_density_redistribute(
+            rho_tmp,
+            diag_tmp,
+            projection_floor=getattr(self, "projection_floor", 0.0),
+        )
+
+    def _use_neumann_fv_fe_fastpath(self, method):
+        return (
+            method == "FE"
+            and self.bc == "Neumann"
+            and self.schelling_flux == "finite_volume"
+            and not self.fft
+        )
+
+    def _run_neumann_fv_fe_fast(
+        self,
+        phi_init,
+        param,
+        nsteps,
+        dt,
+        noise=True,
+        save_every=None,
+        record_projection_history=False,
+    ):
+        """
+        Fast production path for:
+            - Neumann boundaries
+            - finite-volume Schelling flux
+            - forward Euler
+            - optional stochastic noise
+            - adaptive projection
+        """
+        work = self._ensure_work(phi_init.dtype)
+
+        phi = phi_init.copy()
+        phi_next = work.get("phi_next", None)
+
+        if phi_next is None or phi_next.shape != phi.shape:
+            work["phi_next"] = np.empty_like(phi)
+            phi_next = work["phi_next"]
+
+        # Optional output storage.
+        phi_run = []
+        if save_every is not None:
+            phi_run.append(phi.copy())
+
+        # Warm up Numba projection kernels before production timing if desired.
+        if getattr(self, "use_numba_projection", False):
+            self._warmup_projection_kernels(phi, work)
+
+        for step in range(1, nsteps + 1):
+            rhs = self.rhs_SchellingwithVoter(
+                phi,
+                param,
+                dt=dt,
+                toggle_noise=noise,
+                work=work,
+            )
+
+            # Forward Euler update.
+            np.copyto(phi_next, phi)
+            phi_next += dt * rhs
+
+            save_this_step = (
+                save_every is not None
+                and step % save_every == 0
+            )
+
+            self.project_density(
+                phi_next,
+                work=work,
+                step=step,
+                record_history=(
+                    record_projection_history
+                    and save_this_step
+                ),
+            )
+
+            # Swap buffers.
+            phi, phi_next = phi_next, phi
+
+            if save_this_step:
+                phi_run.append(phi.copy())
+
+        if save_every is None:
+            return phi
+
+        return np.asarray(phi_run).transpose((1,0,2,3))
+
     def run(self, phi, param, nsteps, dt, toggle_noise, 
             no_frames = 100,
             scheme = "FE", 
-            model = "Vitelli",
+            model = "Schelling+Voter",
             verbatum = True,
             diagnostic_interval=100,
-            reset_projection_diag=True,):
+            reset_projection_diag=True,
+            use_fastpath=False):
         ''' Runs the FHD simulation with specified parameters for nsteps, recording no_frames equally timed frames.
 
         Arg:
@@ -2785,6 +2913,18 @@ class fhd_2d:
             work["projection_diag"] = self._init_projection_diagnostics()
 
         phi_current = phi.copy()
+
+        if use_fastpath and self._use_neumann_fv_fe_fastpath(scheme):
+            return self._run_neumann_fv_fe_fast(
+                phi_init=phi_current,
+                param=param,
+                nsteps=nsteps,
+                dt=dt,
+                noise=toggle_noise,
+                save_every=plot_every,
+                record_projection_history=(diagnostic_interval is not None),
+            )
+        
         phi_run = np.zeros((self.nspecies, no_frames+1)+self.N)
         phi_run[:,0,:,:] = phi_current
         
@@ -2795,7 +2935,6 @@ class fhd_2d:
             elif model == "Schelling":
                 phi_current = self.step(self.rhs_Schelling, phi_current, param, dt, toggle_noise, scheme)
             elif model == "Schelling+Voter":
-                work = self._ensure_work(phi_current.dtype)
                 record_projection_history = (
                     diagnostic_interval is not None
                     and n % diagnostic_interval == 0
@@ -2992,6 +3131,11 @@ class fhd_2d:
         print(f"redis low failures:    {diag['n_redistribute_low_failures']}")
         print(f"redis high failures:   {diag['n_redistribute_high_failures']}")
         print(f"redis simplex failures:{diag['n_redistribute_simplex_failures']}")
+
+        print(f"no. expensive proj:    {diag['n_expensive_projection_calls']}")
+        print(f"no. roundoff cleanups: {diag['n_roundoff_cleanup_calls']}")
+        print(f"mass roundoff cleanup: {diag['mass_roundoff_cleanup']:.8e}")
+
 
     def projection_history_as_dict(self, work=None):
         if work is None:
