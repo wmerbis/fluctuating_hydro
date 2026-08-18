@@ -142,7 +142,9 @@ nsteps = 2_000_000
 noise = False
 frames = 800
 
-no_cores = 128
+no_cores = int(os.environ.get("SLURM_CPUS_PER_TASK", multiprocessing.cpu_count()))
+
+
 
 def run_simulation(param_set):
     try:
@@ -251,15 +253,40 @@ parameter_sets = [
     for Dv in Dv_vals
 ]
 
+array_id = int(os.environ.get("SLURM_ARRAY_TASK_ID", 0))
+array_count = int(os.environ.get("SLURM_ARRAY_TASK_COUNT", 1))
+
+# Contiguous chunking
+n_total = len(parameter_sets)
+chunk_size = int(np.ceil(n_total / array_count))
+
+start = array_id * chunk_size
+stop = min(start + chunk_size, n_total)
+
+parameter_sets_this_job = parameter_sets[start:stop]
+
+print(
+    f"Array task {array_id}/{array_count}: "
+    f"running parameter_sets[{start}:{stop}] "
+    f"({len(parameter_sets_this_job)} simulations)",
+    flush=True,
+)
+
 def parallel_simulation(parameter_sets):
-    print(f"Number of tasks: {len(parameter_sets)}", flush = True)
-    print(f"Number of worker processes: {no_cores}", flush = True)
-    with multiprocessing.Pool(no_cores) as pool:
+    n_workers = min(no_cores, len(parameter_sets))
+
+    print(f"Number of tasks in this array job: {len(parameter_sets)}", flush=True)
+    print(f"Number of worker processes: {n_workers}", flush=True)
+
+    if len(parameter_sets) == 0:
+        print("No tasks assigned to this array job.", flush=True)
+        return
+
+    with multiprocessing.Pool(n_workers) as pool:
         pool.map(run_simulation, parameter_sets)
-    
-    return 
+
 
 if __name__ == '__main__':
-    parallel_simulation(parameter_sets)
+    parallel_simulation(parameter_sets_this_job)
 
 
