@@ -148,7 +148,7 @@ def run_simulation(param_set):
     try:
         regime, n_run, D_v = param_set
         pid = os.getpid()
-        seed = (1000000*regimes.index(regime) + 10000*int(n_run) + int(round(1_000_000 * float(D_v))))
+        seed = (100*regimes.index(regime) + 10_000*int(n_run) + int(round(1_000_000 * float(D_v))))
         np.random.seed(seed)
         local_simulator = fhd.fhd_2d(L,N, bc= 'Neumann', fft=False, 
                                      schelling_flux="finite_volume",
