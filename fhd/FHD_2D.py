@@ -416,7 +416,7 @@ class fhd_2d:
                  projection_tol = 1e-14,
                  redistribute_radius=1,
                  redistribute_fallback="global",
-                 use_numba_projection=True,
+                 use_numba_projection=False,
                  numba_projection_threads=4,):
         '''
         Initializes instance of the fhd class object
