@@ -20,7 +20,7 @@ Gamma = np.eye(2) # Utility nabla^3 term coefficient
 D_v = 0.01 #Voter model diffusion term
 beta = 10
 
-param = {'D': D, 'Gamma': Gamma, 'nu': nu, 'D_v': D_v, 'beta': beta, 'noise_v' : 1, 'h': 50/128}
+param = {'D': D, 'Gamma': Gamma, 'nu': nu, 'D_v': D_v, 'beta': beta, 'h': 0.01}
 
 
 num_bins = 60
@@ -29,7 +29,7 @@ Dv_space = np.linspace(0.01,0.2,20)
 
 regimes = ["segregating", "integrating", "migrating", "well-mixed"]
 kappas = [np.array([[0.6, -0.4],[-0.4, 0.6]]), np.array([[0.6, 1], [1, 0.6]]),
-np.array([[1, 1], [-1, 1]]), np.array([[0.6, 0.4], [0.6, 0.4]])]
+np.array([[1, 1], [-1, 1]]), np.array([[0., 0.], [0., 0.]])]
 
 
 dt = 1e-3
