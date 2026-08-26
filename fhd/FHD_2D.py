@@ -1382,8 +1382,8 @@ class fhd_2d:
                 )
 
                 add_float("mass_transferred_low", transferred)
-                add_float("mass_transferred_B_to_A", transferred_B_to_A)
-                add_float("mass_transferred_A_to_B", transferred_A_to_B)
+                add_float("mass_transferred_BtoA", transferred_B_to_A)
+                add_float("mass_transferred_AtoB", transferred_A_to_B)
                 add_int("n_transfer_fallback_entries", n_fallback)
                 add_float("mass_added_transfer_fallback", fallback_added)
 
@@ -1787,8 +1787,8 @@ class fhd_2d:
             )
 
             diag["mass_transferred_low"] += transferred
-            diag["mass_transferred_B_to_A"] += transferred_B_to_A
-            diag["mass_transferred_A_to_B"] += transferred_A_to_B
+            diag["mass_transferred_BtoA"] += transferred_B_to_A
+            diag["mass_transferred_AtoB"] += transferred_A_to_B
 
             diag["n_transfer_fallback_entries"] += n_fallback
             diag["mass_added_transfer_fallback"] += fallback_added
@@ -2554,8 +2554,28 @@ class fhd_2d:
             divJ += dnoise_dx
         
         return divJ
+    
+    def demographic_voter_noise(self, phi, work, D_v, dt):
+            '''Compute demographic voter noise contribution'''
+            xi2 = work["xi2"]
+            rho_ab = work["rho_ab"]
+            demo_noise = work["demo_noise"]
 
-    def rhs_SchellingwithVoter(self, phi, param, dt, toggle_noise, work=None):
+            self.rng.standard_normal(out=xi2)
+            xi2 *= 1.0 / np.sqrt(self.dx * self.dy)
+
+            # rho_ab = max(phi_A * phi_B, 0)
+            np.multiply(phi[0], phi[1], out=rho_ab)
+            np.maximum(rho_ab, 0.0, out=rho_ab)
+
+            # demo_noise = sqrt(4 d D_v rho_ab / dt) * xi2
+            np.multiply(rho_ab, 4.0 * 2 * D_v / dt, out=demo_noise)
+            np.sqrt(demo_noise, out=demo_noise)
+            demo_noise *= xi2
+            return demo_noise
+
+
+    def rhs_SchellingwithVoter(self, phi, param, dt, toggle_noise, work=None, with_voter_noise = True):
         """Compute RHS of the equation"""
         if work is None:
             work = self._ensure_work(phi.dtype)
@@ -2647,24 +2667,10 @@ class fhd_2d:
             divJ += work["dnoise_dx"]
 
             # Demographic voter noise: keep as local non-conservative noise
-            xi2 = work["xi2"]
-            rho_ab = work["rho_ab"]
-            demo_noise = work["demo_noise"]
-
-            self.rng.standard_normal(out=xi2)
-            xi2 *= 1.0 / np.sqrt(self.dx * self.dy)
-
-            # rho_ab = max(phi_A * phi_B, floor^2)
-            np.multiply(phi[0], phi[1], out=rho_ab)
-            np.maximum(rho_ab, 0.0, out=rho_ab)
-
-            # demo_noise = sqrt(4 d D_v rho_ab / dt) * xi2
-            np.multiply(rho_ab, 4.0 * 2 * D_v / dt, out=demo_noise)
-            np.sqrt(demo_noise, out=demo_noise)
-            demo_noise *= xi2
-
-            divJ[0] += demo_noise
-            divJ[1] -= demo_noise
+            if with_voter_noise:
+                demo_noise = self.demographic_voter_noise(phi, work, D_v, dt)
+                divJ[0] += demo_noise
+                divJ[1] -= demo_noise
         
         return divJ
     
@@ -2719,31 +2725,46 @@ class fhd_2d:
     def step(self, rhs, phi, param, dt, toggle_noise, scheme, work = None, 
              step=None,
              record_projection_history=False,):
-        phi_tot = np.sum(phi, axis=0)
-        dphidt = rhs(phi, param, dt, toggle_noise, work)
-        rho_pred = phi + dt * dphidt
-    
+        # phi_tot = np.sum(phi, axis=0)
+        # dphidt = rhs(phi, param, dt, toggle_noise, work)
+        # rho_pred = phi + dt * dphidt
+        rho_next = work.get("phi_next", None)
+
         if scheme == "FE":
-            rho_next = rho_pred # + dt * phi*(param['b']*(1-phi_tot) - param['d'])
+            if rhs == self.rhs_SchellingwithVoter:
+                dphidt = rhs(phi, param, dt, toggle_noise, work, with_voter_noise = False)
+                rho_next = phi + dt * dphidt
+                rho_next = self.project_density(rho_next, work=work, step=step, record_history=record_projection_history,) 
+                if toggle_noise:
+                    demo_noise_contribution = dt * self.demographic_voter_noise(phi, work,param["D_v"],dt)
+                    rho_next[0] += demo_noise_contribution
+                    rho_next[1] -= demo_noise_contribution
+                    self._project_density_transfer_to_other(rho_next, work.get("projection_diag", None), self.projection_floor)
+                return rho_next
+            else:
+                dphidt = rhs(phi, param, dt, toggle_noise, work)
+                rho_pred = phi + dt * dphidt
+                rho_next = self.project_density(rho_next, work=work, step=step, record_history=record_projection_history,) 
+
         elif scheme == "PC":
+            dphidt = rhs(phi, param, dt, toggle_noise, work)
+            rho_pred = phi + dt * dphidt
             dphidt = dphidt.copy()
             rho_corr = phi + 0.5*dt*(dphidt + rhs(rho_pred, param,  dt, toggle_noise, work))
-            rho_next = rho_corr # + dt * phi*(param['b']*(1-phi_tot) - param['d'])
+            rho_next = rho_corr 
+            rho_next = self.project_density(rho_next, work=work, step=step, record_history=record_projection_history,)
+
         elif scheme == "RK4":
+            dphidt = rhs(phi, param, dt, toggle_noise, work)
             dphidt = dphidt.copy()
             k1 = dt * dphidt
             k2 = dt * rhs(phi + 1/2* k1, param, dt, toggle_noise, work).copy()
             k3 = dt * rhs(phi + 1/2* k2, param, dt, toggle_noise, work).copy()
             k4 = dt * rhs(phi + k3, param, dt, toggle_noise, work)
             rho_next = phi + 1/6*(k1 + 2*k2 + 2*k3 + k4)
-            # rho_next +=  dt * phi*(param['b']*(1-phi_tot) - param['d'])
+            rho_next = self.project_density(rho_next, work=work, step=step, record_history=record_projection_history,)
 
-        return self.project_density(
-                        rho_next,
-                        work=work,
-                        step=step,
-                        record_history=record_projection_history,
-                    )
+        return rho_next
 
     def scale_down(self, phi):
         ''' Scales down phi such that  sum_a phi[a] < 1 for all x 

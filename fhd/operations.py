@@ -287,7 +287,7 @@ def makeD4(Nx, dx):
         D4x[i, (i+4) % Nx] = 7/240
     return sp.sparse.csc_array(D4x/dx**4)
 
-def power_spectrum(phi_run, L,  num_bins=50, averaged = True, bp = 0, centered = True):
+def power_spectrum(phi_run, L,  num_bins=60, averaged = True, bp = 0, centered = True):
     '''Compute the angle averaged power spectrum for a run, averaged over timeseries from until the end bp:'''
     Nx, Ny = phi_run.shape[2:]
     Lx, Ly = L
