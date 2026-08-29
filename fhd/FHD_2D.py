@@ -455,13 +455,22 @@ class fhd_2d:
             self.x = np.arange(-self.Lx/2, self.Lx/2, self.dx)
             self.y = np.arange(-self.Ly/2, self.Ly/2, self.dy)
         elif bc == "Neumann":
-            self.N = (N[0]+1,N[1]+1)
-            self.Nx += 1
-            self.Ny += 1
-            self.x = np.linspace(-self.Lx/2, self.Lx/2, self.Nx)
-            self.y = np.linspace(-self.Ly/2, self.Ly/2, self.Ny)
-            self.dx = self.Lx / self.Nx
-            self.dy = self.Ly / self.Ny            
+            # self.N = (N[0]+1,N[1]+1)
+            # self.Nx += 1
+            # self.Ny += 1
+            # self.x = np.linspace(-self.Lx/2, self.Lx/2, self.Nx)
+            # self.y = np.linspace(-self.Ly/2, self.Ly/2, self.Ny)
+            # self.dx = self.Lx / self.Nx
+            # self.dy = self.Ly / self.Ny     
+            self.x = (
+                -self.Lx / 2
+                + (np.arange(self.Nx) + 0.5) * self.dx
+            )
+
+            self.y = (
+                -self.Ly / 2
+                + (np.arange(self.Ny) + 0.5) * self.dy
+            )       
         elif bc == "Dirichlet":
             raise ValueError("Dirichet boundary conditions not yet implemented")
         else:
@@ -477,7 +486,7 @@ class fhd_2d:
         self.projection_floor = projection_floor
         self.projection_mode = projection_mode
         self.projection_tol = projection_tol
-        self.projection_mass_tol = 1e-10   # accumulated leftover tolerance
+        self.projection_mass_tol = 1e-12   # accumulated leftover tolerance
         self.redistribute_radius = redistribute_radius
         self.redistribute_fallback = redistribute_fallback
         self.redistribute_n_iter = 1
@@ -528,8 +537,8 @@ class fhd_2d:
                 self.D2x = makeD2_fv_neumann(self.Nx, self.dx)
                 self.D2y = makeD2_fv_neumann(self.Ny, self.dy)
             else:
-                self.D2x = makeD2(self.Nx, self.dx, bc=self.bc)
-                self.D2y = makeD2(self.Ny, self.dy, bc=self.bc)
+                self.D2x = makeD2_second_order(self.Nx, self.dx, bc=self.bc)
+                self.D2y = makeD2_second_order(self.Ny, self.dy, bc=self.bc)
 
             self.D3x = makeD3(self.Nx, self.dx, self.bc)
             self.D3y = makeD3(self.Ny, self.dy, self.bc)
@@ -581,6 +590,28 @@ class fhd_2d:
             "n_redistribute_high_failures": 0,
             "n_redistribute_simplex_failures": 0,
 
+            # DCM voter-noise diagnostics
+            "n_dcm_calls": 0,
+
+            # Input composition outside [-1, 1]
+            "n_dcm_input_clip_cells": 0,
+            "dcm_input_clipped_mass": 0.0,
+            "dcm_input_clipped_AtoB": 0.0,
+            "dcm_input_clipped_BtoA": 0.0,
+            "dcm_max_input_m_violation": 0.0,
+
+            # DCM draw crossing the opposite absorbing boundary
+            "n_dcm_far_boundary_cells": 0,
+            "dcm_far_boundary_transfer_mass": 0.0,
+            "dcm_far_boundary_AtoB": 0.0,
+            "dcm_far_boundary_BtoA": 0.0,
+            "dcm_max_far_m_violation": 0.0,
+
+            # Useful extra diagnostic
+            "n_dcm_absorbed_cells": 0,
+
+            "dcm_history": [],
+
             # Total bookkeeping
             "n_expensive_projection_calls": 0,
             "n_roundoff_cleanup_calls": 0,
@@ -612,6 +643,7 @@ class fhd_2d:
                 "div_dUdx": np.empty(shape2, dtype=dtype),
                 "divJ": np.empty(shape2, dtype=dtype),
                 "voter_current": np.empty(self.N, dtype=dtype),
+                "voter_rhs": np.empty(shape2, dtype=dtype),
 
                 # Derivative temporaries 
                 "grad_pi": np.empty(shape_vec, dtype=dtype),
@@ -1780,12 +1812,6 @@ class fhd_2d:
                 )
             )
 
-            diag["n_low_entries"] += n_low_this
-            diag["max_low_violation"] = max(
-                diag["max_low_violation"],
-                max_low_violation_this,
-            )
-
             diag["mass_transferred_low"] += transferred
             diag["mass_transferred_BtoA"] += transferred_B_to_A
             diag["mass_transferred_AtoB"] += transferred_A_to_B
@@ -1808,17 +1834,11 @@ class fhd_2d:
                 self._project_simplex_transfer_to_vacancy(rho)
             )
 
-            diag["n_simplex_cells"] += n_simplex_this
-            diag["mass_removed_simplex"] += removed_simplex
-            diag["max_simplex_violation"] = max(
-                diag["max_simplex_violation"],
-                max_simplex_violation_this,
-            )
-
             diag["mass_transferred_to_vacancy"] += removed_simplex
             diag["mass_transferred_simplex_to_vacancy"] += removed_simplex
             diag["mass_transferred_A_to_vacancy"] += removed_simplex_species[0]
             diag["mass_transferred_B_to_vacancy"] += removed_simplex_species[1]
+            diag["mass_removed_simplex"] += removed_simplex
 
         # ------------------------------------------------------------
         # 3. Upper repair: rho_a > 1 - floor.
@@ -1834,13 +1854,7 @@ class fhd_2d:
                 )
             )
 
-            diag["n_high_entries"] += n_high_this
             diag["mass_removed_high"] += removed_high
-            diag["max_high_violation"] = max(
-                diag["max_high_violation"],
-                max_high_violation_this,
-            )
-
             diag["mass_transferred_to_vacancy"] += removed_high
             diag["mass_transferred_high_to_vacancy"] += removed_high
             diag["mass_transferred_A_to_vacancy"] += removed_high_species[0]
@@ -1852,6 +1866,8 @@ class fhd_2d:
         work=None,
         step=None,
         record_history=False,
+        projection_mode=None,
+        stage=None,
     ):
         """
         Project densities back to the physical simplex.
@@ -1890,6 +1906,15 @@ class fhd_2d:
             100.0 * np.finfo(rho.dtype).eps,
         )
         upper_bound = 1.0 - projection_floor
+
+        mode = (
+            self.projection_mode
+            if projection_mode is None
+            else projection_mode
+        )
+
+        if mode not in ("clip", "redistribute", "transfer_to_other"):
+            raise ValueError(f"Unknown projection mode: {mode}")
 
         # ------------------------------------------------------------
         # Total mass bookkeeping is done only here.
@@ -1958,16 +1983,15 @@ class fhd_2d:
             or n_simplex_this > 0
         )
 
-        # Optional diagnostic keys. Safe even if not initialized explicitly.
-        if not needs_projection:
-            diag["n_roundoff_cleanup_calls"] = (
-                diag.get("n_roundoff_cleanup_calls", 0) + 1
-            )
-
         # Per-call mass changes for history.
         mass_added_low_before = diag["mass_added_low"]
         mass_removed_high_before = diag["mass_removed_high"]
         mass_removed_simplex_before = diag["mass_removed_simplex"]
+
+        mass_transferred_low_before = diag["mass_transferred_low"]
+        mass_transferred_AtoB_before = diag["mass_transferred_AtoB"]
+        mass_transferred_BtoA_before = diag["mass_transferred_BtoA"]
+        mass_transferred_to_vacancy_before = diag["mass_transferred_to_vacancy"]
 
         roundoff_mass_change_this = 0.0
 
@@ -1992,7 +2016,7 @@ class fhd_2d:
                 + roundoff_mass_change_this
             )
 
-        elif self.projection_mode == "redistribute":
+        elif mode == "redistribute":
             diag["n_expensive_projection_calls"] = (
                diag.get("n_expensive_projection_calls", 0) + 1
             )
@@ -2003,7 +2027,7 @@ class fhd_2d:
                 projection_floor=projection_floor,
             )
 
-        elif self.projection_mode == "transfer_to_other":
+        elif mode == "transfer_to_other":
             diag["n_expensive_projection_calls"] = (
                 diag.get("n_expensive_projection_calls", 0) + 1
             )
@@ -2014,7 +2038,7 @@ class fhd_2d:
                 projection_floor=projection_floor,
             )
 
-        elif self.projection_mode == "clip":
+        elif mode == "clip":
             # Use the existing fast nonconservative projection, but count the
             # corresponding mass changes explicitly for diagnostics.
             diag["n_expensive_projection_calls"] = (
@@ -2070,9 +2094,31 @@ class fhd_2d:
             diag["mass_removed_simplex"] - mass_removed_simplex_before
         )
 
+        mass_transferred_low_this = (
+            diag["mass_transferred_low"]
+            - mass_transferred_low_before
+        )
+
+        mass_transferred_AtoB_this = (
+            diag["mass_transferred_AtoB"]
+            - mass_transferred_AtoB_before
+        )
+
+        mass_transferred_BtoA_this = (
+            diag["mass_transferred_BtoA"]
+            - mass_transferred_BtoA_before
+        )
+
+        mass_transferred_to_vacancy_this = (
+            diag["mass_transferred_to_vacancy"]
+            - mass_transferred_to_vacancy_before
+        )
+
         if record_history:
             diag["history"].append({
                 "step": step,
+                "stage": stage,
+                "projection_mode": mode,
 
                 "needs_projection": needs_projection,
 
@@ -2096,6 +2142,11 @@ class fhd_2d:
                 "min_pre_projection": min_pre_projection,
                 "max_pre_projection": max_pre_projection,
                 "max_sum_pre_projection": max_sum_pre_projection,
+
+                "mass_transferred_low": mass_transferred_low_this,
+                "mass_transferred_AtoB": mass_transferred_AtoB_this,
+                "mass_transferred_BtoA": mass_transferred_BtoA_this,
+                "mass_transferred_to_vacancy": mass_transferred_to_vacancy_this,
 
                 "mass_redistributed_low_local": diag["mass_redistributed_low_local"],
                 "mass_redistributed_low_global": diag["mass_redistributed_low_global"],
@@ -2555,6 +2606,53 @@ class fhd_2d:
         
         return divJ
     
+    def rhs_Voter(self, phi, param, dt, toggle_noise=False, work=None):
+        """
+        Voter contribution only:
+            deterministic interdiffusive voter current
+            + demographic voter noise.
+
+        The A and B contributions are exactly opposite, so local
+        occupied density rho_A + rho_B is conserved by this substep
+        before projection.
+        """
+        if work is None:
+            work = self._ensure_work(phi.dtype)
+
+        D_v = param["D_v"]
+
+        lap_phi = work["lap_phi"]
+        voter_current = work["voter_current"]
+        voter_rhs = work["voter_rhs"]
+
+        # Recompute on the state entering the Voter substep.
+        self.lapl(phi, out=lap_phi)
+
+        # D_v * (rho_B lap rho_A - rho_A lap rho_B)
+        np.multiply(phi[1], lap_phi[0], out=voter_current)
+        voter_current -= phi[0] * lap_phi[1]
+        voter_current *= D_v
+
+        voter_rhs[0] = voter_current
+        voter_rhs[1] = - voter_current
+
+        # if toggle_noise:
+        #     demo_noise = self.demographic_voter_noise(
+        #         phi,
+        #         work,
+        #         D_v,
+        #         dt,
+        #     )
+
+        #     # Keep this if noise_v is intended as an independent
+        #     # multiplier for voter noise.
+        #     noise_v = param.get("noise_v", 1.0)
+
+        #     voter_rhs[0] += noise_v * demo_noise
+        #     voter_rhs[1] -= noise_v * demo_noise
+
+        return voter_rhs
+
     def demographic_voter_noise(self, phi, work, D_v, dt):
             '''Compute demographic voter noise contribution'''
             xi2 = work["xi2"]
@@ -2575,8 +2673,360 @@ class fhd_2d:
             return demo_noise
 
 
-    def rhs_SchellingwithVoter(self, phi, param, dt, toggle_noise, work=None, with_voter_noise = True):
-        """Compute RHS of the equation"""
+    def demographic_voter_step_dcm(
+        self,
+        phi,
+        D_v,
+        dt,
+        noise_strength=1.0,
+        work=None,
+        step=None,
+        record_history=False,
+    ):
+        """
+        DCM-style finite-time sampler for the demographic Voter noise.
+
+        Updates phi IN PLACE.
+
+        The Voter substep conserves
+            n = rho_A + rho_B
+        exactly at every grid cell.
+
+        We use the composition field
+            m = (rho_A - rho_B) / n
+        and the DCM nearest-absorbing-barrier approximation
+
+            sqrt(1 - m**2) -> sqrt(1 - |m|).
+
+        The corresponding one-barrier square-root process is sampled
+        exactly using the Poisson-Gamma representation.
+
+        Parameters
+        ----------
+        phi : ndarray, shape (2, Nx, Ny)
+            Species densities. Modified in place.
+
+        D_v : float
+            Voter diffusion coefficient.
+
+        dt : float
+            Timestep.
+
+        noise_strength : float
+            Multiplicative factor on the Voter noise amplitude.
+            Use 1.0 for the physical noise.
+
+
+        Returns
+        -------
+        phi
+            The same array, modified in place.
+
+        diagnostics : dict, optional
+            Returned only if return_diagnostics=True.
+        """
+        if work is None:
+            work = self._ensure_work(phi.dtype)
+
+        diag = work["projection_diag"]
+        diag["n_dcm_calls"] += 1
+
+        if D_v <= 0.0 or noise_strength == 0.0:
+            return phi
+
+        rho_A = phi[0]
+        rho_B = phi[1]
+
+        # ------------------------------------------------------------
+        # 1. Occupancy and Voter composition
+        # ------------------------------------------------------------
+        occupancy = rho_A + rho_B
+        active = occupancy > 0.0
+
+        m = np.zeros_like(occupancy)
+        m[active] = (
+            (rho_A[active] - rho_B[active])
+            / occupancy[active]
+        )
+
+        # ============================================================
+        # 1. REPAIR INPUT m OUTSIDE [-1, 1]
+        #
+        # Keep n fixed. This is exactly a local A <-> B transfer.
+        #
+        # m > 1  <=> rho_B < 0  -> A to B repair
+        # m < -1 <=> rho_A < 0  -> B to A repair
+        # ============================================================
+
+        input_high = active & (m > 1.0)
+        input_low  = active & (m < -1.0)
+
+        n_input_high = int(np.count_nonzero(input_high))
+        n_input_low = int(np.count_nonzero(input_low))
+        n_input_clip = n_input_high + n_input_low
+
+        # Equivalent transferred density at fixed n:
+        #
+        # rho_A = n(1+m)/2
+        # rho_B = n(1-m)/2
+        #
+        # Therefore delta rho = n * delta m / 2.
+        input_AtoB = 0.0
+        input_BtoA = 0.0
+        max_input_violation = 0.0
+
+        if n_input_high:
+            excess_m = m[input_high] - 1.0
+
+            input_AtoB = float(
+                np.sum(
+                    0.5
+                    * occupancy[input_high]
+                    * excess_m
+                )
+            )
+
+            max_input_violation = max(
+                max_input_violation,
+                float(np.max(excess_m)),
+            )
+
+        if n_input_low:
+            excess_m = -1.0 - m[input_low]
+
+            input_BtoA = float(
+                np.sum(
+                    0.5
+                    * occupancy[input_low]
+                    * excess_m
+                )
+            )
+
+            max_input_violation = max(
+                max_input_violation,
+                float(np.max(excess_m)),
+            )
+
+        input_clipped_mass = input_AtoB + input_BtoA
+
+        # Clip m while preserving occupancy.
+        np.clip(m, -1.0, 1.0, out=m)
+
+        diag["n_dcm_input_clip_cells"] += n_input_clip
+        diag["dcm_input_clipped_mass"] += input_clipped_mass
+        diag["dcm_input_clipped_AtoB"] += input_AtoB
+        diag["dcm_input_clipped_BtoA"] += input_BtoA
+
+        diag["dcm_max_input_m_violation"] = max(
+            diag["dcm_max_input_m_violation"],
+            max_input_violation,
+        )
+
+        # Also include these in the aggregate transfer diagnostics.
+        diag["mass_transferred_low"] += input_clipped_mass
+        diag["mass_transferred_AtoB"] += input_AtoB
+        diag["mass_transferred_BtoA"] += input_BtoA
+
+        # ------------------------------------------------------------
+        # 2. Choose nearest absorbing barrier.
+        #
+        # s = +1 -> m = +1 is closest
+        # s = -1 -> m = -1 is closest
+        #
+        # At m == 0 the barriers are equidistant, so choose randomly
+        # to avoid introducing A/B bias.
+        # ------------------------------------------------------------
+        s = np.sign(m)
+
+        zero_mask = active & (s == 0.0)
+        n_zero = int(np.count_nonzero(zero_mask))
+
+        if n_zero:
+            s[zero_mask] = np.where(
+                self.rng.random(n_zero) < 0.5,
+                -1.0,
+                1.0,
+            )
+
+        # Distance from selected absorbing barrier.
+        y = np.zeros_like(m)
+        y[active] = 1.0 - s[active] * m[active]
+
+        # ------------------------------------------------------------
+        # 3. DCM Poisson-Gamma stochastic step
+        #
+        # dm = sigma_m sqrt(1-|m|) dW
+        #
+        # Spatial white-noise discretization contributes
+        # 1 / sqrt(dx * dy).
+        # ------------------------------------------------------------
+        d = 2
+        cell_area = self.dx * self.dy
+
+        sigma2 = (
+            noise_strength**2
+            * 4.0 * d * D_v
+            / cell_area
+        )
+
+        lam = 2.0 / (sigma2 * dt)
+
+        # Q ~ Poisson(lambda * y)
+        Q = np.zeros(y.shape, dtype=np.int64)
+        Q[active] = self.rng.poisson(lam * y[active])
+
+        # y_new = Gamma(Q, 1) / lambda.
+        #
+        # Q = 0 corresponds exactly to absorption: y_new = 0.
+        y_new = np.zeros_like(y)
+
+        gamma_mask = active & (Q > 0)
+
+        if np.any(gamma_mask):
+            y_new[gamma_mask] = self.rng.gamma(
+                shape=Q[gamma_mask],
+                scale=1.0 / lam,
+            )
+
+        # ------------------------------------------------------------
+        # 4. Transform back to m.
+        # ------------------------------------------------------------
+        m_new = m.copy()
+        m_new[active] = (
+            s[active] * (1.0 - y_new[active])
+        )
+
+        # ------------------------------------------------------------
+        # 5. IMPORTANT diagnostic:
+        #
+        # The nearest-barrier approximation only treats one boundary
+        # exactly. A sufficiently large stochastic jump could cross
+        # the *opposite* boundary.
+        #
+        # ============================================================
+        # 2. DCM DRAW CROSSES THE OPPOSITE ABSORBING BOUNDARY
+        #
+        # Repair exactly as transfer_to_other at fixed occupancy.
+        # ============================================================
+
+        far_high = active & (m_new > 1.0)
+        far_low  = active & (m_new < -1.0)
+
+        n_far_high = int(np.count_nonzero(far_high))
+        n_far_low = int(np.count_nonzero(far_low))
+        n_far = n_far_high + n_far_low
+
+        far_AtoB = 0.0
+        far_BtoA = 0.0
+        max_far_violation = 0.0
+
+        if n_far_high:
+            excess_m = m_new[far_high] - 1.0
+
+            # B is negative -> transfer A to B.
+            far_AtoB = float(
+                np.sum(
+                    0.5
+                    * occupancy[far_high]
+                    * excess_m
+                )
+            )
+
+            max_far_violation = max(
+                max_far_violation,
+                float(np.max(excess_m)),
+            )
+
+        if n_far_low:
+            excess_m = -1.0 - m_new[far_low]
+
+            # A is negative -> transfer B to A.
+            far_BtoA = float(
+                np.sum(
+                    0.5
+                    * occupancy[far_low]
+                    * excess_m
+                )
+            )
+
+            max_far_violation = max(
+                max_far_violation,
+                float(np.max(excess_m)),
+            )
+
+        far_transfer_mass = far_AtoB + far_BtoA
+
+        # The actual transfer-to-other repair.
+        np.clip(m_new, -1.0, 1.0, out=m_new)
+
+        diag["n_dcm_far_boundary_cells"] += n_far
+        diag["dcm_far_boundary_transfer_mass"] += far_transfer_mass
+        diag["dcm_far_boundary_AtoB"] += far_AtoB
+        diag["dcm_far_boundary_BtoA"] += far_BtoA
+
+        diag["dcm_max_far_m_violation"] = max(
+            diag["dcm_max_far_m_violation"],
+            max_far_violation,
+        )
+
+        # Aggregate A <-> B transfer bookkeeping.
+        diag["mass_transferred_low"] += far_transfer_mass
+        diag["mass_transferred_AtoB"] += far_AtoB
+        diag["mass_transferred_BtoA"] += far_BtoA
+
+        absorbed_mask = active & (
+            (m_new == -1.0)
+            | (m_new == 1.0)
+        )
+
+        n_absorbed = int(np.count_nonzero(absorbed_mask))
+
+        diag["n_dcm_absorbed_cells"] += n_absorbed
+
+        # ------------------------------------------------------------
+        # 6. Transform back to species densities.
+        #
+        # Using rho_B = n - rho_A makes local occupancy conservation
+        # exact up to the final subtraction.
+        # ------------------------------------------------------------
+        rho_A[active] = (
+            0.5
+            * occupancy[active]
+            * (1.0 + m_new[active])
+        )
+
+        rho_B[active] = (
+            occupancy[active]
+            - rho_A[active]
+        )
+
+        # Empty cells stay empty.
+        rho_A[~active] = 0.0
+        rho_B[~active] = 0.0
+
+        if record_history:
+            diag["dcm_history"].append({
+                "step": step,
+
+                "n_input_clip_cells": n_input_clip,
+                "input_clipped_mass": input_clipped_mass,
+                "input_clipped_AtoB": input_AtoB,
+                "input_clipped_BtoA": input_BtoA,
+                "max_input_m_violation": max_input_violation,
+
+                "n_far_boundary_cells": n_far,
+                "far_boundary_transfer_mass": far_transfer_mass,
+                "far_boundary_AtoB": far_AtoB,
+                "far_boundary_BtoA": far_BtoA,
+                "max_far_m_violation": max_far_violation,
+
+                "n_absorbed_cells": n_absorbed,
+            })
+
+        return phi
+
+    def rhs_Schelling_2species(self, phi, param, dt, toggle_noise, work=None):
+        """Compute RHS of the Schelling part of the equation"""
         if work is None:
             work = self._ensure_work(phi.dtype)
 
@@ -2589,7 +3039,6 @@ class fhd_2d:
 
         D = param["D"]
         beta = param["beta"]
-        D_v = param["D_v"]
 
         self.lapl(phi, out=lap_phi)
         
@@ -2642,16 +3091,7 @@ class fhd_2d:
         divJ[1] -= phi[1] * lap_phi0
         divJ[1] -= beta * div_dUdx[1]
         divJ[1] *= D[1]
-
-        # voter current = D_v * (phi_B lap_phi_A - phi_A lap_phi_B)
-        voter_current = work["voter_current"]
-        np.multiply(phi[1], lap_phi[0], out=voter_current)
-        voter_current -= phi[0] * lap_phi[1]
-        voter_current *= D_v
-
-        divJ[0] += voter_current
-        divJ[1] -= voter_current
-    
+        
         """Generate stochastic flux term ∂x( rho ξ )"""
         if toggle_noise:
             # Conservative Schelling/mobility noise as face fluxes
@@ -2665,14 +3105,24 @@ class fhd_2d:
             )
 
             divJ += work["dnoise_dx"]
-
-            # Demographic voter noise: keep as local non-conservative noise
-            if with_voter_noise:
-                demo_noise = self.demographic_voter_noise(phi, work, D_v, dt)
-                divJ[0] += demo_noise
-                divJ[1] -= demo_noise
         
         return divJ
+
+    def rhs_SchellingwithVoter(self, phi, param, dt, toggle_noise, work=None):
+        """Compute RHS of the equation"""
+        if work is None:
+            work = self._ensure_work(phi.dtype)
+
+        rhs = self.rhs_Schelling_2species(
+            phi, param, dt, toggle_noise, work
+        )
+
+        rhs += self.rhs_Voter(
+            phi, param, dt, toggle_noise, work
+        )
+
+        return rhs
+
     
     def w0(self, phi, param):
         D = param["D"]
@@ -2725,25 +3175,68 @@ class fhd_2d:
     def step(self, rhs, phi, param, dt, toggle_noise, scheme, work = None, 
              step=None,
              record_projection_history=False,):
-        # phi_tot = np.sum(phi, axis=0)
-        # dphidt = rhs(phi, param, dt, toggle_noise, work)
-        # rho_pred = phi + dt * dphidt
-        rho_next = work.get("phi_next", None)
+        
+        if work is None:
+           work = self._ensure_work(phi.dtype)
+
+        rho_next = work["phi_next"]
+
 
         if scheme == "FE":
-            if rhs == self.rhs_SchellingwithVoter:
-                dphidt = rhs(phi, param, dt, toggle_noise, work, with_voter_noise = False)
-                rho_next = phi + dt * dphidt
-                rho_next = self.project_density(rho_next, work=work, step=step, record_history=record_projection_history,) 
+            if rhs == self.rhs_Voter:
+                np.copyto(rho_next, phi)
+                voter_rhs = work["voter_rhs"]
                 if toggle_noise:
-                    demo_noise_contribution = dt * self.demographic_voter_noise(phi, work,param["D_v"],dt)
-                    rho_next[0] += demo_noise_contribution
-                    rho_next[1] -= demo_noise_contribution
-                    self._project_density_transfer_to_other(rho_next, work.get("projection_diag", None), self.projection_floor)
+                    self.demographic_voter_step_dcm(
+                        rho_next,
+                        D_v=param["D_v"],
+                        dt=dt,
+                        noise_strength=param.get("noise_v", 1.0),
+                        work=work,
+                        step=step,
+                        record_history=record_projection_history,
+                    )
+
+                # Deterministic Voter current, evaluated AFTER stochastic step.
+                voter_rhs = self.rhs_Voter(rho_next, param, dt, toggle_noise=False, work=work,)
+                rho_next += dt * voter_rhs
+                return rho_next
+
+            elif rhs == self.rhs_SchellingwithVoter:
+                voter_rhs = work["voter_rhs"]
+                schelling_rhs = work["divJ"]
+
+                # Schelling update
+                schelling_rhs = self.rhs_Schelling_2species(phi, param, dt, toggle_noise, work,)
+
+                np.copyto(rho_next, phi)
+                rho_next += dt * schelling_rhs
+                self.project_density(rho_next, work=work, step=step, record_history=record_projection_history, 
+                                     projection_mode="redistribute", stage="schelling",)
+
+                # Voter update
+                if toggle_noise:
+                    self.demographic_voter_step_dcm(
+                        rho_next,
+                        D_v=param["D_v"],
+                        dt=dt,
+                        noise_strength=param.get("noise_v", 1.0),
+                        work=work,
+                        step=step,
+                        record_history=record_projection_history,
+                    )
+
+                # Deterministic Voter current, evaluated AFTER stochastic step.
+                voter_rhs = self.rhs_Voter(rho_next, param, dt, toggle_noise=False, work=work,)
+                rho_next += dt * voter_rhs
+
+                self.project_density(rho_next, work=work, step=step, record_history=record_projection_history, 
+                                     projection_mode="transfer_to_other", stage="voter",)
+
                 return rho_next
             else:
                 dphidt = rhs(phi, param, dt, toggle_noise, work)
-                rho_pred = phi + dt * dphidt
+                rho_next = phi + dt * dphidt
                 rho_next = self.project_density(rho_next, work=work, step=step, record_history=record_projection_history,) 
 
         elif scheme == "PC":
@@ -2834,6 +3327,9 @@ class fhd_2d:
             work["phi_next"] = np.empty_like(phi)
             phi_next = work["phi_next"]
 
+        rhs_s = work["divJ"]
+        rhs_v = work["voter_rhs"]
+
         # Optional output storage.
         phi_run = []
         if save_every is not None:
@@ -2844,7 +3340,13 @@ class fhd_2d:
             self._warmup_projection_kernels(phi, work)
 
         for step in range(1, nsteps + 1):
-            rhs = self.rhs_SchellingwithVoter(
+            save_this_step = (
+                save_every is not None
+                and step % save_every == 0
+            )
+
+            # Schelling substep                        
+            rhs_s = self.rhs_Schelling_part(
                 phi,
                 param,
                 dt=dt,
@@ -2852,25 +3354,38 @@ class fhd_2d:
                 work=work,
             )
 
-            # Forward Euler update.
             np.copyto(phi_next, phi)
-            phi_next += dt * rhs
-
-            save_this_step = (
-                save_every is not None
-                and step % save_every == 0
-            )
+            phi_next += dt * rhs_s
 
             self.project_density(
                 phi_next,
                 work=work,
                 step=step,
-                record_history=(
-                    record_projection_history
-                    and save_this_step
-                ),
+                record_history=save_this_step,
+                projection_mode="redistribute",
+                stage="schelling",
             )
 
+            # Voter substep
+            rhs_v = self.rhs_Voter(
+                phi_next,
+                param,
+                dt=dt,
+                toggle_noise=noise,
+                work=work,
+            )
+
+            phi_next += dt * rhs_v
+
+            self.project_density(
+                phi_next,
+                work=work,
+                step=step,
+                record_history=save_this_step,
+                projection_mode="transfer_to_other",
+                stage="voter",
+            )
+            
             # Swap buffers.
             phi, phi_next = phi_next, phi
 
@@ -2917,6 +3432,9 @@ class fhd_2d:
                         'Gamma': numpy array of shape (nspecies, nspecies) for the lapl(phi) term in the utility \Gamma^{ab} \nabla^2 \phi_b
                         'nu':    Optional np.array of shape (nspecies, nspecies, nspecies) for the quadratic term in the utility: nu^{abc} \phi_b \phi_c
                         'D_v':   float: coefficient for voter model diffusion term
+                        'noise_v': (optional) float: strength of voter model noise (default is one)
+                    "Voter" with expected parameters
+                        'D_v':   float: coefficient for voter model diffusion term
                         'noise_v': float: strength of voter model noise (default is one)
             verbatum: If True print and plot stuff
 
@@ -2948,19 +3466,24 @@ class fhd_2d:
         
         phi_run = np.zeros((self.nspecies, no_frames+1)+self.N)
         phi_run[:,0,:,:] = phi_current
+
         
         for n in range(1, nsteps + 1):     
-            # print("step", n)
+            record_projection_history = (
+                diagnostic_interval is not None
+                and n % diagnostic_interval == 0
+            )
+
             if model == "Vitelli":
                 phi_current = self.step(self.rhs_Vitelli, phi_current, param, dt, toggle_noise, scheme)
+            elif model == "Voter":
+                phi_current = self.step(self.rhs_Voter, phi_current, param, dt, toggle_noise, scheme, 
+                                        work = work, 
+                                        step = n, 
+                                        record_projection_history=record_projection_history)
             elif model == "Schelling":
                 phi_current = self.step(self.rhs_Schelling, phi_current, param, dt, toggle_noise, scheme)
             elif model == "Schelling+Voter":
-                record_projection_history = (
-                    diagnostic_interval is not None
-                    and n % diagnostic_interval == 0
-                )
-
                 phi_current = self.step(
                     self.rhs_SchellingwithVoter,
                     phi_current,
@@ -3157,6 +3680,22 @@ class fhd_2d:
         print(f"no. roundoff cleanups: {diag['n_roundoff_cleanup_calls']}")
         print(f"mass roundoff cleanup: {diag['mass_roundoff_cleanup']:.8e}")
 
+        print("")
+        print("DCM voter diagnostics")
+        print("---------------------")
+        print(f"DCM calls:              {diag['n_dcm_calls']}")
+
+        print(f"input clip cells:       {diag['n_dcm_input_clip_cells']}")
+        print(f"input clipped mass:     {diag['dcm_input_clipped_mass']:.8e}")
+        print(f"input A -> B:           {diag['dcm_input_clipped_AtoB']:.8e}")
+        print(f"input B -> A:           {diag['dcm_input_clipped_BtoA']:.8e}")
+        print(f"max input m violation:  {diag['dcm_max_input_m_violation']:.8e}")
+
+        print(f"far-boundary cells:     {diag['n_dcm_far_boundary_cells']}")
+        print(f"far-boundary mass:      {diag['dcm_far_boundary_transfer_mass']:.8e}")
+        print(f"far A -> B:             {diag['dcm_far_boundary_AtoB']:.8e}")
+        print(f"far B -> A:             {diag['dcm_far_boundary_BtoA']:.8e}")
+        print(f"max far m violation:    {diag['dcm_max_far_m_violation']:.8e}")
 
     def projection_history_as_dict(self, work=None):
         if work is None:
@@ -3168,6 +3707,22 @@ class fhd_2d:
             return {}
 
         keys = hist[0].keys()
+        return {
+            key: np.array([h[key] for h in hist])
+            for key in keys
+        }
+    
+    def dcm_history_as_dict(self, work=None):
+        if work is None:
+            work = self._work
+
+        hist = work["projection_diag"]["dcm_history"]
+
+        if len(hist) == 0:
+            return {}
+
+        keys = hist[0].keys()
+
         return {
             key: np.array([h[key] for h in hist])
             for key in keys

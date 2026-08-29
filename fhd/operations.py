@@ -393,6 +393,212 @@ def power_spectrum_1d(phi_run, L,  num_bins=50, averaged = True, bp = 0):
     return k_bin_centers, power_spectra, S_ab_spectrum
 
 
+from scipy.fft import dctn
+
+
+def power_spectrum_dct_2d(
+    phi_run,
+    L,
+    bp=0,
+    centered=True,
+    num_bins=50,
+    averaged=True,
+    use_lattice_k=False,
+):
+    """
+    2D power spectrum using the DCT appropriate for cell-centered
+    Neumann finite-volume fields.
+
+    Parameters
+    ----------
+    phi_run : array, shape (2, nframes, Nx, Ny)
+        Density history.
+
+    L : tuple
+        (Lx, Ly)
+
+    bp : int
+        First frame included in time averaging.
+
+    centered : bool
+        Subtract spatial mean independently from each frame.
+
+    num_bins : int
+        Number of radial bins.
+
+    averaged : bool
+        If False, use only the final frame.
+
+    use_lattice_k : bool
+        False:
+            radial coordinate is continuum
+                k = sqrt(kx^2 + ky^2)
+
+        True:
+            radial coordinate is the FV lattice wavenumber
+                khat^2 = 4/dx^2 sin^2(kx dx/2)
+                       + 4/dy^2 sin^2(ky dy/2)
+
+    Returns
+    -------
+    k_centers : (nbins,) array
+
+    spectra : (3, nbins) array
+        AA, BB, vacancy auto-spectra.
+
+    G_AB : (nbins,) array
+        AB cross-spectrum.
+
+    power_2d : (3, Nx, Ny) array
+        Time-averaged 2D DCT power.
+
+    G_AB_2d : (Nx, Ny) array
+        Time-averaged 2D AB cross-spectrum.
+
+    k_2d : (Nx, Ny) array
+        Radial wavenumber used for binning.
+    """
+
+    Lx, Ly = L
+    _, nframes, Nx, Ny = phi_run.shape
+
+    dx = Lx / Nx
+    dy = Ly / Ny
+
+    if not averaged:
+        fields = phi_run[:, -1:, :, :].copy()
+    else:
+        fields = phi_run[:, bp:, :, :].copy()
+
+    # Vacancy field
+    phi0 = 1.0 - fields.sum(axis=0)
+
+    fields = np.concatenate(
+        (fields, phi0[np.newaxis, ...]),
+        axis=0,
+    )
+
+    # ------------------------------------------------------------
+    # Remove the DCT zero mode independently at each time.
+    # ------------------------------------------------------------
+    if centered:
+        fields -= fields.mean(
+            axis=(2, 3),
+            keepdims=True,
+        )
+
+    # ------------------------------------------------------------
+    # DCT-II in spatial dimensions.
+    #
+    # norm="ortho" gives an orthonormal transform, convenient for
+    # comparisons between resolutions.
+    # ------------------------------------------------------------
+    coeff = dctn(
+        fields,
+        type=2,
+        axes=(2, 3),
+        norm="ortho",
+    )
+
+    # Auto spectra
+    power_2d_t = coeff**2
+
+    # AB cross spectrum
+    G_AB_t = coeff[0] * coeff[1]
+
+    # Average over recorded frames
+    power_2d = power_2d_t.mean(axis=1)
+    G_AB_2d = G_AB_t.mean(axis=0)
+
+    # ------------------------------------------------------------
+    # Neumann/DCT mode numbers.
+    #
+    # Continuum eigenmodes:
+    #     k_n = pi n / L
+    # ------------------------------------------------------------
+    nx = np.arange(Nx)
+    ny = np.arange(Ny)
+
+    kx = np.pi * nx / Lx
+    ky = np.pi * ny / Ly
+
+    # ------------------------------------------------------------
+    # Either continuum radial k or exact FV lattice khat.
+    # ------------------------------------------------------------
+    if use_lattice_k:
+        kx_used = (
+            2.0 / dx
+            * np.sin(0.5 * kx * dx)
+        )
+        ky_used = (
+            2.0 / dy
+            * np.sin(0.5 * ky * dy)
+        )
+    else:
+        kx_used = kx
+        ky_used = ky
+
+    KX, KY = np.meshgrid(
+        kx_used,
+        ky_used,
+        indexing="ij",
+    )
+
+    k_2d = np.sqrt(KX**2 + KY**2)
+
+    # ------------------------------------------------------------
+    # Radial binning
+    # ------------------------------------------------------------
+    k_flat = k_2d.ravel()
+
+    bins = np.linspace(
+        0.0,
+        k_flat.max(),
+        num_bins + 1,
+    )
+
+    k_centers = 0.5 * (bins[:-1] + bins[1:])
+
+    spectra = np.full(
+        (3, num_bins),
+        np.nan,
+    )
+
+    G_AB = np.full(num_bins, np.nan)
+
+    for i in range(num_bins):
+
+        mask = (
+            (k_flat >= bins[i])
+            & (k_flat < bins[i + 1])
+        )
+
+        # Include upper endpoint in final bin
+        if i == num_bins - 1:
+            mask |= k_flat == bins[-1]
+
+        if not np.any(mask):
+            continue
+
+        for a in range(3):
+            spectra[a, i] = np.mean(
+                power_2d[a].ravel()[mask]
+            )
+
+        G_AB[i] = np.mean(
+            G_AB_2d.ravel()[mask]
+        )
+
+    return (
+        k_centers,
+        spectra,
+        G_AB,
+        power_2d,
+        G_AB_2d,
+        k_2d,
+    )
+
+
 def check_convergence(Obs_list, T, eps_mean = 1e-3, K = 50):
     """ Checks whether the change in running averages of the mean and Fano factors of all observables in Obs_list 
     are below the specified eps_mean and eps_Fano for the last K samples.
@@ -416,3 +622,50 @@ def kmean(power_spectrum, k_bins):
     Z = np.sum(power_spectrum)
     kmean = np.sum(k_bins*power_spectrum)
     return kmean/Z
+
+
+def voter_interface_density(phi_run, eps=1e-14):
+    """
+    Interface-density diagnostic used by Dornic, Chate & Munoz.
+
+    Parameters
+    ----------
+    phi_run : ndarray, shape (2, nframes, Nx, Ny)
+        phi_run[0] = rho_A
+        phi_run[1] = rho_B
+
+    Returns
+    -------
+    rho_I : ndarray, shape (nframes,)
+        rho_I(t) = 1 - <m(r,t) m(r+e,t)>,
+        averaged over x- and y-nearest-neighbor bonds.
+    """
+
+    rho_A = phi_run[0]
+    rho_B = phi_run[1]
+
+    n = rho_A + rho_B
+
+    # Voter composition / magnetization field in [-1, 1].
+    # For pure voter with n=1 this is simply rho_A - rho_B.
+    m = np.divide(
+        rho_A - rho_B,
+        n,
+        out=np.zeros_like(rho_A),
+        where=n > eps,
+    )
+
+    # Nearest-neighbor correlations in the two lattice directions.
+    Cx = np.mean(
+        m * np.roll(m, -1, axis=1),
+        axis=(1, 2),
+    )
+
+    Cy = np.mean(
+        m * np.roll(m, -1, axis=2),
+        axis=(1, 2),
+    )
+
+    C_nn = 0.5 * (Cx + Cy)
+
+    return 1.0 - C_nn
