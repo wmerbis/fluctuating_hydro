@@ -392,6 +392,21 @@ def power_spectrum_1d(phi_run, L,  num_bins=50, averaged = True, bp = 0):
 
     return k_bin_centers, power_spectra, S_ab_spectrum
 
+def fit_amplitude_logspace(theory, data):
+    """
+    Fit a multiplicative amplitude amp in log-space:
+        log(data) ~ log(amp) + log(theory)
+    """
+    valid = (
+        np.isfinite(theory) & np.isfinite(data) &
+        (theory > 0) & (data > 0)
+    )
+
+    if not np.any(valid):
+        return 1.0
+
+    log_amp = np.mean(np.log(data[valid]) - np.log(theory[valid]))
+    return np.exp(log_amp) 
 
 from scipy.fft import dctn
 
