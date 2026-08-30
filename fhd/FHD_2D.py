@@ -50,7 +50,7 @@ from numba import njit, prange
 
 from .operations import *
 
-@njit(parallel=True, cache=True)
+@njit
 def _redistribute_low_species_local_numba(
     rho,
     species,
@@ -118,7 +118,7 @@ def _redistribute_low_species_local_numba(
 
                 moved_color = 0.0
 
-                for idx in prange(n_cells_color):
+                for idx in range(n_cells_color):
                     qi = idx // n_j_color
                     qj = idx - qi * n_j_color
 
@@ -208,7 +208,7 @@ def _redistribute_low_species_local_numba(
     # Compute remaining deficit.
     leftover_total = 0.0
 
-    for idx in prange(Nx * Ny):
+    for idx in range(Nx * Ny):
         i = idx // Ny
         j = idx - i * Ny
 
@@ -218,7 +218,7 @@ def _redistribute_low_species_local_numba(
 
     return moved_total_all, leftover_total
 
-@njit(parallel=True, cache=True)
+@njit
 def _redistribute_simplex_local_numba(
     rho,
     radius,
@@ -279,7 +279,7 @@ def _redistribute_simplex_local_numba(
 
                 moved_color = 0.0
 
-                for idx in prange(n_cells_color):
+                for idx in range(n_cells_color):
                     qi = idx // n_j_color
                     qj = idx - qi * n_j_color
 
@@ -388,7 +388,7 @@ def _redistribute_simplex_local_numba(
     # Compute remaining simplex excess.
     leftover_total = 0.0
 
-    for idx in prange(Nx * Ny):
+    for idx in range(Nx * Ny):
         i = idx // Ny
         j = idx - i * Ny
 
@@ -417,7 +417,7 @@ class fhd_2d:
                  redistribute_radius=1,
                  redistribute_fallback="global",
                  use_numba_projection=False,
-                 numba_projection_threads=4,):
+                 numba_projection_threads=1,):
         '''
         Initializes instance of the fhd class object
 
@@ -3230,8 +3230,8 @@ class fhd_2d:
                 voter_rhs = self.rhs_Voter(rho_next, param, dt, toggle_noise=False, work=work,)
                 rho_next += dt * voter_rhs
 
-                self.project_density(rho_next, work=work, step=step, record_history=record_projection_history, 
-                                     projection_mode="transfer_to_other", stage="voter",)
+                # self.project_density(rho_next, work=work, step=step, record_history=record_projection_history, 
+                #                      projection_mode="transfer_to_other", stage="voter",)
 
                 return rho_next
             else:
