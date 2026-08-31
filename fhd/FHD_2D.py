@@ -32,7 +32,6 @@ Features:
 - multiplicative conservative noise ~ sqrt(phi_a phi_0), turn on by passing non-zero "toggle_noise"
 - numerical differentiation by fft, derivatives are computed using finite differences when passing "fft = False".
 
-Authors: Tuan Pham and Wout Merbis
 """
 
 import numpy as np
@@ -41,6 +40,11 @@ from numpy.fft import rfft, irfft
 from matplotlib.animation import FuncAnimation, PillowWriter
 from scipy.fft import dct, idct
 import scipy as sp
+import math
+from dataclasses import dataclass
+import time
+import mpmath as mp
+from scipy.special import gammaln
 
 import os
 os.environ["NUMBA_THREADING_LAYER"] = "omp"
@@ -403,6 +407,200 @@ def _redistribute_simplex_local_numba(
     return moved_total_all, leftover_total
 
 
+@dataclass
+class WFQMTable:
+    tau: float
+    q: np.ndarray
+    cdf: np.ndarray
+    raw_sum: float
+    clipped_negative_mass: float
+    m_max: int
+    build_seconds: float
+
+
+def _estimate_peak_log10_term(m: int, tau: float) -> float:
+    """
+    Estimate the largest log10 magnitude in the alternating q_m series.
+
+    This determines how many decimal digits are needed to survive cancellation.
+    Uses float64 log arithmetic only for choosing mpmath precision.
+    """
+    log_b = (
+        math.log(2 * m - 1)
+        + gammaln(2 * m - 1)
+        - gammaln(m)
+        - gammaln(m + 1)
+        - 0.5 * m * (m - 1) * tau
+    )
+    max_log_b = log_b
+    k = m
+
+    # The term ratio is eventually monotone below unity.  We only need the peak.
+    for _ in range(1_000_000):
+        log_ratio = (
+            math.log(2 * k + 1)
+            - math.log(2 * k - 1)
+            + math.log(m + k - 1)
+            - math.log(k + 1 - m)
+            - k * tau
+        )
+        log_b += log_ratio
+        max_log_b = max(max_log_b, log_b)
+        k += 1
+        if log_ratio < 0.0:
+            break
+    else:
+        raise RuntimeError("Could not locate decreasing tail of q_m series")
+
+    return max_log_b / math.log(10.0)
+
+
+def q_m_zero_mutation_mp(
+    m: int,
+    tau: float,
+    target_digits: int = 26,
+) -> float:
+    r"""
+    Compute q_m^0(tau) from
+
+      q_m(tau) = sum_{k=m}^inf (-1)^(k-m) a_{k,m}
+                 exp[-k(k-1) tau / 2],
+
+      a_{k,m} = (2k-1) (m)_{k-1} / [m! (k-m)!].
+
+    The terms are generated recursively to avoid repeated Gamma evaluations.
+    Arbitrary precision is selected adaptively from the estimated peak term.    
+    """
+    if m < 1:
+        raise ValueError("For theta=0, M has support m >= 1")
+    if tau <= 0.0:
+        raise ValueError("tau must be positive")
+
+    peak_log10 = _estimate_peak_log10_term(m, tau)
+    dps = max(
+        50,
+        int(math.ceil(max(0.0, peak_log10))) + target_digits + 20,
+    )
+
+    with mp.workdps(dps):
+        t = mp.mpf(str(float(tau)))
+
+        # First positive term k=m.
+        b = (
+            (2 * m - 1)
+            * mp.gamma(2 * m - 1)
+            / (mp.gamma(m) * mp.gamma(m + 1))
+            * mp.exp(-mp.mpf(m * (m - 1)) * t / 2)
+        )
+
+        total = b
+        previous = b
+        sign = -1
+        k = m
+        decreasing = False
+
+        # Absolute error target for an individual probability.  This is far below
+        # the precision needed for the final float64 CDF.
+        term_tol = mp.power(10, -(target_digits + 6))
+
+        for _ in range(1_000_000):
+            # b_{k+1}/b_k for theta=0.
+            ratio = (
+                (mp.mpf(2 * k + 1) / (2 * k - 1))
+                * (mp.mpf(m + k - 1) / (k + 1 - m))
+                * mp.exp(-mp.mpf(k) * t)
+            )
+            b *= ratio
+            k += 1
+
+            if b < previous:
+                decreasing = True
+
+            total += sign * b
+            sign = -sign
+
+            # Once the alternating terms decrease, the first omitted term bounds
+            # the truncation error.
+            if decreasing and b < term_tol:
+                return float(total)
+
+            previous = b
+
+    raise RuntimeError(f"q_m series failed to converge for m={m}, tau={tau}")
+
+
+def build_qm_table(
+    tau: float,
+    target_digits: int = 26,
+    tail_sigma: float = 12.0,
+    tail_padding: int = 20,
+    pmf_tolerance: float = 5e-14,
+) -> WFQMTable:
+    """
+    Precompute q_m^0(tau), m=1,...,m_max, and its float64 CDF.
+
+    For small tau the lineage count is concentrated around
+        mean ~ 2/tau,
+        variance ~ 2/(3 tau).
+    We use that only to choose a generously large initial upper cutoff.  The
+    probabilities themselves come from the exact alternating series.
+    """
+    if tau <= 0.0:
+        raise ValueError("tau must be positive")
+
+    t0 = time.perf_counter()
+
+    mu_asym = 2.0 / tau
+    sigma_asym = math.sqrt(2.0 / (3.0 * tau))
+    m_max = max(
+        5,
+        int(math.ceil(mu_asym + tail_sigma * sigma_asym + tail_padding)),
+    )
+
+    values = [
+        q_m_zero_mutation_mp(m, tau, target_digits=target_digits)
+        for m in range(1, m_max + 1)
+    ]
+    q = np.asarray(values, dtype=np.float64)
+
+    # Arbitrary-precision cancellation can leave utterly negligible (~1e-30)
+    # signed roundoff after conversion.  Refuse any materially negative PMF.
+    materially_negative = q < -pmf_tolerance
+    if np.any(materially_negative):
+        bad = np.where(materially_negative)[0] + 1
+        raise RuntimeError(
+            "Materially negative q_m values; increase target_digits. "
+            f"First bad m values: {bad[:10]}"
+        )
+
+    clipped_negative_mass = float(-q[q < 0.0].sum())
+    q[q < 0.0] = 0.0
+
+    raw_sum = float(q.sum())
+    residual = 1.0 - raw_sum
+    if abs(residual) > pmf_tolerance:
+        raise RuntimeError(
+            "q_m table does not sum sufficiently close to one: "
+            f"sum={raw_sum:.17g}, residual={residual:.3e}. "
+            "Increase tail_sigma/tail_padding and/or target_digits."
+        )
+
+    # Normalize only at float64 roundoff level so cdf[-1] is exactly one.
+    q /= q.sum()
+    cdf = np.cumsum(q)
+    cdf[-1] = 1.0
+
+    return WFQMTable(
+        tau=tau,
+        q=q,
+        cdf=cdf,
+        raw_sum=raw_sum,
+        clipped_negative_mass=clipped_negative_mass,
+        m_max=m_max,
+        build_seconds=time.perf_counter() - t0,
+    )
+
+
 class fhd_2d:
     '''Defines the 2-D fluctuating hydrodynamics class for simulating the sociohydrodynamic equations including noise and reactions:
 
@@ -416,8 +614,11 @@ class fhd_2d:
                  projection_tol = 1e-14,
                  redistribute_radius=1,
                  redistribute_fallback="global",
-                 use_numba_projection=False,
-                 numba_projection_threads=1,):
+                 use_numba_projection=True,
+                 numba_projection_threads=1,
+                 voter_noise_mode="dcm",
+                 wf_gaussian_threshold=0.025,
+                 wf_target_digits=26,):
         '''
         Initializes instance of the fhd class object
 
@@ -454,14 +655,7 @@ class fhd_2d:
         if bc == "periodic":
             self.x = np.arange(-self.Lx/2, self.Lx/2, self.dx)
             self.y = np.arange(-self.Ly/2, self.Ly/2, self.dy)
-        elif bc == "Neumann":
-            # self.N = (N[0]+1,N[1]+1)
-            # self.Nx += 1
-            # self.Ny += 1
-            # self.x = np.linspace(-self.Lx/2, self.Lx/2, self.Nx)
-            # self.y = np.linspace(-self.Ly/2, self.Ly/2, self.Ny)
-            # self.dx = self.Lx / self.Nx
-            # self.dy = self.Ly / self.Ny     
+        elif bc == "Neumann":    
             self.x = (
                 -self.Lx / 2
                 + (np.arange(self.Nx) + 0.5) * self.dx
@@ -490,10 +684,29 @@ class fhd_2d:
         self.redistribute_radius = redistribute_radius
         self.redistribute_fallback = redistribute_fallback
         self.redistribute_n_iter = 1
-        
 
         self.use_numba_projection = use_numba_projection
         self.numba_projection_threads = numba_projection_threads
+
+        self.voter_noise_mode = voter_noise_mode
+        self.wf_gaussian_threshold = float(wf_gaussian_threshold)
+        self.wf_target_digits = int(wf_target_digits)
+
+        allowed_voter_noise_modes = (
+            "dcm",
+            "wright_fisher",
+        )
+
+        if self.voter_noise_mode not in allowed_voter_noise_modes:
+            raise ValueError(
+                f"voter_noise_mode must be one of "
+                f"{allowed_voter_noise_modes}, "
+                f"got {self.voter_noise_mode}"
+            )
+
+        # Cache q_m tables indexed by tau.
+        # Normally there will only be one entry per run.
+        self._wf_qm_cache = {}
 
         if self.use_numba_projection:
             nb.set_num_threads(self.numba_projection_threads)
@@ -611,6 +824,17 @@ class fhd_2d:
             "n_dcm_absorbed_cells": 0,
 
             "dcm_history": [],
+
+            #Wright-Fisher diagnostics
+            "n_wf_calls": 0,
+            "n_wf_gaussian_calls": 0,
+            "n_wf_exact_calls": 0,
+
+            "n_wf_absorb_zero": 0,
+            "n_wf_absorb_one": 0,
+
+            "n_wf_input_clip_cells": 0,
+            "wf_input_clipped_mass": 0.0,
 
             # Total bookkeeping
             "n_expensive_projection_calls": 0,
@@ -2608,9 +2832,8 @@ class fhd_2d:
     
     def rhs_Voter(self, phi, param, dt, toggle_noise=False, work=None):
         """
-        Voter contribution only:
+        Deterministic Voter contribution only:
             deterministic interdiffusive voter current
-            + demographic voter noise.
 
         The A and B contributions are exactly opposite, so local
         occupied density rho_A + rho_B is conserved by this substep
@@ -2636,42 +2859,367 @@ class fhd_2d:
         voter_rhs[0] = voter_current
         voter_rhs[1] = - voter_current
 
-        # if toggle_noise:
-        #     demo_noise = self.demographic_voter_noise(
-        #         phi,
-        #         work,
-        #         D_v,
-        #         dt,
-        #     )
-
-        #     # Keep this if noise_v is intended as an independent
-        #     # multiplier for voter noise.
-        #     noise_v = param.get("noise_v", 1.0)
-
-        #     voter_rhs[0] += noise_v * demo_noise
-        #     voter_rhs[1] -= noise_v * demo_noise
-
         return voter_rhs
 
-    def demographic_voter_noise(self, phi, work, D_v, dt):
-            '''Compute demographic voter noise contribution'''
-            xi2 = work["xi2"]
-            rho_ab = work["rho_ab"]
-            demo_noise = work["demo_noise"]
+    def _voter_wf_tau(
+        self,
+        D_v,
+        dt,
+        noise_strength=1.0,
+    ):
+        """
+        Dimensionless Wright-Fisher time for one Voter
+        demographic substep.
 
-            self.rng.standard_normal(out=xi2)
-            xi2 *= 1.0 / np.sqrt(self.dx * self.dy)
+        dp = sqrt[p(1-p)] dW_tau
+        """
 
-            # rho_ab = max(phi_A * phi_B, 0)
-            np.multiply(phi[0], phi[1], out=rho_ab)
-            np.maximum(rho_ab, 0.0, out=rho_ab)
+        d = 2
 
-            # demo_noise = sqrt(4 d D_v rho_ab / dt) * xi2
-            np.multiply(rho_ab, 4.0 * 2 * D_v / dt, out=demo_noise)
-            np.sqrt(demo_noise, out=demo_noise)
-            demo_noise *= xi2
-            return demo_noise
+        return (
+            noise_strength**2
+            * 4.0
+            * d
+            * D_v
+            * dt
+            / (self.dx * self.dy)
+        )
 
+    def _get_wf_qm_table(self, tau):
+        """
+        Return cached q_m^0(tau) table.
+
+        Tables are only needed when tau is above the
+        Griffiths-Gaussian threshold.
+        """
+
+        if tau < self.wf_gaussian_threshold:
+            return None
+
+        # Avoid tiny floating point differences generating
+        # duplicate caches.
+        key = round(float(tau), 14)
+
+        table = self._wf_qm_cache.get(key)
+
+        if table is None:
+            print(
+                f"Building Wright-Fisher q_m^0 table "
+                f"for tau={tau:.8g} ..."
+            )
+
+            table = build_qm_table(
+                tau,
+                target_digits=self.wf_target_digits,
+            )
+
+            self._wf_qm_cache[key] = table
+
+            print(
+                f"  m=1..{table.m_max}, "
+                f"sum={table.raw_sum:.17g}"
+            )
+
+        return table
+
+    def _wf_griffiths_moments_zero(self, tau):
+        """
+        Griffiths small-time Gaussian approximation to
+        q_m^0(tau), i.e. theta = 0.
+
+        Returns
+        -------
+        mu, var
+        """
+
+        tau = float(tau)
+
+        if tau <= 0.0:
+            raise ValueError("tau must be positive")
+
+        # Series avoids catastrophic cancellation in the exact
+        # Griffiths expression for small tau.
+        #
+        # theta = 0:
+        #
+        # mu =
+        #   2/tau + 1/2 + tau/24 - tau^3/5760 + ...
+        #
+        # var =
+        #   2/(3 tau)
+        #   - 7 tau/360
+        #   + 41 tau^3/120960
+        #   - 67 tau^5/14515200
+        #   + ...
+
+        mu = (
+            2.0 / tau
+            + 0.5
+            + tau / 24.0
+            - tau**3 / 5760.0
+        )
+
+        var = (
+            2.0 / (3.0 * tau)
+            - 7.0 * tau / 360.0
+            + 41.0 * tau**3 / 120960.0
+            - 67.0 * tau**5 / 14515200.0
+        )
+
+        return mu, var
+
+    def _sample_wf_M_griffiths(
+        self,
+        tau,
+        size,
+    ):
+        """
+        Small-time approximate draw of the ancestral
+        lineage count M_tau.
+        """
+
+        mu, var = self._wf_griffiths_moments_zero(tau)
+
+        M = np.rint(
+            self.rng.normal(
+                loc=mu,
+                scale=np.sqrt(var),
+                size=size,
+            )
+        ).astype(np.int64)
+
+        # Purely defensive. For tau << 1 this should never
+        # actually matter.
+        np.maximum(M, 1, out=M)
+
+        return M
+
+    def _sample_wf_lineage_count(
+        self,
+        tau,
+        size,
+    ):
+        """
+        Draw M ~ q_m^0(tau).
+
+        Small tau:
+            Griffiths Gaussian approximation.
+
+        Larger tau:
+            numerically exact cached q_m^0 table.
+        """
+
+        if tau < self.wf_gaussian_threshold:
+
+            return self._sample_wf_M_griffiths(
+                tau=tau,
+                size=size,
+            )
+
+        table = self._get_wf_qm_table(tau)
+
+        u = self.rng.random(size)
+
+        M = (
+            np.searchsorted(
+                table.cdf,
+                u,
+                side="right",
+            )
+            + 1
+        )
+
+        return M
+
+    def _sample_wright_fisher_transition(
+        self,
+        p,
+        tau,
+    ):
+        """
+        Neutral Wright-Fisher transition
+
+            dp = sqrt[p(1-p)] dW_tau
+
+        using
+
+            M ~ q_m^0(tau)
+            L | M ~ Binomial(M, p)
+
+        followed by the conditional Beta draw.
+
+        Parameters
+        ----------
+        p : 1D ndarray
+            Values strictly inside (0,1).
+
+        tau : float
+
+        Returns
+        -------
+        p_new : ndarray
+            Same shape as p.
+        """
+
+        M = self._sample_wf_lineage_count(
+            tau=tau,
+            size=p.size,
+        )
+
+        L = self.rng.binomial(
+            M,
+            p,
+        )
+
+        p_new = np.empty_like(p)
+
+        at_zero = L == 0
+        at_one = L == M
+
+        interior = ~(at_zero | at_one)
+
+        p_new[at_zero] = 0.0
+        p_new[at_one] = 1.0
+
+        if np.any(interior):
+
+            p_new[interior] = self.rng.beta(
+                L[interior],
+                M[interior] - L[interior],
+            )
+
+        return p_new
+
+    def demographic_voter_step_wright_fisher(
+        self,
+        phi,
+        D_v,
+        dt,
+        noise_strength=1.0,
+        work=None,
+    ):
+        """
+        Wright-Fisher demographic Voter substep.
+
+        Modifies phi in place.
+
+        Local occupancy
+
+            n = rho_A + rho_B
+
+        is exactly conserved.
+
+        The composition
+
+            p = rho_A / n
+
+        follows the neutral Wright-Fisher transition.
+
+        No post-noise projection is required.
+        """
+        if work is None:
+            work = self._ensure_work(phi.dtype)
+
+        diag = work["projection_diag"]
+
+        if D_v <= 0.0 or noise_strength == 0.0:
+            return phi
+
+        A = phi[0]
+        B = phi[1]
+
+        # --------------------------------------------------------
+        # 1. Local occupancy
+        # --------------------------------------------------------
+
+        n = A + B
+
+        occupied = n > 0.0
+
+        if not np.any(occupied):
+            return phi
+
+        # --------------------------------------------------------
+        # 2. Composition p = A / n
+        # --------------------------------------------------------
+
+        p = np.empty(
+            np.count_nonzero(occupied),
+            dtype=np.float64,
+        )
+
+        p[:] = (
+            A[occupied]
+            / n[occupied]
+        )
+
+        # Input cleanup only.
+        #
+        # The Schelling projection should already have made
+        # this physical.
+        np.clip(
+            p,
+            0.0,
+            1.0,
+            out=p,
+        )
+
+        # Cells already exactly absorbed require no random draw.
+        stochastic = (
+            (p > 0.0)
+            & (p < 1.0)
+        )
+
+        if np.any(stochastic):
+
+            tau = self._voter_wf_tau(
+                D_v=D_v,
+                dt=dt,
+                noise_strength=noise_strength,
+            )
+
+            diag["n_wf_calls"] += 1
+
+            if tau < self.wf_gaussian_threshold:
+                diag["n_wf_gaussian_calls"] += 1
+            else:
+                diag["n_wf_exact_calls"] += 1
+
+            old_p = p[stochastic]
+
+            new_p = self._sample_wright_fisher_transition(
+                old_p,
+                tau,
+            )
+
+            diag["n_wf_absorb_zero"] += int(
+                np.count_nonzero(new_p == 0.0)
+            )
+
+            diag["n_wf_absorb_one"] += int(
+                np.count_nonzero(new_p == 1.0)
+            )
+
+            p[stochastic] = new_p
+        # --------------------------------------------------------
+        # 3. Reconstruct densities at fixed occupancy
+        # --------------------------------------------------------
+
+        A[occupied] = (
+            n[occupied]
+            * p
+        )
+
+        # Subtraction gives the best local occupancy conservation.
+        B[occupied] = (
+            n[occupied]
+            - A[occupied]
+        )
+
+        A[~occupied] = 0.0
+        B[~occupied] = 0.0
+
+        return phi
 
     def demographic_voter_step_dcm(
         self,
@@ -3025,6 +3573,53 @@ class fhd_2d:
 
         return phi
 
+    def demographic_voter_step(
+        self,
+        phi,
+        param,
+        dt,
+        work=None,
+        step=None,
+        record_history=False,
+    ):
+        """
+        Dispatch demographic Voter stochastic propagator.
+        """
+
+        D_v = param["D_v"]
+
+        noise_strength = param.get(
+            "noise_v",
+            1.0,
+        )
+
+        if self.voter_noise_mode == "dcm":
+
+            return self.demographic_voter_step_dcm(
+                phi,
+                D_v=D_v,
+                dt=dt,
+                noise_strength=noise_strength,
+                work=work,
+                step=step,
+                record_history=record_history,
+            )
+
+        elif self.voter_noise_mode == "wright_fisher":
+
+            return self.demographic_voter_step_wright_fisher(
+                phi,
+                D_v=D_v,
+                dt=dt,
+                noise_strength=noise_strength,
+                work=work,
+            )
+
+        raise RuntimeError(
+            f"Unknown voter_noise_mode: "
+            f"{self.voter_noise_mode}"
+        )
+
     def rhs_Schelling_2species(self, phi, param, dt, toggle_noise, work=None):
         """Compute RHS of the Schelling part of the equation"""
         if work is None:
@@ -3122,8 +3717,7 @@ class fhd_2d:
         )
 
         return rhs
-
-    
+  
     def w0(self, phi, param):
         D = param["D"]
         beta = param["beta"]
@@ -3171,7 +3765,60 @@ class fhd_2d:
             divJ += dnoise_dx
         
         return divJ
-        
+
+    def prepare_voter_noise(
+        self,
+        param,
+        dt,
+    ):
+        """
+        Prepare cached stochastic objects before a run.
+        """
+
+        if self.voter_noise_mode != "wright_fisher":
+            return
+
+        D_v = param["D_v"]
+
+        noise_strength = param.get(
+            "noise_v",
+            1.0,
+        )
+
+        if D_v <= 0.0 or noise_strength == 0.0:
+            return
+
+        tau = self._voter_wf_tau(
+            D_v=D_v,
+            dt=dt,
+            noise_strength=noise_strength,
+        )
+
+        print(
+            f"Wright-Fisher Voter noise: tau={tau:.8g}"
+        )
+
+        if tau < self.wf_gaussian_threshold:
+
+            mu, var = (
+                self._wf_griffiths_moments_zero(tau)
+            )
+
+            print(
+                "  sampler: Griffiths Gaussian\n"
+                f"  E[M] ~ {mu:.3f}\n"
+                f"  std[M] ~ {np.sqrt(var):.3f}"
+            )
+
+        else:
+
+            table = self._get_wf_qm_table(tau)
+
+            print(
+                "  sampler: q_m^0 table\n"
+                f"  m_max={table.m_max}"
+            )
+
     def step(self, rhs, phi, param, dt, toggle_noise, scheme, work = None, 
              step=None,
              record_projection_history=False,):
@@ -3187,19 +3834,20 @@ class fhd_2d:
                 np.copyto(rho_next, phi)
                 voter_rhs = work["voter_rhs"]
                 if toggle_noise:
-                    self.demographic_voter_step_dcm(
-                        rho_next,
-                        D_v=param["D_v"],
-                        dt=dt,
-                        noise_strength=param.get("noise_v", 1.0),
-                        work=work,
-                        step=step,
-                        record_history=record_projection_history,
-                    )
+                    self.demographic_voter_step(rho_next, 
+                                                     param=param,
+                                                     dt=dt,
+                                                     work=work,
+                                                     step=step,
+                                                     record_history=record_projection_history,)
 
                 # Deterministic Voter current, evaluated AFTER stochastic step.
                 voter_rhs = self.rhs_Voter(rho_next, param, dt, toggle_noise=False, work=work,)
                 rho_next += dt * voter_rhs
+
+                self.project_density(rho_next, work=work, step=step, record_history=record_projection_history, 
+                                     projection_mode="transfer_to_other", stage="voter",)
+
                 return rho_next
 
             elif rhs == self.rhs_SchellingwithVoter:
@@ -3216,22 +3864,19 @@ class fhd_2d:
 
                 # Voter update
                 if toggle_noise:
-                    self.demographic_voter_step_dcm(
-                        rho_next,
-                        D_v=param["D_v"],
-                        dt=dt,
-                        noise_strength=param.get("noise_v", 1.0),
-                        work=work,
-                        step=step,
-                        record_history=record_projection_history,
-                    )
+                    self.demographic_voter_step(rho_next, 
+                                                     param=param,
+                                                     dt=dt,
+                                                     work=work,
+                                                     step=step,
+                                                     record_history=record_projection_history,)
 
                 # Deterministic Voter current, evaluated AFTER stochastic step.
                 voter_rhs = self.rhs_Voter(rho_next, param, dt, toggle_noise=False, work=work,)
                 rho_next += dt * voter_rhs
 
-                # self.project_density(rho_next, work=work, step=step, record_history=record_projection_history, 
-                #                      projection_mode="transfer_to_other", stage="voter",)
+                self.project_density(rho_next, work=work, step=step, record_history=record_projection_history, 
+                                     projection_mode="transfer_to_other", stage="voter",)
 
                 return rho_next
             else:
@@ -3366,12 +4011,21 @@ class fhd_2d:
                 stage="schelling",
             )
 
-            # Voter substep
+            # Voter substep: demographic noise step
+            if noise:
+                self.demographic_voter_step(phi_next, 
+                                                    param=param,
+                                                    dt=dt,
+                                                    work=work,
+                                                    step=step,
+                                                    record_history=record_projection_history,)
+
+            #Deterministic noise update
             rhs_v = self.rhs_Voter(
                 phi_next,
                 param,
                 dt=dt,
-                toggle_noise=noise,
+                toggle_noise=False,
                 work=work,
             )
 
@@ -3450,6 +4104,9 @@ class fhd_2d:
         
         if reset_projection_diag:
             work["projection_diag"] = self._init_projection_diagnostics()
+
+        if toggle_noise and (model=="Voter" or model=="Schelling+Voter"):
+            self.prepare_voter_noise(param,dt,)
 
         phi_current = phi.copy()
 
