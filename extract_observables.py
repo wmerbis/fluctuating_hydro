@@ -32,9 +32,12 @@ Outputs
 Notes
 -----
 - The steady-state window is the last N_AVG snapshots, default 200.
-- Power spectra use the same convention as the previous operations.py:
-  centered fields, raw |FFT|^2 normalization, 3 auto-spectra (A, B, vacancy),
-  and real cross-spectrum G_AB.
+- Power spectra use a 2D orthonormal DCT-II, appropriate for the cell-centered
+  finite-volume Neumann Laplacian. Fields are centered snapshot-by-snapshot.
+- Radial bins use the exact finite-volume eigen-wavenumber
+      k_hat^2 = (2/dx sin(kx dx/2))^2 + (2/dy sin(ky dy/2))^2,
+  with DCT mode labels kx = pi*n/Lx and ky = pi*m/Ly.
+- The spectrum contains 3 auto-spectra (A, B, vacancy) and the AB cross-spectrum.
 - The spectrum is accumulated in chunks to keep memory usage low.
 """
 
@@ -46,6 +49,7 @@ from pathlib import Path
 import sys
 
 import numpy as np
+from scipy.fft import dctn
 
 
 REGIMES = ["segregating", "integrating", "migrating", "well-mixed"]
@@ -55,7 +59,7 @@ N_RUNS = 10
 DEFAULT_L = (50.0, 50.0)
 DEFAULT_NUM_BINS = 60
 DEFAULT_N_AVG = 200
-DEFAULT_FFT_CHUNK = 20
+DEFAULT_DCT_CHUNK = 20
 EPS = 1e-10
 
 
@@ -142,7 +146,7 @@ def late_time_observables(phi: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.n
 # Radially averaged power spectrum
 # ---------------------------------------------------------------------------
 
-def make_radial_bins(
+def make_fv_dct_radial_bins(
     Nx: int,
     Ny: int,
     Lx: float,
@@ -150,32 +154,64 @@ def make_radial_bins(
     num_bins: int,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
-    Match operations.power_spectrum:
-      k_bins = linspace(0, max(k), num_bins)
-      k_centers = midpoint of adjacent edges
+    Construct radial bins using the eigenvalues of the cell-centered
+    second-order finite-volume Neumann Laplacian.
+
+    For a DCT-II mode n = 0,...,N-1,
+
+        k_n = pi*n/L,
+
+    while the corresponding finite-volume eigen-wavenumber is
+
+        k_hat_n = (2/dx) sin(k_n dx/2)
+                = (2/dx) sin(pi*n/(2N)).
+
+    The 2D radial coordinate is
+
+        k_hat = sqrt(k_hat_x**2 + k_hat_y**2).
 
     Returns
     -------
     k_centers : (num_bins-1,)
-    bin_index : flattened bin index for every Fourier mode; -1 means excluded
-    mode_count : number of Fourier modes in each radial bin
+        Radial finite-volume eigen-wavenumber bin centers.
+    bin_index : (Nx*Ny,)
+        Flattened radial-bin index for every DCT mode; -1 means excluded.
+    mode_count : (num_bins-1,)
+        Number of DCT modes in each radial bin.
     """
     dx, dy = Lx / Nx, Ly / Ny
-    kx = np.fft.fftfreq(Nx, d=dx) * 2.0 * np.pi
-    ky = np.fft.fftfreq(Ny, d=dy) * 2.0 * np.pi
-    KX, KY = np.meshgrid(kx, ky, indexing="ij")
-    k = np.sqrt(KX**2 + KY**2)
 
-    edges = np.linspace(0.0, np.max(k), num_bins)
+    nx = np.arange(Nx, dtype=np.float64)
+    ny = np.arange(Ny, dtype=np.float64)
+
+    # Continuum labels of the Neumann/DCT-II modes.
+    kx = np.pi * nx / Lx
+    ky = np.pi * ny / Ly
+
+    # Exact eigen-wavenumbers of the second-order FV Neumann Laplacian.
+    kx_hat = (2.0 / dx) * np.sin(0.5 * kx * dx)
+    ky_hat = (2.0 / dy) * np.sin(0.5 * ky * dy)
+
+    KX_hat, KY_hat = np.meshgrid(kx_hat, ky_hat, indexing="ij")
+    k_hat = np.sqrt(KX_hat**2 + KY_hat**2)
+
+    edges = np.linspace(0.0, np.max(k_hat), num_bins)
     centers = 0.5 * (edges[1:] + edges[:-1])
 
-    # side='right' reproduces [edge_i, edge_{i+1}) bins.
-    idx = np.searchsorted(edges, k.ravel(), side="right") - 1
+    # Match the old [edge_i, edge_{i+1}) convention.
+    idx = np.searchsorted(edges, k_hat.ravel(), side="right") - 1
 
-    # The old code excludes k == max(k) because the last comparison is "<".
-    valid = (idx >= 0) & (idx < len(centers)) & (k.ravel() < edges[-1])
-    bin_index = np.full(k.size, -1, dtype=np.int16)
-    bin_index[valid] = idx[valid].astype(np.int16)
+    # Exclude exactly the largest corner mode, as the previous code excluded
+    # k == max(k) through its strict upper-bin comparison.
+    valid = (
+        (idx >= 0)
+        & (idx < len(centers))
+        & (k_hat.ravel() < edges[-1])
+    )
+
+    bin_dtype = np.int16 if len(centers) < np.iinfo(np.int16).max else np.int32
+    bin_index = np.full(k_hat.size, -1, dtype=bin_dtype)
+    bin_index[valid] = idx[valid].astype(bin_dtype)
 
     mode_count = np.bincount(
         bin_index[bin_index >= 0],
@@ -191,7 +227,7 @@ def radial_average_from_mode_sum(
     mode_count: np.ndarray,
     n_snapshots: int,
 ) -> np.ndarray:
-    """Radially average a time-summed Fourier quantity."""
+    """Radially average a time-summed DCT quantity."""
     flat = np.asarray(mode_sum, dtype=np.float64).ravel()
     valid = bin_index >= 0
     sums = np.bincount(
@@ -210,31 +246,37 @@ def power_spectrum_chunked(
     phi: np.ndarray,
     L: tuple[float, float],
     num_bins: int = DEFAULT_NUM_BINS,
-    chunk_size: int = DEFAULT_FFT_CHUNK,
+    chunk_size: int = DEFAULT_DCT_CHUNK,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
-    Equivalent in convention to operations.power_spectrum(...,
-    averaged=True, centered=True), but processes the time axis in chunks.
+    Compute the late-time Neumann power spectrum in chunks using a 2D DCT-II.
+
+    The DCT uses ``norm="ortho"`` and the radial coordinate is the exact
+    finite-volume eigen-wavenumber k_hat of the cell-centered second-order
+    Neumann Laplacian.
 
     Parameters
     ----------
     phi : ndarray/memmap, shape (2,T,Nx,Ny)
     L : (Lx, Ly)
     num_bins : number of radial bin edges (returns num_bins-1 centers)
-    chunk_size : snapshots per FFT batch
+    chunk_size : snapshots per DCT batch
 
     Returns
     -------
     k_centers       : (K,)
-    power_spectra   : (3,K), for A, B, vacancy
+        Radial FV eigen-wavenumber k_hat.
+    power_spectra   : (3,K)
+        DCT auto-spectra for A, B, vacancy.
     G_AB            : (K,)
+        DCT AB cross-spectrum.
     """
     if phi.ndim != 4 or phi.shape[0] != 2:
         raise ValueError(f"Expected phi shape (2,T,Nx,Ny), got {phi.shape}")
 
     _, T, Nx, Ny = phi.shape
     Lx, Ly = L
-    k_centers, bin_index, mode_count = make_radial_bins(
+    k_centers, bin_index, mode_count = make_fv_dct_radial_bins(
         Nx, Ny, Lx, Ly, num_bins
     )
 
@@ -249,18 +291,21 @@ def power_spectrum_chunked(
         B = np.array(phi[1, start:stop], dtype=np.float64, copy=True)
         O = 1.0 - A - B
 
+        # Remove the spatially constant DCT mode independently per snapshot.
         A -= A.mean(axis=(1, 2), keepdims=True)
         B -= B.mean(axis=(1, 2), keepdims=True)
         O -= O.mean(axis=(1, 2), keepdims=True)
 
-        A_k = np.fft.fft2(A, axes=(1, 2))
-        B_k = np.fft.fft2(B, axes=(1, 2))
-        O_k = np.fft.fft2(O, axes=(1, 2))
+        # DCT-II diagonalizes the cell-centered FV Neumann Laplacian.
+        A_k = dctn(A, type=2, axes=(1, 2), norm="ortho")
+        B_k = dctn(B, type=2, axes=(1, 2), norm="ortho")
+        O_k = dctn(O, type=2, axes=(1, 2), norm="ortho")
 
-        ps_mode_sum[0] += np.sum(np.abs(A_k) ** 2, axis=0)
-        ps_mode_sum[1] += np.sum(np.abs(B_k) ** 2, axis=0)
-        ps_mode_sum[2] += np.sum(np.abs(O_k) ** 2, axis=0)
-        gab_mode_sum += np.sum((np.conjugate(A_k) * B_k).real, axis=0)
+        # DCT coefficients are real for real input fields.
+        ps_mode_sum[0] += np.sum(A_k**2, axis=0)
+        ps_mode_sum[1] += np.sum(B_k**2, axis=0)
+        ps_mode_sum[2] += np.sum(O_k**2, axis=0)
+        gab_mode_sum += np.sum(A_k * B_k, axis=0)
 
     ps = np.vstack([
         radial_average_from_mode_sum(ps_mode_sum[a], bin_index, mode_count, T)
@@ -701,8 +746,14 @@ def build_parser():
         help="Physical y-length (default: 50)"
     )
     p.add_argument(
-        "--fft-chunk", type=int, default=DEFAULT_FFT_CHUNK,
-        help="Snapshots per FFT batch (default: 20)"
+        "--dct-chunk", "--fft-chunk",
+        dest="fft_chunk",
+        type=int,
+        default=DEFAULT_DCT_CHUNK,
+        help=(
+            "Snapshots per DCT batch (default: 20). "
+            "--fft-chunk is retained as a backwards-compatible alias."
+        ),
     )
     p.add_argument(
         "--mass-chunk", type=int, default=64,
