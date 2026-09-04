@@ -418,7 +418,7 @@ def power_spectrum_dct_2d(
     centered=True,
     num_bins=50,
     averaged=True,
-    use_lattice_k=False,
+    use_lattice_k=True,
 ):
     """
     2D power spectrum using the DCT appropriate for cell-centered
