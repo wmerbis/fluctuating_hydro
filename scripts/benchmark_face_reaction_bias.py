@@ -37,7 +37,7 @@ DT = 1e-3
 NO_FRAMES = 100
 
 N = (128, 128)
-L = (128.0, 128.0)
+L = (50, 50)
 BC = "Neumann"
 
 D = np.array([0.1, 0.1])
@@ -65,6 +65,9 @@ MODES = (
     "face_reaction",
     "face_reaction_biased",
 )
+
+OUTPUT_DIR = Path("benchmark_face_reaction_bias")
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 
 # ============================================================
@@ -294,7 +297,6 @@ def plot_observable(results, obs_name):
         x = results[mode][:, :, j]
         mean = x.mean(axis=0)
         sem = x.std(axis=0, ddof=1) / np.sqrt(N_RUNS)
-
         ax.plot(times, mean, label=mode)
         ax.fill_between(times, mean - sem, mean + sem, alpha=0.2)
 
@@ -303,20 +305,24 @@ def plot_observable(results, obs_name):
     ax.legend()
     fig.tight_layout()
 
+    fig.savefig(OUTPUT_DIR / f"{obs_name}_timeseries.png", dpi=200)
+    plt.close(fig)
+
 
 def plot_final_distributions(results):
     for obs_name in ("dissimilarity", "var_pol", "var_0"):
         j = OBS_NAMES.index(obs_name)
 
         fig, ax = plt.subplots()
-
         data = [results[mode][:, -1, j] for mode in MODES]
-        ax.boxplot(data, labels=MODES)
 
+        ax.boxplot(data, tick_labels=MODES)
         ax.set_ylabel(obs_name)
         ax.set_title(f"Final {obs_name}")
         fig.tight_layout()
 
+        fig.savefig(OUTPUT_DIR / f"{obs_name}_final_distribution.png", dpi=200)
+        plt.close(fig)
 
 # ============================================================
 # SAVE
@@ -324,7 +330,7 @@ def plot_final_distributions(results):
 
 def save_results(results, runtimes):
     np.savez_compressed(
-        "face_reaction_bias_benchmark.npz",
+        OUTPUT_DIR / "face_reaction_bias_benchmark.npz",
         face_reaction=results["face_reaction"],
         face_reaction_biased=results["face_reaction_biased"],
         runtime_face_reaction=runtimes["face_reaction"],
@@ -372,7 +378,7 @@ def main():
     plot_final_distributions(results)
     save_results(results, runtimes)
 
-    plt.show()
+    # plt.show()
 
 
 if __name__ == "__main__":

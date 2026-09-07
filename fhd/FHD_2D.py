@@ -618,7 +618,8 @@ class fhd_2d:
                  numba_projection_threads=1,
                  voter_noise_mode="dcm",
                  wf_gaussian_threshold=0.025,
-                 wf_target_digits=26,):
+                 wf_target_digits=26,
+                 reaction_diagnostic=True):
         '''
         Initializes instance of the fhd class object
 
@@ -692,7 +693,7 @@ class fhd_2d:
         allowed_schelling_fluxes = ("collocated",
                                     "finite_volume",
                                     "face_reaction", 
-                                    "face_reaction_biased")
+                                    "face_reaction_biased", "face_reaction_linear_bias")
 
         if self.schelling_flux not in allowed_schelling_fluxes:
             raise ValueError(
@@ -701,7 +702,7 @@ class fhd_2d:
                 f"got {self.schelling_flux}"
             )
 
-        if self.schelling_flux in ("face_reaction", "face_reaction_biased"):
+        if self.schelling_flux in ("face_reaction", "face_reaction_biased", "face_reaction_linear_bias"):
             if self.bc != "Neumann":
                 raise ValueError(
                     "schelling_flux='face_reaction' is currently "
@@ -722,6 +723,9 @@ class fhd_2d:
         self.voter_noise_mode = voter_noise_mode
         self.wf_gaussian_threshold = float(wf_gaussian_threshold)
         self.wf_target_digits = int(wf_target_digits)
+
+        self.reaction_diagnostics = reaction_diagnostic
+        self.detailed_reaction_diag = True
 
         allowed_voter_noise_modes = (
             "dcm",
@@ -777,7 +781,7 @@ class fhd_2d:
         self.Dx = makeD(self.Nx, self.dx, self.bc)
         self.Dy = makeD(self.Ny, self.dy, self.bc)
         if not fft:
-            if (bc == "Neumann" and schelling_flux in ("finite_volume","face_reaction","face_reaction_biased")):
+            if bc == "Neumann":
                 self.D2x = makeD2_fv_neumann(self.Nx, self.dx)
                 self.D2y = makeD2_fv_neumann(self.Ny, self.dy)
             else:
@@ -787,8 +791,14 @@ class fhd_2d:
             self.D3x = makeD3(self.Nx, self.dx, self.bc)
             self.D3y = makeD3(self.Ny, self.dy, self.bc)
 
-        if schelling_flux in  ("face_reaction", "face_reaction_biased"):
+        if schelling_flux in  ("face_reaction", "face_reaction_biased", "face_reaction_linear_bias"):
             self._reaction_face_colors = (self._build_neumann_reaction_face_colors())
+
+        #Temp timing diagnostics
+        self._setup_gather = 0.
+        self._timing_poisson = 0.
+        self._timing_Mge2loop = 0.
+        self._timing_update = 0.
 
     def _init_projection_diagnostics(self):
         return {
@@ -880,6 +890,8 @@ class fhd_2d:
             "n_schelling_M0_faces": 0,
             "n_schelling_M1_faces": 0,
             "n_schelling_Mge2_faces": 0,
+            "n_schelling_negative_linear_rates": 0,
+            "min_schelling_linear_bias": 0.0,
 
             # Total bookkeeping
             "n_expensive_projection_calls": 0,
@@ -895,11 +907,11 @@ class fhd_2d:
     def _ensure_work(self, dtype=np.float64):
         shape2 = (self.nspecies,) + self.N
         shape_vec = (2, self.nspecies) + self.N
-
         needs_new = (
             not hasattr(self, "_work")
             or self._work["divJ"].dtype != dtype
         )
+        max_faces = ((max(self.N) + 1) // 2) * max(self.N)
 
         if needs_new:
             self._work = {
@@ -911,6 +923,7 @@ class fhd_2d:
                 "flux": np.empty(shape_vec, dtype=dtype),
                 "div_dUdx": np.empty(shape2, dtype=dtype),
                 "divJ": np.empty(shape2, dtype=dtype),
+                "reaction_rate": np.empty(max_faces, dtype = dtype),
                 "passive_rhs": np.empty(shape2, dtype=dtype),
                 "voter_current": np.empty(self.N, dtype=dtype),
                 "voter_rhs": np.empty(shape2, dtype=dtype),
@@ -970,105 +983,105 @@ class fhd_2d:
     def set_seed(self, seed):
         self.rng = np.random.default_rng(seed)
 
-    def _build_neumann_reaction_face_colors(self):
-        """
-        Build disjoint interior face sets for conservative reaction updates.
+    # def _build_neumann_reaction_face_colors(self):
+    #     """
+    #     Build disjoint interior face sets for conservative reaction updates.
 
-        For Neumann BCs there are no wrap faces.
+    #     For Neumann BCs there are no wrap faces.
 
-        Returns
-        -------
-        dict
-            {
-                "x": [(left0, right0), (left1, right1)],
-                "y": [(left0, right0), (left1, right1)],
-            }
+    #     Returns
+    #     -------
+    #     dict
+    #         {
+    #             "x": [(left0, right0), (left1, right1)],
+    #             "y": [(left0, right0), (left1, right1)],
+    #         }
 
-        Each left/right object is a tuple of integer index arrays:
-            (i_array, j_array)
+    #     Each left/right object is a tuple of integer index arrays:
+    #         (i_array, j_array)
 
-        Within each color no cell occurs in more than one face.
-        """
-        if self.bc != "Neumann":
-            raise ValueError(
-                "_build_neumann_reaction_face_colors is only "
-                "implemented for Neumann boundary conditions."
-            )
+    #     Within each color no cell occurs in more than one face.
+    #     """
+    #     if self.bc != "Neumann":
+    #         raise ValueError(
+    #             "_build_neumann_reaction_face_colors is only "
+    #             "implemented for Neumann boundary conditions."
+    #         )
 
-        Nx, Ny = self.Nx, self.Ny
+    #     Nx, Ny = self.Nx, self.Ny
 
-        x_colors = []
-        y_colors = []
+    #     x_colors = []
+    #     y_colors = []
 
-        # --------------------------------------------------------------
-        # x-faces
-        #
-        # Interior face starting positions:
-        #   i = 0,...,Nx-2
-        #
-        # color 0:
-        #   (0,1), (2,3), ...
-        #
-        # color 1:
-        #   (1,2), (3,4), ...
-        # --------------------------------------------------------------
-        for parity in (0, 1):
+    #     # --------------------------------------------------------------
+    #     # x-faces
+    #     #
+    #     # Interior face starting positions:
+    #     #   i = 0,...,Nx-2
+    #     #
+    #     # color 0:
+    #     #   (0,1), (2,3), ...
+    #     #
+    #     # color 1:
+    #     #   (1,2), (3,4), ...
+    #     # --------------------------------------------------------------
+    #     for parity in (0, 1):
 
-            starts = np.arange(
-                parity,
-                Nx - 1,
-                2,
-                dtype=np.int64,
-            )
+    #         starts = np.arange(
+    #             parity,
+    #             Nx - 1,
+    #             2,
+    #             dtype=np.int64,
+    #         )
 
-            iL = np.repeat(starts, Ny)
-            jL = np.tile(
-                np.arange(Ny, dtype=np.int64),
-                starts.size,
-            )
+    #         iL = np.repeat(starts, Ny)
+    #         jL = np.tile(
+    #             np.arange(Ny, dtype=np.int64),
+    #             starts.size,
+    #         )
 
-            iR = iL + 1
-            jR = jL.copy()
+    #         iR = iL + 1
+    #         jR = jL.copy()
 
-            x_colors.append(
-                (
-                    (iL, jL),
-                    (iR, jR),
-                )
-            )
+    #         x_colors.append(
+    #             (
+    #                 (iL, jL),
+    #                 (iR, jR),
+    #             )
+    #         )
 
-        # --------------------------------------------------------------
-        # y-faces
-        # --------------------------------------------------------------
-        for parity in (0, 1):
+    #     # --------------------------------------------------------------
+    #     # y-faces
+    #     # --------------------------------------------------------------
+    #     for parity in (0, 1):
 
-            starts = np.arange(
-                parity,
-                Ny - 1,
-                2,
-                dtype=np.int64,
-            )
+    #         starts = np.arange(
+    #             parity,
+    #             Ny - 1,
+    #             2,
+    #             dtype=np.int64,
+    #         )
 
-            iL = np.repeat(
-                np.arange(Nx, dtype=np.int64),
-                starts.size,
-            )
-            jL = np.tile(starts, Nx)
+    #         iL = np.repeat(
+    #             np.arange(Nx, dtype=np.int64),
+    #             starts.size,
+    #         )
+    #         jL = np.tile(starts, Nx)
 
-            iR = iL.copy()
-            jR = jL + 1
+    #         iR = iL.copy()
+    #         jR = jL + 1
 
-            y_colors.append(
-                (
-                    (iL, jL),
-                    (iR, jR),
-                )
-            )
+    #         y_colors.append(
+    #             (
+    #                 (iL, jL),
+    #                 (iR, jR),
+    #             )
+    #         )
 
-        return {
-            "x": x_colors,
-            "y": y_colors,
-        }
+    #     return {
+    #         "x": x_colors,
+    #         "y": y_colors,
+    #     }
 
     def _get_reaction_face_colors(self):
         """
@@ -1080,6 +1093,18 @@ class fhd_2d:
             )
 
         return self._reaction_face_colors
+    
+    def _build_neumann_reaction_face_colors(self):
+        """Build the two disjoint face colors in each direction using slices."""
+        all_ = slice(None)
+
+        x0 = ((slice(0, -1, 2), all_), (slice(1, None, 2), all_))
+        x1 = ((slice(1, -1, 2), all_), (slice(2, None, 2), all_))
+
+        y0 = ((all_, slice(0, -1, 2)), (all_, slice(1, None, 2)))
+        y1 = ((all_, slice(1, -1, 2)), (all_, slice(2, None, 2)))
+
+        return {"x": [x0, x1], "y": [y0, y1]}
 
     def _shift2d(self, arr, di, dj, fill_value=0.0):
         """
@@ -2821,7 +2846,7 @@ class fhd_2d:
             work=work,
         )
 
-        return ou
+        return out
     def schelling_fv_flux_periodic(self, phi, phi0, U, param, work):
         """
         Compute face fluxes for div(M grad U), periodic BCs.
@@ -3037,11 +3062,10 @@ class fhd_2d:
 
         return out
 
-    def _directed_face_reaction_vectorized(self, phi, species, source, target, D_a, delta, dt, h, 
-                                           U=None, beta=0.0, diag=None):
+    def _directed_face_reaction_vectorized(self, phi, phi0, species, source, target, D_a, delta, dt, h,
+                                        U=None, beta=0.0, work = None, diag=None):
         """
-        Exact uniformization sampler for many NON-OVERLAPPING
-        directed face reactions
+        Exact uniformization sampler for many NON-OVERLAPPING directed face reactions
 
             a_source + 0_target -> 0_source + a_target
 
@@ -3050,19 +3074,23 @@ class fhd_2d:
         Fast paths
         ----------
         M = 0:
-            no event.
+            No event.
 
         M = 1:
-            exactly one accepted event, because the first
-            uniformization candidate has acceptance probability 1.
+            Exactly one accepted event, because the first uniformization
+            candidate has acceptance probability R0 / R0 = 1.
 
         M >= 2:
-            first event is accepted exactly, then only these faces
+            The first event is accepted exactly, then only these rare faces
             enter the state-dependent accept/reject loop.
 
         Parameters
         ----------
         phi : ndarray, shape (2, Nx, Ny)
+            Species density fields.
+
+        phi0 : ndarray, shape (Nx, Ny)
+            Vacancy density field. This is updated consistently together with phi.
 
         species : int
             Species index, 0 or 1.
@@ -3071,8 +3099,9 @@ class fhd_2d:
             (i_array, j_array) for source and target cells.
 
             IMPORTANT:
-            The face collection must be disjoint: each cell may occur
-            at most once in the collection.
+            The face collection must be disjoint: each cell may occur at most
+            once in the collection. This ensures that all reactions in the
+            vectorized batch can be updated simultaneously without conflicts.
 
         D_a : float
             Schelling diffusion coefficient for species a.
@@ -3088,302 +3117,217 @@ class fhd_2d:
         h : float
             Microscopic lattice spacing.
 
+        U : ndarray or None
+            Optional utility field. If None, the reaction is unbiased/passive.
+
+        beta : float
+            Utility bias strength.
+
         diag : dict or None
-            Optional diagnostics dictionary.
+            Optional reaction diagnostics dictionary. If None, expensive
+            diagnostic reductions are skipped.
+
+        detailed_diag : bool
+            If True, additionally compute absorption diagnostics. These require
+            extra full-array operations and should normally be disabled in
+            production runs.
 
         Returns
         -------
-        tuple
-            (
-                total_events,
-                total_candidates,
-                max_candidates,
-                n_M0,
-                n_M1,
-                n_Mge2,
-            )
+        None
+            The species and vacancy fields are updated in place. Diagnostics,
+            when enabled, are accumulated directly into diag.
         """
 
-        iS, jS = source
-        iT, jT = target
+        ti = time.perf_counter()
+        # iS, jS = source
+        # iT, jT = target
+        # nfaces = iS.size
 
-        nfaces = iS.size
-
-        if (
-            nfaces == 0
-            or dt <= 0.0
-            or D_a <= 0.0
-        ):
-            return 0, 0, 0, nfaces, 0, 0
-
-        # ==============================================================
-        # Microscopic scale
-        # ==============================================================
-
+        # Microscopic density quantum and corresponding directed reaction prefactor.
         omega = self.cell_area / (h * h)
         epsilon = 1.0 / omega
+        rate_prefactor = D_a * omega / (delta * delta)
 
-        rate_prefactor = (
-            D_a * omega / (delta * delta)
-        )
+        # Advanced indexing creates compact arrays containing the source particles
+        # and target vacancies for all non-overlapping faces in this batch.
+        source_view = phi[(species,) + source]
+        target_view = phi[(species,) + target]
+        source_vac_view = phi0[source]
+        target_vac_view = phi0[target]
 
-        # ==============================================================
-        # Initial reactants
-        # ==============================================================
+        # face_shape = source_view.shape
+        nfaces = source_view.size
 
-        # Advanced indexing already creates new arrays;
-        # no explicit .copy() needed.
-        source_a0 = phi[
-            species,
-            iS,
-            jS,
-        ]
+        # Copies used by the sampler; keep the existing 1D algorithm unchanged.
+        # source_a0 = np.array(source_view, copy=True).reshape(-1)
+        # target_vac0 = np.array(target_vac_view, copy=True).reshape(-1)
 
-        target_vac0 = (
-            1.0
-            - phi[0, iT, jT]
-            - phi[1, iT, jT]
-        )
+        if nfaces == 0 or dt <= 0.0 or D_a <= 0.0:
+            return
 
-        if np.any(source_a0 < -self.projection_tol):
-            raise RuntimeError(
-                "Negative source density before directed "
-                "Schelling reaction."
-            )
+        # Safety checks. These can later be made optional if profiling shows that
+        # the two full-array reductions are significant in production.
+        if np.any(source_view < -self.projection_tol):
+            raise RuntimeError("Negative source density before directed Schelling reaction.")
 
-        if np.any(target_vac0 < -self.projection_tol):
-            raise RuntimeError(
-                "Negative target vacancy before directed "
-                "Schelling reaction."
-            )
+        if np.any(target_view < -self.projection_tol):
+            raise RuntimeError("Negative target vacancy before directed Schelling reaction.")
 
-        # Only remove tiny roundoff negatives.
-        source_a0 = np.maximum(source_a0, 0.0,)
+        # Remove only tiny roundoff negatives before converting available density
+        # # into a maximum number of microscopic transfers.
+        # np.maximum(source_a0, 0.0, out=source_a0)
+        # np.maximum(target_vac0, 0.0, out=target_vac0)
 
-        target_vac0 = np.maximum(target_vac0, 0.0,)
+        # Only one event needs to be possible initially.
+        reactive = (source_view  >= epsilon) & (target_view >= epsilon)
 
-        # ==============================================================
-        # Maximum possible number of microscopic transfers
-        # ==============================================================
 
-        min_reactant = np.minimum(source_a0, target_vac0,)
-        max_events = np.floor(min_reactant / epsilon + 1e-12).astype(np.int64)
-        reactive = max_events > 0
+        # min_reactant = np.minimum(source_a0, target_vac0)
+        # max_events = np.floor(min_reactant / epsilon + 1e-12).astype(np.int64)
 
-        # ==============================================================
         # Initial uniformization rate
         #
-        # R0 =
+        #     R0 = D_a Omega / delta^2 * rho_source^a rho_target^0.
         #
-        #   D_a Omega / delta^2
-        #   * rho_source^a rho_target^0
-        # ==============================================================
+        # For non-reactive faces the rate is set exactly to zero.
+        rate0 = work["reaction_rate"][:source_view.size].reshape(source_view.shape)
+        np.multiply(source_view, target_vac_view, out=rate0)
+        rate0 *= rate_prefactor * dt
+        rate0[~reactive] = 0.0
 
-        product0 = (source_a0 * target_vac0)
-        rate0 = np.zeros(nfaces,dtype=float,)
-        rate0[reactive] = rate_prefactor * product0[reactive]
-
+        # Optional utility-dependent bias. This pathway is retained for testing;
+        # the standard face_reaction mode enters here with U=None.
         if U is not None and beta != 0.0:
-            dU = U[species, iT, jT] - U[species, iS, jS]
-            bias = 1.0 + np.tanh(0.5 * beta * dU)
-            rate0 *= bias
+            dU = U[(species,) + target] - U[(species,) + source]
 
-        # ==============================================================
-        # Draw candidate-event counts
-        # ==============================================================
+            if self.schelling_flux == "face_reaction_biased":
+                rate0 *= 1.0 + np.tanh(0.5 * beta * dU)
 
-        n_candidates = self.rng.poisson(rate0 * dt)
-        total_candidates = int( n_candidates.sum())
-        max_candidates = (int(n_candidates.max()) if n_candidates.size else 0 )
+            elif self.schelling_flux == "face_reaction_linear_bias":
+                bias = 1.0 + 0.5 * beta * dU
+                invalid = bias < 0.0
 
-        n_M0 = int( np.count_nonzero(n_candidates == 0))
-        n_M1 = int(np.count_nonzero(n_candidates == 1))
-        many_mask = (n_candidates >= 2)
-        n_Mge2 = int(np.count_nonzero(many_mask))
+                if np.any(invalid):
+                    if diag is not None:
+                        diag["n_schelling_negative_linear_rates"] += int(np.count_nonzero(invalid))
+                        diag["min_schelling_linear_bias"] = min(diag["min_schelling_linear_bias"], float(np.min(bias)))
 
-        # ==============================================================
-        # No candidates anywhere
-        # ==============================================================
+                    raise RuntimeError(f"Negative linear Schelling reaction rate encountered: min bias = {bias.min():.6e}")
 
-        if max_candidates == 0:
+                rate0 *= bias
 
-            if diag is not None:
-                diag["n_schelling_reaction_calls"] = (diag.get("n_schelling_reaction_calls", 0,) + 1)
-                diag["n_schelling_candidates"] = (diag.get("n_schelling_candidates",0,))
-                diag["n_schelling_M0_faces"] = (diag.get("n_schelling_M0_faces",0,)+ n_M0)
+            else:
+                raise ValueError(f"Unknown reaction bias mode '{self.schelling_flux}'")
 
-            return (0,0,0,n_M0,n_M1,n_Mge2,)
+        self._setup_gather += time.perf_counter() - ti
 
-        # ==============================================================
-        # FAST PATH:
-        #
-        # M = 0 -> 0 events
-        #
-        # M >= 1 -> first uniformization candidate is accepted
-        #           with probability exactly R0/R0 = 1.
-        #
-        # So M = 1 is now completely finished.
-        # ==============================================================
+        # Convert rates to Poisson means in place, avoiding a temporary rate0 * dt.
+        t0 = time.perf_counter()
+        n_candidates = self.rng.poisson(rate0)
+        self._timing_poisson += time.perf_counter() - t0
 
-        n_events = np.zeros(
-            nfaces,
-            dtype=np.int64,
-        )
+        # M >= 1 means the first uniformization candidate exists and is accepted
+        # exactly, since its acceptance probability is R0 / R0 = 1.
+        one_or_more = n_candidates >= 1
+        n_events = one_or_more.astype(np.int64)
 
-        one_or_more = (
-            n_candidates >= 1
-        )
+        # Only faces with at least two Poisson candidates require any further work.
+        many_mask = n_candidates >= 2
+        candidates_many = n_candidates[many_mask]
 
-        n_events[one_or_more] = 1
 
-        # ==============================================================
-        # Only M >= 2 faces require further work
-        # ==============================================================
+        t1 = time.perf_counter()
+        if candidates_many.size:
+            source0_many = source_view[many_mask]
+            vacancy0_many = target_vac_view[many_mask]
 
-        if n_Mge2 > 0:
+            # product0 is only needed for the rare M >= 2 acceptance calculation,
+            # so compute it here rather than over every face.
+            product0_many = source0_many * vacancy0_many
 
-            idx_many = np.flatnonzero(
-                many_mask
-            )
+            # Compute capacity only for M >= 2 faces.
+            max_events_many = np.floor(np.minimum(source0_many, vacancy0_many) / epsilon + 1e-12).astype(np.int64)
 
-            candidates_many = (
-                n_candidates[idx_many]
-            )
+            # State after the guaranteed first accepted event.
+            source_many = source0_many - epsilon
+            vacancy_many = vacancy0_many - epsilon
+            events_many = np.ones(candidates_many.size, dtype=np.int64)
 
-            max_events_many = (
-                max_events[idx_many]
-            )
+            # Only the rare M >= 2 subset requires this reduction.
+            max_candidates_many = int(candidates_many.max())
 
-            product0_many = (
-                product0[idx_many]
-            )
+            # candidate_index = 1 processes candidate number 2.
+            # Candidate number 1 has already been accepted exactly above.
+            for candidate_index in range(1, max_candidates_many):
+                active_idx = np.flatnonzero((candidates_many > candidate_index) & (events_many < max_events_many))
 
-            # State after the guaranteed first event.
-            source_many = (
-                source_a0[idx_many]
-                - epsilon
-            )
-
-            vacancy_many = (
-                target_vac0[idx_many]
-                - epsilon
-            )
-
-            events_many = np.ones(
-                idx_many.size,
-                dtype=np.int64,
-            )
-
-            max_candidates_many = int(
-                candidates_many.max()
-            )
-
-            # ----------------------------------------------------------
-            # candidate_index = 1 means:
-            #
-            #   process candidate number 2
-            #
-            # Candidate number 1 was already accepted exactly above.
-            # ----------------------------------------------------------
-
-            for candidate_index in range(
-                1,
-                max_candidates_many,
-            ):
-
-                active = (
-                    (candidates_many > candidate_index)
-                    & (
-                        events_many
-                        < max_events_many
-                    )
-                )
-
-                if not np.any(active):
+                if active_idx.size == 0:
                     break
 
-                active_idx = np.flatnonzero(
-                    active
-                )
+                # Uniformization acceptance probability:
+                #
+                #     p = R_current / R0
+                #       = rho_source rho_vacancy / product0.
+                current_product = source_many[active_idx] * vacancy_many[active_idx]
+                p_accept = current_product / product0_many[active_idx]
+                
+                accepted_local = self.rng.random(active_idx.size) < p_accept
+                accepted_idx = active_idx[accepted_local]
 
-                current_product = (
-                    source_many[active_idx]
-                    * vacancy_many[active_idx]
-                )
-
-                p_accept = (
-                    current_product
-                    / product0_many[active_idx]
-                )
-
-                # Only guards against machine roundoff.
-                p_accept = np.clip(
-                    p_accept,
-                    0.0,
-                    1.0,
-                )
-
-                accepted_local = (self.rng.random(active_idx.size) < p_accept)
-
-                if not np.any(accepted_local):
+                if accepted_idx.size == 0:
                     continue
 
-                accepted_idx = (active_idx[accepted_local])
-
                 events_many[accepted_idx] += 1
-
                 source_many[accepted_idx] -= epsilon
-
                 vacancy_many[accepted_idx] -= epsilon
 
-            # Copy the rare-face event totals back into the
-            # full face array.
-            n_events[idx_many] = events_many
+            # Copy event totals for the rare M >= 2 faces back into the full array.
+            n_events[many_mask] = events_many
 
-        # ==============================================================
-        # Map event counts back to density transfer
-        # ==============================================================
+        self._timing_Mge2loop += time.perf_counter() - t1
 
-        transfer = (epsilon * n_events.astype(float))
+        tf = time.perf_counter()
+        # Convert microscopic event counts to density transfer and update both the
+        # species and vacancy fields consistently.
+        transfer = epsilon * n_events
 
-        # Since this is a disjoint face color, no index occurs twice.
-        phi[species,iS,jS,] -= transfer
+        source_view -= transfer
+        target_view += transfer
+        source_vac_view += transfer
+        target_vac_view -= transfer
 
-        phi[species,iT,jT,] += transfer
-
-        # ==============================================================
-        # Diagnostics
-        # ==============================================================
-
-        total_events = int(
-            n_events.sum()
-        )
-
+        # Diagnostics are deliberately kept outside the numerical hot path.
+        # When diag=None, all global sums/counts/maxima below are skipped.
         if diag is not None:
-            diag["n_schelling_reaction_calls"] = (diag.get("n_schelling_reaction_calls",0,)+ 1)
-            diag["n_schelling_candidates"] = (diag.get("n_schelling_candidates",0,)+ total_candidates)
-            diag["n_schelling_events"] = (diag.get("n_schelling_events", 0,)+ total_events)
-            diag["max_schelling_candidates"] = max(diag.get("max_schelling_candidates",0,),max_candidates,)
-            diag["n_schelling_M0_faces"] = (diag.get("n_schelling_M0_faces",0,)+ n_M0)
-            diag["n_schelling_M1_faces"] = (diag.get("n_schelling_M1_faces",0,)+ n_M1)
-            diag["n_schelling_Mge2_faces"] = (diag.get("n_schelling_Mge2_faces",0,)+ n_Mge2)
+            total_candidates = int(n_candidates.sum())
+            total_events = int(n_events.sum())
+            max_candidates = int(n_candidates.max())
 
-            # Optional absorption diagnostics.
-            source_final = (source_a0 - transfer)
-            vacancy_final = (target_vac0 - transfer)
+            # Reuse masks already constructed by the sampler where possible.
+            n_active = int(np.count_nonzero(one_or_more))
+            n_Mge2 = int(many_mask.size)
+            n_M1 = n_active - n_Mge2
+            n_M0 = nfaces - n_active
 
-            reacted = (n_events > 0)
+            diag["n_schelling_reaction_calls"] += 1
+            diag["n_schelling_candidates"] += total_candidates
+            diag["n_schelling_events"] += total_events
+            diag["max_schelling_candidates"] = max(diag["max_schelling_candidates"], max_candidates)
+            diag["n_schelling_M0_faces"] += n_M0
+            diag["n_schelling_M1_faces"] += n_M1
+            diag["n_schelling_Mge2_faces"] += n_Mge2
 
-            diag["n_schelling_absorbed_source"] = (diag.get("n_schelling_absorbed_source",0,)
-                + int(np.count_nonzero(reacted & (source_final < epsilon))))
+            # More expensive diagnostics used mainly during validation.
+            if self.detailed_reaction_diag:
+                reacted = n_events > 0
+                diag["n_schelling_absorbed_source"] += int(np.count_nonzero(reacted & (source_view < epsilon)))
+                diag["n_schelling_absorbed_vacancy"] += int(np.count_nonzero(reacted & (target_vac_view < epsilon)))
+        self._timing_update += time.perf_counter() - tf
+        return
 
-            diag["n_schelling_absorbed_vacancy"] = (diag.get("n_schelling_absorbed_vacancy",0,)
-                + int(np.count_nonzero(reacted & (vacancy_final< epsilon))))
-
-        return (total_events,total_candidates,max_candidates,n_M0,n_M1,n_Mge2,)
-
-    def _reaction_face_color_strang(self, phi, species, left, right, D_a, delta, dt, h, 
-                                    U=None, beta=0.0, reverse=False, diag=None):
+    def _reaction_face_color_strang(self, phi, phi0, species, left, right, D_a, delta, dt, h, 
+                                    U=None, beta=0.0, reverse=False, work= None, diag=None):
         """
         Strang split the two directed reactions on one disjoint face color.
 
@@ -3400,8 +3344,9 @@ class fhd_2d:
 
         if not reverse:
 
-            s1 = self._directed_face_reaction_vectorized(
+            self._directed_face_reaction_vectorized(
                 phi=phi,
+                phi0=phi0,
                 species=species,
                 source=left,
                 target=right,
@@ -3411,11 +3356,13 @@ class fhd_2d:
                 h=h,
                 U=U,
                 beta = beta,
+                work=work,
                 diag=diag,
             )
 
-            s2 = self._directed_face_reaction_vectorized(
+            self._directed_face_reaction_vectorized(
                 phi=phi,
+                phi0=phi0,
                 species=species,
                 source=right,
                 target=left,
@@ -3425,11 +3372,13 @@ class fhd_2d:
                 h=h,
                 U=U,
                 beta = beta,
+                work=work,
                 diag=diag,
             )
 
-            s3 = self._directed_face_reaction_vectorized(
+            self._directed_face_reaction_vectorized(
                 phi=phi,
+                phi0=phi0,
                 species=species,
                 source=left,
                 target=right,
@@ -3439,13 +3388,15 @@ class fhd_2d:
                 h=h,
                 U=U,
                 beta = beta,
+                work=work,
                 diag=diag,
             )
 
         else:
 
-            s1 = self._directed_face_reaction_vectorized(
+            self._directed_face_reaction_vectorized(
                 phi=phi,
+                phi0=phi0,
                 species=species,
                 source=right,
                 target=left,
@@ -3455,11 +3406,13 @@ class fhd_2d:
                 h=h,               
                 U=U,
                 beta = beta,
+                work=work,
                 diag=diag,
             )
 
-            s2 = self._directed_face_reaction_vectorized(
+            self._directed_face_reaction_vectorized(
                 phi=phi,
+                phi0=phi0,
                 species=species,
                 source=left,
                 target=right,
@@ -3469,11 +3422,13 @@ class fhd_2d:
                 h=h,
                 U=U,
                 beta = beta,
+                work=work,
                 diag=diag,
             )
 
-            s3 = self._directed_face_reaction_vectorized(
+            self._directed_face_reaction_vectorized(
                 phi=phi,
+                phi0=phi0,
                 species=species,
                 source=right,
                 target=left,
@@ -3483,22 +3438,15 @@ class fhd_2d:
                 h=h,
                 U=U,
                 beta = beta,
+                work=work,
                 diag=diag,
             )
-
-        # Aggregate useful statistics.
-        return (
-            s1[0] + s2[0] + s3[0],   # events
-            s1[1] + s2[1] + s3[1],   # candidates
-            max(s1[2], s2[2], s3[2]),
-            s1[3] + s2[3] + s3[3],   # M=0
-            s1[4] + s2[4] + s3[4],   # M=1
-            s1[5] + s2[5] + s3[5],   # M>=2
-        )
+        return
 
     def _reaction_face_color_lie(
         self,
         phi,
+        phi0,
         species,
         left,
         right,
@@ -3509,6 +3457,7 @@ class fhd_2d:
         U=None,
         beta = 0.0,
         reverse=False,
+        work=None,
         diag=None,
     ):
         """
@@ -3519,8 +3468,9 @@ class fhd_2d:
 
         if not reverse:
 
-            s1 = self._directed_face_reaction_vectorized(
+            self._directed_face_reaction_vectorized(
                 phi=phi,
+                phi0=phi0,
                 species=species,
                 source=left,
                 target=right,
@@ -3530,11 +3480,13 @@ class fhd_2d:
                 h=h,
                 U=U,
                 beta=beta,
+                work=work,
                 diag=diag,
             )
 
-            s2 = self._directed_face_reaction_vectorized(
+            self._directed_face_reaction_vectorized(
                 phi=phi,
+                phi0=phi0,
                 species=species,
                 source=right,
                 target=left,
@@ -3544,13 +3496,15 @@ class fhd_2d:
                 h=h,
                 U=U,
                 beta=beta,
+                work=work,
                 diag=diag,
             )
 
         else:
 
-            s1 = self._directed_face_reaction_vectorized(
+            self._directed_face_reaction_vectorized(
                 phi=phi,
+                phi0=phi0,
                 species=species,
                 source=right,
                 target=left,
@@ -3560,11 +3514,13 @@ class fhd_2d:
                 h=h,
                 U=U,
                 beta=beta,
+                work=work,
                 diag=diag,
             )
 
-            s2 = self._directed_face_reaction_vectorized(
+            self._directed_face_reaction_vectorized(
                 phi=phi,
+                phi0=phi0,
                 species=species,
                 source=left,
                 target=right,
@@ -3574,20 +3530,14 @@ class fhd_2d:
                 h=h,
                 U=U,
                 beta=beta,
+                work=work,
                 diag=diag,
             )
+        
+        return
 
-        return (
-            s1[0] + s2[0],
-            s1[1] + s2[1],
-            max(s1[2], s2[2]),
-            s1[3] + s2[3],
-            s1[4] + s2[4],
-            s1[5] + s2[5],
-        )
-
-    def _passive_reaction_2d_species(self, phi, species, D_a, dt, h, U=None, beta=0.0, 
-                                     reverse_sweep=False, reverse_direction=False, diag=None):
+    def _passive_reaction_2d_species(self, phi, phi0, species, D_a, dt, h, U=None, beta=0.0, 
+                                     reverse_sweep=False, reverse_direction=False, work=None, diag=None):
         """
         Apply passive Schelling hopping for one species across all
         interior Neumann faces.
@@ -3643,18 +3593,11 @@ class fhd_2d:
         if reverse_sweep:
             sequence = sequence[::-1]
 
-        total_events = 0
-        total_candidates = 0
-        max_candidates = 0
-
-        total_M0 = 0
-        total_M1 = 0
-        total_Mge2 = 0
-
         for left, right, delta in sequence:
 
-            stats = self._reaction_face_color_lie(
+            self._reaction_face_color_lie(
                 phi=phi,
+                phi0=phi0,
                 species=species,
                 left=left,
                 right=right,
@@ -3665,28 +3608,11 @@ class fhd_2d:
                 U=U,
                 beta=beta,
                 reverse=reverse_direction,
+                work=work,
                 diag=diag,
             )
-
-            total_events += stats[0]
-            total_candidates += stats[1]
-            max_candidates = max(
-                max_candidates,
-                stats[2],
-            )
-
-            total_M0 += stats[3]
-            total_M1 += stats[4]
-            total_Mge2 += stats[5]
-
-        return (
-            total_events,
-            total_candidates,
-            max_candidates,
-            total_M0,
-            total_M1,
-            total_Mge2,
-        )
+        
+        return
 
     def _passive_schelling_reaction_step(self, phi, param, dt, step_index=0, work=None, biased=False):
         """
@@ -3710,7 +3636,11 @@ class fhd_2d:
         D = np.asarray(param["D"], dtype=float)
         h = param.get("h", np.sqrt(self.dx * self.dy))
         beta = float(param["beta"]) if biased else 0.0
-        diag = work.get("projection_diag", None)
+
+        diag = work["projection_diag"] if self.reaction_diagnostics else None
+        phi0 = work["phi0"]
+        np.add(phi[0], phi[1], out=phi0)
+        np.subtract(1.0, phi0, out=phi0)
 
         U = None
         if biased:
@@ -3725,16 +3655,11 @@ class fhd_2d:
         max_candidates = 0
 
         for species in species_order:
-            stats = self._passive_reaction_2d_species(phi, species, D[species], dt, h, U=U, beta=beta, reverse_sweep=reverse, reverse_direction=reverse, diag=diag)
-            total_events += stats[0]
-            total_candidates += stats[1]
-            max_candidates = max(max_candidates, stats[2])
-            total_M0 += stats[3]
-            total_M1 += stats[4]
-            total_Mge2 += stats[5]
+            self._passive_reaction_2d_species(phi, phi0, species, D[species], dt, h, U=U, beta=beta, 
+                                              reverse_sweep=reverse, reverse_direction=reverse, work=work, diag=diag)
 
-        return {"events": total_events, "candidates": total_candidates, "max_candidates": max_candidates, "M0": total_M0, "M1": total_M1, "Mge2": total_Mge2}
-
+        return 
+    
     def rhs_Vitelli(self, phi, param, dt, toggle_noise):
         """Compute RHS of the equation"""
 
@@ -4597,7 +4522,7 @@ class fhd_2d:
 
             self.div2d(flux, out=div_dUdx)
 
-        elif self.schelling_flux in ("finite_volume", "face_reaction","face_reaction_biased"):
+        elif self.schelling_flux in ("finite_volume", "face_reaction","face_reaction_biased", "face_reaction_linear_bias"):
             U = self.utility_from_lap(
                 phi,
                 lap_phi,
@@ -4619,7 +4544,7 @@ class fhd_2d:
                 f"Unknown schelling_flux option: {self.schelling_flux}"
             )
 
-        if self.schelling_flux in ("face_reaction", "face_reaction_biased"):
+        if self.schelling_flux in ("face_reaction", "face_reaction_biased", "face_reaction_linear_bias"):
 
             # --------------------------------------------------------------
             # Passive diffusion is NOT included here.
@@ -4654,7 +4579,7 @@ class fhd_2d:
             divJ[1] *= D[1]
         
         """Generate stochastic flux term ∂x( rho ξ )"""
-        if  (toggle_noise and self.schelling_flux != ("face_reaction", "face_reaction_biased")):
+        if  (toggle_noise and self.schelling_flux != ("face_reaction", "face_reaction_biased", "face_reaction_linear_bias")):
             # Conservative Schelling/mobility noise as face fluxes
             self.conservative_face_noise_flux(phi, phi0, param, dt, work)
 
@@ -4667,6 +4592,24 @@ class fhd_2d:
 
             divJ += work["dnoise_dx"]
         
+        return divJ
+
+    def rhs_Schelling_utility_fv(self, phi, phi0, param, work):
+        """Utility-only FV Schelling drift for the face-reaction pathway."""
+        lap_phi = work["lap_phi"]
+        div_dUdx = work["div_dUdx"]
+        divJ = work["divJ"]
+
+        self.lapl(phi, out=lap_phi)
+        U = self.utility_from_lap(phi, lap_phi, param, work)
+        self.schelling_fv_div_M_grad_U(phi, phi0, U, param, work, out=div_dUdx)
+
+        D = param["D"]
+        beta = param["beta"]
+
+        np.multiply(div_dUdx[0], -beta * D[0], out=divJ[0])
+        np.multiply(div_dUdx[1], -beta * D[1], out=divJ[1])
+
         return divJ
 
     def rhs_SchellingwithVoter(self, phi, param, dt, toggle_noise, work=None):
@@ -4794,7 +4737,6 @@ class fhd_2d:
 
         rho_next = work["phi_next"]
 
-
         if scheme == "FE":
             if rhs == self.rhs_Voter:
                 np.copyto(rho_next, phi)
@@ -4816,8 +4758,7 @@ class fhd_2d:
 
                 return rho_next
 
-            elif rhs == self.rhs_SchellingwithVoter:
-                voter_rhs = work["voter_rhs"]
+            elif (rhs == self.rhs_SchellingwithVoter or rhs == self.rhs_Vitelli):
                 schelling_rhs = work["divJ"]
 
                 # ==============================================================
@@ -4829,18 +4770,20 @@ class fhd_2d:
                 if self.schelling_flux == "face_reaction":
                     if toggle_noise:
                         # Unbiased reaction update for passive drift + conservative noise
-                        self._passive_schelling_reaction_step(rho_next, param, dt, step_index=step, work=work, 
-                                                              biased=False)
+                        self._passive_schelling_reaction_step(rho_next, param, dt, step_index=step, work=work)
+                        phi0 = work["phi0"]  # already kept current by the reaction sampler
+                        schelling_rhs = self.rhs_Schelling_utility_fv(rho_next, phi0, param, work)
+                        rho_next += dt * schelling_rhs
                     else:
                         # Deterministic FE integration of passive drift
                         self.schelling_fv_passive_rhs_neumann(rho_next, param, work, out=work["passive_rhs"])
                         rho_next += dt * work["passive_rhs"]
 
-                    # Add the utility flux
-                    schelling_rhs = self.rhs_Schelling_2species(rho_next, param, dt, toggle_noise=False, work=work)
-                    rho_next += dt * schelling_rhs
+                        # Add the utility flux
+                        schelling_rhs = self.rhs_Schelling_2species(rho_next, param, dt, toggle_noise=False, work=work)
+                        rho_next += dt * schelling_rhs
 
-                elif self.schelling_flux == "face_reaction_biased":
+                elif self.schelling_flux in ("face_reaction_biased", "face_reaction_linear_bias"):
                     if toggle_noise:
                         # Biased reaction rates for both utility flux and passive drift + cons. noise
                         self._passive_schelling_reaction_step(rho_next, param, dt, step_index=step, work=work,
@@ -4882,122 +4825,23 @@ class fhd_2d:
                 )
 
                 # Voter update
-                if toggle_noise:
-                    self.demographic_voter_step(rho_next, 
-                                                     param=param,
-                                                     dt=dt,
-                                                     work=work,
-                                                     step=step,
-                                                     record_history=record_projection_history,)
+                if rhs == self.rhs_SchellingwithVoter:
+                    if toggle_noise:
+                        self.demographic_voter_step(rho_next, 
+                                                        param=param,
+                                                        dt=dt,
+                                                        work=work,
+                                                        step=step,
+                                                        record_history=record_projection_history,)
 
-                # Deterministic Voter current, evaluated AFTER stochastic step.
-                voter_rhs = self.rhs_Voter(rho_next, param, dt, toggle_noise=False, work=work,)
-                rho_next += dt * voter_rhs
+                    # Deterministic Voter current, evaluated AFTER stochastic step.
+                    voter_rhs = self.rhs_Voter(rho_next, param, dt, toggle_noise=False, work=work,)
+                    rho_next += dt * voter_rhs
 
-                self.project_density(rho_next, work=work, step=step, record_history=record_projection_history, 
-                                     projection_mode="transfer_to_other", stage="voter",)
+                    self.project_density(rho_next, work=work, step=step, record_history=record_projection_history, 
+                                        projection_mode="transfer_to_other", stage="voter",)
 
                 return rho_next
-            elif rhs == self.rhs_Vitelli:
-                schelling_rhs = work["divJ"]
-
-                # ==============================================================
-                # Schelling update
-                # ==============================================================
-
-                np.copyto(
-                    rho_next,
-                    phi,
-                )
-
-                if self.schelling_flux == "face_reaction":
-
-                    # ----------------------------------------------------------
-                    # Passive Schelling transport
-                    # ----------------------------------------------------------
-                    if toggle_noise:
-
-                        # Exact directed-reaction face process.
-                        #
-                        # Contains BOTH:
-                        #   - passive deterministic hopping drift
-                        #   - corresponding conservative fluctuations
-                        #
-                        self._passive_schelling_reaction_step(
-                            rho_next,
-                            param,
-                            dt,
-                            step_index=(
-                                0 if step is None else step
-                            ),
-                            work=work,
-                        )
-
-                    else:
-
-                        # Noise disabled:
-                        # retain the deterministic mean passive FV current.
-                        passive_rhs = work["passive_rhs"]
-
-                        self.schelling_fv_passive_rhs_neumann(
-                            rho_next,
-                            param,
-                            work,
-                            out=passive_rhs,
-                        )
-
-                        rho_next += (
-                            dt * passive_rhs
-                        )
-
-                    # ----------------------------------------------------------
-                    # Utility / Gamma drift.
-                    #
-                    # In face_reaction mode rhs_Schelling_2species contains
-                    # ONLY this contribution.
-                    #
-                    # Evaluate it after the passive reaction step, analogous to
-                    # the existing stochastic-first Voter split.
-                    # ----------------------------------------------------------
-                    schelling_rhs = self.rhs_Schelling_2species(
-                        rho_next,
-                        param,
-                        dt,
-                        toggle_noise=False,
-                        work=work,
-                    )
-
-                    rho_next += (
-                        dt * schelling_rhs
-                    )
-
-                else:
-
-                    # ----------------------------------------------------------
-                    # Existing collocated / finite_volume behavior
-                    # ----------------------------------------------------------
-                    schelling_rhs = self.rhs_Schelling_2species(
-                        phi,
-                        param,
-                        dt,
-                        toggle_noise,
-                        work,
-                    )
-
-                    rho_next += (
-                        dt * schelling_rhs
-                    )
-
-
-                # Existing projection remains here.
-                self.project_density(
-                    rho_next,
-                    work=work,
-                    step=step,
-                    record_history=record_projection_history,
-                    projection_mode="redistribute",
-                    stage="schelling",
-                )                
             
             else:
                 dphidt = rhs(phi, param, dt, toggle_noise, work)
@@ -5263,7 +5107,8 @@ class fhd_2d:
             )
 
             if model == "Vitelli":
-                phi_current = self.step(self.rhs_Vitelli, phi_current, param, dt, toggle_noise, scheme)
+                phi_current = self.step(self.rhs_Vitelli, phi_current, param, dt, toggle_noise, scheme,
+                                        work = work, step = n, record_projection_history=record_projection_history)
             elif model == "Voter":
                 phi_current = self.step(self.rhs_Voter, phi_current, param, dt, toggle_noise, scheme, 
                                         work = work, 
