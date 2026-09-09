@@ -794,12 +794,6 @@ class fhd_2d:
         if schelling_flux in  ("face_reaction", "face_reaction_biased", "face_reaction_linear_bias"):
             self._reaction_face_colors = (self._build_neumann_reaction_face_colors())
 
-        #Temp timing diagnostics
-        self._setup_gather = 0.
-        self._timing_poisson = 0.
-        self._timing_Mge2loop = 0.
-        self._timing_update = 0.
-
     def _init_projection_diagnostics(self):
         return {
             "n_calls": 0,
@@ -982,106 +976,6 @@ class fhd_2d:
         
     def set_seed(self, seed):
         self.rng = np.random.default_rng(seed)
-
-    # def _build_neumann_reaction_face_colors(self):
-    #     """
-    #     Build disjoint interior face sets for conservative reaction updates.
-
-    #     For Neumann BCs there are no wrap faces.
-
-    #     Returns
-    #     -------
-    #     dict
-    #         {
-    #             "x": [(left0, right0), (left1, right1)],
-    #             "y": [(left0, right0), (left1, right1)],
-    #         }
-
-    #     Each left/right object is a tuple of integer index arrays:
-    #         (i_array, j_array)
-
-    #     Within each color no cell occurs in more than one face.
-    #     """
-    #     if self.bc != "Neumann":
-    #         raise ValueError(
-    #             "_build_neumann_reaction_face_colors is only "
-    #             "implemented for Neumann boundary conditions."
-    #         )
-
-    #     Nx, Ny = self.Nx, self.Ny
-
-    #     x_colors = []
-    #     y_colors = []
-
-    #     # --------------------------------------------------------------
-    #     # x-faces
-    #     #
-    #     # Interior face starting positions:
-    #     #   i = 0,...,Nx-2
-    #     #
-    #     # color 0:
-    #     #   (0,1), (2,3), ...
-    #     #
-    #     # color 1:
-    #     #   (1,2), (3,4), ...
-    #     # --------------------------------------------------------------
-    #     for parity in (0, 1):
-
-    #         starts = np.arange(
-    #             parity,
-    #             Nx - 1,
-    #             2,
-    #             dtype=np.int64,
-    #         )
-
-    #         iL = np.repeat(starts, Ny)
-    #         jL = np.tile(
-    #             np.arange(Ny, dtype=np.int64),
-    #             starts.size,
-    #         )
-
-    #         iR = iL + 1
-    #         jR = jL.copy()
-
-    #         x_colors.append(
-    #             (
-    #                 (iL, jL),
-    #                 (iR, jR),
-    #             )
-    #         )
-
-    #     # --------------------------------------------------------------
-    #     # y-faces
-    #     # --------------------------------------------------------------
-    #     for parity in (0, 1):
-
-    #         starts = np.arange(
-    #             parity,
-    #             Ny - 1,
-    #             2,
-    #             dtype=np.int64,
-    #         )
-
-    #         iL = np.repeat(
-    #             np.arange(Nx, dtype=np.int64),
-    #             starts.size,
-    #         )
-    #         jL = np.tile(starts, Nx)
-
-    #         iR = iL.copy()
-    #         jR = jL + 1
-
-    #         y_colors.append(
-    #             (
-    #                 (iL, jL),
-    #                 (iR, jR),
-    #             )
-    #         )
-
-    #     return {
-    #         "x": x_colors,
-    #         "y": y_colors,
-    #     }
 
     def _get_reaction_face_colors(self):
         """
@@ -2926,11 +2820,24 @@ class fhd_2d:
         )
 
         return out
-        
+
     def conservative_face_noise_flux(self, phi, phi0, param, dt, work):
         """
         Fill work["noise_flux_x"] and work["noise_flux_y"] with conservative
         stochastic fluxes on cell faces.
+
+        The face mobility is the cross-cell species-vacancy mobility
+
+            M_f^a = 1/2 * (
+                rho_L^a rho_R^0
+                + rho_R^a rho_L^0
+            ).
+
+        This is the same face mobility that follows from the infinitesimal
+        covariance of the exact passive face-reaction process. Therefore the
+        Gaussian FV noise and the face-reaction scheme have the same
+        semi-discrete second moment; they differ only in the finite-time
+        stochastic statistics and boundary treatment.
 
         Periodic:
             noise_flux_x shape = (nspecies, Nx, Ny)
@@ -2939,12 +2846,15 @@ class fhd_2d:
         Neumann:
             noise_flux_x shape = (nspecies, Nx+1, Ny)
             noise_flux_y shape = (nspecies, Nx, Ny+1)
-            boundary normal fluxes are set to zero.
+            boundary normal fluxes are zero.
         """
         D = param["D"]
         h = param.get("h", np.sqrt(self.dx * self.dy))
 
-        rho_center = work["rho_center"]
+        # rho_center is retained as a reusable scratch array. It is no longer
+        # literally the cell-centered mobility in this implementation.
+        scratch = work["rho_center"]
+
         amp_x = work["noise_amp_x"]
         amp_y = work["noise_amp_y"]
         flux_x = work["noise_flux_x"]
@@ -2952,30 +2862,110 @@ class fhd_2d:
 
         inv_sqrt_cell = 1.0 / np.sqrt(self.dx * self.dy)
 
-        # rho_center[a] = phi[a] * phi0
-        np.multiply(phi, phi0[np.newaxis, :, :], out=rho_center)
-
         if self.bc == "periodic":
-            # x-faces: average center mobility between i and i+1
-            amp_x[:, :-1, :] = 0.5 * (rho_center[:, :-1, :] + rho_center[:, 1:, :])
-            amp_x[:, -1, :] = 0.5 * (rho_center[:, -1, :] + rho_center[:, 0, :])
 
-            # y-faces: average center mobility between j and j+1
-            amp_y[:, :, :-1] = 0.5 * (rho_center[:, :, :-1] + rho_center[:, :, 1:])
-            amp_y[:, :, -1] = 0.5 * (rho_center[:, :, -1] + rho_center[:, :, 0])
+            # ------------------------------------------------------------
+            # x-faces between cells i and i+1:
+            #
+            # M_x = 1/2 (
+            #     rho_a[i]   rho_0[i+1]
+            #   + rho_a[i+1] rho_0[i]
+            # )
+            # ------------------------------------------------------------
+
+            np.multiply(
+                phi[:, :-1, :],
+                phi0[np.newaxis, 1:, :],
+                out=amp_x[:, :-1, :],
+            )
+
+            np.multiply(
+                phi[:, 1:, :],
+                phi0[np.newaxis, :-1, :],
+                out=scratch[:, :-1, :],
+            )
+
+            amp_x[:, :-1, :] += scratch[:, :-1, :]
+            amp_x[:, :-1, :] *= 0.5
+
+            # Periodic wrap face: last cell <-> first cell.
+            amp_x[:, -1, :] = 0.5 * (
+                phi[:, -1, :] * phi0[np.newaxis, 0, :]
+                + phi[:, 0, :] * phi0[np.newaxis, -1, :]
+            )
+
+            # ------------------------------------------------------------
+            # y-faces between cells j and j+1.
+            # ------------------------------------------------------------
+
+            np.multiply(
+                phi[:, :, :-1],
+                phi0[np.newaxis, :, 1:],
+                out=amp_y[:, :, :-1],
+            )
+
+            np.multiply(
+                phi[:, :, 1:],
+                phi0[np.newaxis, :, :-1],
+                out=scratch[:, :, :-1],
+            )
+
+            amp_y[:, :, :-1] += scratch[:, :, :-1]
+            amp_y[:, :, :-1] *= 0.5
+
+            # Periodic wrap face.
+            amp_y[:, :, -1] = 0.5 * (
+                phi[:, :, -1] * phi0[np.newaxis, :, 0]
+                + phi[:, :, 0] * phi0[np.newaxis, :, -1]
+            )
 
         elif self.bc == "Neumann":
-            # Interior x-faces
-            amp_x[:, 1:-1, :] = 0.5 * (rho_center[:, :-1, :] + rho_center[:, 1:, :])
 
-            # Boundary x-faces: no normal flux
+            # ------------------------------------------------------------
+            # Interior x-faces.
+            #
+            # amp_x[:, i, :] with i=1,...,Nx-1 lies between cells
+            # i-1 and i.
+            # ------------------------------------------------------------
+
+            np.multiply(
+                phi[:, :-1, :],
+                phi0[np.newaxis, 1:, :],
+                out=amp_x[:, 1:-1, :],
+            )
+
+            np.multiply(
+                phi[:, 1:, :],
+                phi0[np.newaxis, :-1, :],
+                out=scratch[:, :-1, :],
+            )
+
+            amp_x[:, 1:-1, :] += scratch[:, :-1, :]
+            amp_x[:, 1:-1, :] *= 0.5
+
+            # No normal stochastic flux through Neumann boundaries.
             amp_x[:, 0, :] = 0.0
             amp_x[:, -1, :] = 0.0
 
-            # Interior y-faces
-            amp_y[:, :, 1:-1] = 0.5 * (rho_center[:, :, :-1] + rho_center[:, :, 1:])
+            # ------------------------------------------------------------
+            # Interior y-faces.
+            # ------------------------------------------------------------
 
-            # Boundary y-faces: no normal flux
+            np.multiply(
+                phi[:, :, :-1],
+                phi0[np.newaxis, :, 1:],
+                out=amp_y[:, :, 1:-1],
+            )
+
+            np.multiply(
+                phi[:, :, 1:],
+                phi0[np.newaxis, :, :-1],
+                out=scratch[:, :, :-1],
+            )
+
+            amp_y[:, :, 1:-1] += scratch[:, :, :-1]
+            amp_y[:, :, 1:-1] *= 0.5
+
             amp_y[:, :, 0] = 0.0
             amp_y[:, :, -1] = 0.0
 
@@ -2984,16 +2974,23 @@ class fhd_2d:
                 f"Conservative face noise not implemented for bc={self.bc}"
             )
 
-        # Apply floor before sqrt
+        # Roundoff guard before sqrt. For a physical input state the cross
+        # mobility is non-negative. This only protects against tiny numerical
+        # excursions from the simplex.
         np.maximum(amp_x, 0.0, out=amp_x)
         np.maximum(amp_y, 0.0, out=amp_y)
 
-        # Draw standard normals directly into the flux arrays
+        # Draw standard normals directly into the flux buffers.
         self.rng.standard_normal(out=flux_x)
         self.rng.standard_normal(out=flux_y)
 
-        # Convert amp arrays from mobility to full noise amplitude.
-        # amp <- h * sqrt(2 D_a amp / dt) / sqrt(dx dy)
+        # Convert mobility to stochastic flux amplitude:
+        #
+        #     h sqrt(2 D_a M_f / dt) / sqrt(dx dy).
+        #
+        # After multiplication by dt and application of the FV divergence,
+        # this gives the same infinitesimal cell covariance as the face
+        # reaction process.
         for a in range(self.nspecies):
             amp_x[a] *= 2.0 * D[a] / dt
             amp_y[a] *= 2.0 * D[a] / dt
@@ -3008,11 +3005,12 @@ class fhd_2d:
             flux_y[a] *= amp_y[a]
 
         if self.bc == "Neumann":
-            # Make this explicit even though amplitudes are already zero there.
+            # Explicitly enforce zero normal stochastic flux.
             flux_x[:, 0, :] = 0.0
             flux_x[:, -1, :] = 0.0
             flux_y[:, :, 0] = 0.0
             flux_y[:, :, -1] = 0.0
+
 
     def div_face_flux(self, flux_x, flux_y, out, work):
         """
@@ -3139,7 +3137,6 @@ class fhd_2d:
             when enabled, are accumulated directly into diag.
         """
 
-        ti = time.perf_counter()
         # iS, jS = source
         # iT, jT = target
         # nfaces = iS.size
@@ -3182,10 +3179,6 @@ class fhd_2d:
         # Only one event needs to be possible initially.
         reactive = (source_view  >= epsilon) & (target_view >= epsilon)
 
-
-        # min_reactant = np.minimum(source_a0, target_vac0)
-        # max_events = np.floor(min_reactant / epsilon + 1e-12).astype(np.int64)
-
         # Initial uniformization rate
         #
         #     R0 = D_a Omega / delta^2 * rho_source^a rho_target^0.
@@ -3195,6 +3188,7 @@ class fhd_2d:
         np.multiply(source_view, target_vac_view, out=rate0)
         rate0 *= rate_prefactor * dt
         rate0[~reactive] = 0.0
+        np.maximum(rate0, 0.0, out=rate0)
 
         # Optional utility-dependent bias. This pathway is retained for testing;
         # the standard face_reaction mode enters here with U=None.
@@ -3220,12 +3214,20 @@ class fhd_2d:
             else:
                 raise ValueError(f"Unknown reaction bias mode '{self.schelling_flux}'")
 
-        self._setup_gather += time.perf_counter() - ti
-
         # Convert rates to Poisson means in place, avoiding a temporary rate0 * dt.
-        t0 = time.perf_counter()
-        n_candidates = self.rng.poisson(rate0)
-        self._timing_poisson += time.perf_counter() - t0
+        try:
+            n_candidates = self.rng.poisson(rate0)
+        except ValueError:
+            print("Poisson failure diagnostics")
+            print("  min source =", np.nanmin(source_view))
+            print("  min target vacancy =", np.nanmin(target_vac_view))
+            print("  min rate0 =", np.nanmin(rate0))
+            print("  max rate0 =", np.nanmax(rate0))
+            print("  any NaN source =", np.isnan(source_view).any())
+            print("  any NaN vacancy =", np.isnan(target_vac_view).any())
+            print("  any NaN rate =", np.isnan(rate0).any())
+            print("  max local occupancy =", np.nanmax(phi.sum(axis=0)))
+            raise
 
         # M >= 1 means the first uniformization candidate exists and is accepted
         # exactly, since its acceptance probability is R0 / R0 = 1.
@@ -3236,8 +3238,6 @@ class fhd_2d:
         many_mask = n_candidates >= 2
         candidates_many = n_candidates[many_mask]
 
-
-        t1 = time.perf_counter()
         if candidates_many.size:
             source0_many = source_view[many_mask]
             vacancy0_many = target_vac_view[many_mask]
@@ -3285,9 +3285,7 @@ class fhd_2d:
             # Copy event totals for the rare M >= 2 faces back into the full array.
             n_events[many_mask] = events_many
 
-        self._timing_Mge2loop += time.perf_counter() - t1
 
-        tf = time.perf_counter()
         # Convert microscopic event counts to density transfer and update both the
         # species and vacancy fields consistently.
         transfer = epsilon * n_events
@@ -3306,7 +3304,7 @@ class fhd_2d:
 
             # Reuse masks already constructed by the sampler where possible.
             n_active = int(np.count_nonzero(one_or_more))
-            n_Mge2 = int(many_mask.size)
+            n_Mge2 = int(np.count_nonzero(many_mask))
             n_M1 = n_active - n_Mge2
             n_M0 = nfaces - n_active
 
@@ -3323,7 +3321,6 @@ class fhd_2d:
                 reacted = n_events > 0
                 diag["n_schelling_absorbed_source"] += int(np.count_nonzero(reacted & (source_view < epsilon)))
                 diag["n_schelling_absorbed_vacancy"] += int(np.count_nonzero(reacted & (target_vac_view < epsilon)))
-        self._timing_update += time.perf_counter() - tf
         return
 
     def _reaction_face_color_strang(self, phi, phi0, species, left, right, D_a, delta, dt, h, 
