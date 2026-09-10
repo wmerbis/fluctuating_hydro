@@ -139,8 +139,8 @@ L = simulator.L
 
 dt = 1e-3
 nsteps = 2_000_000
-noise = False
-frames = 800
+noise = True
+frames = 1000
 
 
 def run_simulation(param_set):
@@ -150,10 +150,13 @@ def run_simulation(param_set):
         seed = (100*regimes.index(regime) + 10_000*int(n_run) + int(round(1_000_000 * float(D_v))))
         np.random.seed(seed)
         local_simulator = fhd.fhd_2d(L,N, bc= 'Neumann', fft=False, 
-                                     schelling_flux="finite_volume",
-                                     projection_mode="clip", 
-                                     use_numba_projection=False,
-                                     )
+                                        schelling_flux="finite_volume",
+                                        projection_mode="redistribute" , 
+                                        use_numba_projection=True, 
+                                        numba_projection_threads=1,
+                                        voter_noise_mode="wright_fisher",
+                                        wf_gaussian_threshold=0.01,
+                                        reaction_diagnostic=False)
         local_simulator.set_seed(seed)
 
         print(f"[pid={pid}] Task started: {regime}, run {n_run}, Dv = {D_v}", flush=True)
