@@ -3011,7 +3011,6 @@ class fhd_2d:
             flux_y[:, :, 0] = 0.0
             flux_y[:, :, -1] = 0.0
 
-
     def div_face_flux(self, flux_x, flux_y, out, work):
         """
         Compute finite-volume divergence of face fluxes.
@@ -4557,7 +4556,6 @@ class fhd_2d:
             divJ[1] = (-beta * D[1] * div_dUdx[1])
 
         else:
-
             # Existing collocated / Gaussian-FV implementation.
 
             # lap_phi0 = -lap_phi.sum(axis=0)
@@ -4951,14 +4949,15 @@ class fhd_2d:
                 and step % save_every == 0
             )
 
-            # Schelling substep                        
-            rhs_s = self.rhs_Schelling_part(
-                phi,
-                param,
-                dt=dt,
-                toggle_noise=noise,
-                work=work,
-            )
+            # Schelling substep    
+            # 
+            rhs_s = self.rhs_Schelling_2species(
+                    phi,
+                    param,
+                    dt,
+                    toggle_noise=noise,
+                    work=work,
+                )
 
             np.copyto(phi_next, phi)
             phi_next += dt * rhs_s
@@ -4981,7 +4980,7 @@ class fhd_2d:
                                                     step=step,
                                                     record_history=record_projection_history,)
 
-            #Deterministic noise update
+            #Deterministic passive voter diffusion update
             rhs_v = self.rhs_Voter(
                 phi_next,
                 param,
