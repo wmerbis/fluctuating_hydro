@@ -1614,7 +1614,7 @@ class fhd_2d:
         leftover = total_excess - moved
         return moved, leftover
 
-    def _project_density_redistribute(self, rho, diag, projection_floor=0.0):
+    def _project_density_redistribute(self, rho, diag, projection_floor=0.0, step = None):
         """
         Conservative local redistribution projection.
 
@@ -1627,6 +1627,15 @@ class fhd_2d:
         amount falls back according to self.redistribute_fallback.
         """
         nspecies, Nx, Ny = rho.shape
+
+        # Alternate species priority to avoid a persistent A-first/B-second bias.
+        # Convention:
+        #   even or unspecified step -> A first
+        #   odd step                -> B first
+        if step is None or step % 2 == 0:
+            species_order = range(nspecies)
+        else:
+            species_order = range(nspecies - 1, -1, -1)
 
         radius = self.redistribute_radius
         tol = getattr(self, "projection_tol", 100.0 * np.finfo(rho.dtype).eps)
@@ -1655,7 +1664,7 @@ class fhd_2d:
         # ------------------------------------------------------------
         # low_mask = rho < projection_floor
 
-        for a in range(nspecies):
+        for a in species_order:
             low_mask_a = rho[a] < projection_floor - tol
 
             if not np.any(low_mask_a):
@@ -1812,9 +1821,10 @@ class fhd_2d:
                 max_high_violation_this,
             )
 
-            high_positions = np.argwhere(high_mask)
+        for a in species_order:
+            high_positions_a = np.argwhere(high_mask[a])
 
-            for a, i, j in high_positions:
+            for i, j in high_positions_a:
                 current = rho[a, i, j]
 
                 if current <= upper_bound:
@@ -1856,12 +1866,17 @@ class fhd_2d:
                             )
                         )
 
-                        add_float("mass_redistributed_high_global", moved_global)
+                        add_float(
+                            "mass_redistributed_high_global",
+                            moved_global,
+                        )
                         leftover = global_leftover
 
-                # Final upper fallback: remove excess mass.
                 if leftover > 0.0:
-                    removable = max(float(rho[a, i, j] - upper_bound), 0.0)
+                    removable = max(
+                        float(rho[a, i, j] - upper_bound),
+                        0.0,
+                    )
                     removed = min(leftover, removable)
 
                     if removed > 0.0:
@@ -2325,6 +2340,7 @@ class fhd_2d:
                 rho,
                 diag,
                 projection_floor=projection_floor,
+                step = step,
             )
 
         elif mode == "transfer_to_other":
