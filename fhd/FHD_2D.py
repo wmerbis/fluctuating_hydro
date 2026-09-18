@@ -4988,33 +4988,34 @@ class fhd_2d:
             )
 
             # Voter substep: demographic noise step
-            if noise:
-                self.demographic_voter_step(phi_next, 
-                                                    param=param,
-                                                    dt=dt,
-                                                    work=work,
-                                                    step=step,
-                                                    record_history=record_projection_history,)
+            if param["D_v"] != 0.0:
+                if noise:
+                    self.demographic_voter_step(phi_next, 
+                                                        param=param,
+                                                        dt=dt,
+                                                        work=work,
+                                                        step=step,
+                                                        record_history=record_projection_history,)
 
-            #Deterministic passive voter diffusion update
-            rhs_v = self.rhs_Voter(
-                phi_next,
-                param,
-                dt=dt,
-                toggle_noise=False,
-                work=work,
-            )
+                #Deterministic passive voter diffusion update
+                rhs_v = self.rhs_Voter(
+                    phi_next,
+                    param,
+                    dt=dt,
+                    toggle_noise=False,
+                    work=work,
+                )
 
-            phi_next += dt * rhs_v
+                phi_next += dt * rhs_v
 
-            self.project_density(
-                phi_next,
-                work=work,
-                step=step,
-                record_history=save_this_step,
-                projection_mode="transfer_to_other",
-                stage="voter",
-            )
+                self.project_density(
+                    phi_next,
+                    work=work,
+                    step=step,
+                    record_history=save_this_step,
+                    projection_mode="transfer_to_other",
+                    stage="voter",
+                )
             
             # Swap buffers.
             phi, phi_next = phi_next, phi
