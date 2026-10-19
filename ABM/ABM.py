@@ -389,12 +389,12 @@ def utility_and_hypothetical_utility_flat(x, neighbors,
                 owner[pos]    = i
                 # contribution if moved to j depends on what spin i has
                 if x[i] == 1: #we have not consider the new local configuration as the move happens
-                    pi_plus_vacant = pi_plus[j] #- (kappa_aa + Gamma_aa)  # 5 comes from -4 *(n==1) and -1 of reducing 1 plus meighbor
-                    delta_flat[pos] = pi_plus_vacant - pi[i]
+                    #pi_plus_vacant = pi_plus[j] #- (kappa_aa + Gamma_aa)  # 5 comes from -4 *(n==1) and -1 of reducing 1 plus meighbor
+                    delta_flat[pos] = kappa_aa * ( n_plus[j] - 1 - n_plus[i]) + kappa_ab *( n_minus[j] - n_minus[i])  # pi_plus_vacant - pi[i]
                 else:
                     # x[i] == -1 expected (we skipped x[i]==0 above)
-                    pi_minus_vacant = pi_minus[j] # - (kappa_bb + Gamma_bb)
-                    delta_flat[pos] = pi_minus_vacant- pi[i]
+                    #pi_minus_vacant = pi_minus[j] # - (kappa_bb + Gamma_bb)
+                    delta_flat[pos] = kappa_ba * ( n_plus[j]  - n_plus[i]) + kappa_bb *( n_minus[j] - 1 - n_minus[i])  #
                 pos += 1
 
     vac_starts[N] = pos
