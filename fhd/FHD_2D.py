@@ -15,16 +15,11 @@ D^a is the type dependent Schelling diffusion constant
 \beta is the inverse temperature controlling the strength of the utility gradient on the diffusion process
 h is the microscopic lattice spacing (zero for the strict thermodynamic limit)
 
-Model "Schelling" implements Schelling type rules where agents only diffuse if the fraction of like agents is below a threshold theta.
-In that case the dynamical equations become:
-
-∂t phi_a =   w0 (phi_0 ∂^2 phi_a - phi_a ∂^2 phi_0)  + phi_a * phi_0 * ∂^2 w0 + 2 phi_0 ∂ w0 . ∂ phi_a ) +  ∂[sqrt(2 w0 h^2 phi_a phi_0) Z] + R(phi)
-
-with:
-w0 = D/ (1+ e^(-\beta \pi)) density dependent diffusion term
-pi = \sum_b ((theta - 1) delta^{ab} + theta sigma_x^{ab} ) (phi_b + \Gamma ∂^2 phi_b) utility threshold function with Gaussian smeared neighborhood (\sigma^2/2 = \Gamma)
-Z Gaussian white noise
-R(phi) implements a voter model with mean-field equation ∂t phi_a = phi*(b*pho_0 - d) with b and d birth and death rates respectively
+Model "Schelling" now uses the microscopic hydrodynamic limit derived in the
+October 2026 Schelling-Voter manuscript appendices. Its drift contains passive
+vacancy-mediated diffusion, a nonlinear exact finite-state response matrix
+Theta^{ab}(rho), and matched Cahn-Hilliard stiffness Gamma=2 h^2 Theta(rho_bar).
+The model includes conservative Schelling noise but no Voter terms.
 
 Features:
 - A class object fhd_2d for 2D (see FHD_1D.py for 1D version of the code)
@@ -599,6 +594,55 @@ def build_qm_table(
         m_max=m_max,
         build_seconds=time.perf_counter() - t0,
     )
+
+
+# -----------------------------------------------------------------------------
+# New microscopic Schelling transport: Appendix S3, Eq. (S47)
+# Insert at module level (after imports, before class fhd_2d).
+# -----------------------------------------------------------------------------
+
+def build_schelling_theta_coeff(beta, kappa):
+    """Exact degree-five Bernstein coefficients of Theta[a,b](rhoA,rhoB)."""
+    from math import comb
+    kappa = np.asarray(kappa, dtype=np.float64)
+    if kappa.shape != (2, 2):
+        raise ValueError("Schelling kappa must be a 2x2 array")
+    coeff = np.zeros((2, 2, 6, 6), dtype=np.float64)
+    for mA in range(3):
+        for mB in range(3 - mA):
+            wm = comb(2, mA) * comb(2 - mA, mB)
+            for nA in range(4):
+                for nB in range(4 - nA):
+                    wn = comb(3, nA) * comb(3 - nA, nB)
+                    p, q = mA + nA, mB + nB
+                    for a in range(2):
+                        x = 0.5 * beta * ((mA - nA) * kappa[a, 0] + (mB - nB) * kappa[a, 1])
+                        for b in range(2):
+                            coeff[a, b, p, q] += wm * wn * (np.tanh(x + 0.5 * beta * kappa[a, b]) - np.tanh(x))
+    return coeff
+
+
+@njit(cache=True)
+def schelling_theta(phi, coeff):
+    """Evaluate Theta[a,b,i,j] exactly from local rhoA, rhoB (rho0=1-rhoA-rhoB)."""
+    nx, ny = phi.shape[1:]
+    result = np.empty((2, 2, nx, ny), dtype=np.float64)
+    for i in range(nx):
+        for j in range(ny):
+            rA, rB = phi[0, i, j], phi[1, i, j]
+            r0 = 1.0 - rA - rB
+            pA, pB, p0 = np.ones(6), np.ones(6), np.ones(6)
+            for k in range(1, 6):
+                pA[k], pB[k], p0[k] = pA[k - 1] * rA, pB[k - 1] * rB, p0[k - 1] * r0
+            for a in range(2):
+                for b in range(2):
+                    val = 0.0
+                    for p in range(6):
+                        for q in range(6 - p):
+                            val += coeff[a, b, p, q] * pA[p] * pB[q] * p0[5 - p - q]
+                    result[a, b, i, j] = val
+    return result
+
 
 
 class fhd_2d:
@@ -4637,54 +4681,110 @@ class fhd_2d:
         )
 
         return rhs
-  
-    def w0(self, phi, param):
-        D = param["D"]
-        beta = param["beta"]
-        theta = param["theta"]
-        sigma = param["sigma"]
-        kappa = np.array([[theta-1,theta],[theta,theta-1]])
-        Gamma = kappa*sigma**2/2
-        pi = np.einsum("ab, bij-> aij", kappa, phi) + np.einsum("ab, bij-> aij", Gamma, self.lapl(phi))
-        w0 = np.einsum("a, aij -> aij", D, 1/(1+np.exp(-beta*pi)))
-        grad_pi = np.einsum("ab, lbij-> laij", kappa, self.grad(phi))
-        grad_pi += np.einsum("ab, lbij-> laij", Gamma, self.grad_lapl(phi))
-        gradw0 = np.einsum("aij, laij -> laij",  np.einsum("a, aij->aij", D, beta/(2+2*np.cosh(beta*pi))) , grad_pi)
-        laplw0 = self.div2d(gradw0)
-        return w0, gradw0, laplw0
-
-    def rhs_Schelling(self, phi, param, dt, toggle_noise):
-        """Compute RHS of the equation"""
-        phi0   = 1- phi.sum(axis=0)
-        phi0 = phi0.reshape((1,)+self.N)
-        w0, gradw0, laplw0 = self.w0(phi, param)
-        
-        """Compute grad J =   w0 (rho_0 ∂^2 rho -  rho ∂^2 rho_0)  + rho * rho_0 * ∂^2 w0 + 2 rho0 ∂ w0 . ∂ rho ) """
-        gradphi = self.grad(phi)
-        lap_phi = self.lapl(phi)
-        lap_phi0 = - lap_phi.sum(axis=0)
-        divJ = w0*phi0*lap_phi - w0*phi*lap_phi0  + phi*phi0*laplw0 + 2*phi0*(gradw0[0]*gradphi[0] + gradw0[1]*gradphi[1])
     
-        """Generate stochastic flux term ∂x( rho ξ )"""
-        if toggle_noise:
-            if 'h' in param:
-                h = param['h']
+    def rhs_CP(self, phi, param, dt, toggle_noise, work = None):
+        "Contact process with diffusion and demographic noise"
+        if work is None:
+            work = self._ensure_work(phi.dtype)
+
+        a = param["a"]
+        b = param["b"]
+        D = param["D"]
+
+        rhs = a*phi - b*phi**2
+        rhs += D*self.lapl(phi)
+
+        return rhs
+
+    def prepare_schelling(self, phi, param):
+        """Prepare exact Theta polynomial and microscopic Gamma=2*h**2*Theta(rho_bar)."""
+        rho_bar = np.asarray(param.get("rho_bar", phi.mean(axis=(1, 2))), dtype=np.float64)
+
+        if rho_bar.shape != (2,) or np.any(rho_bar < 0) or rho_bar.sum() > 1:
+            raise ValueError("rho_bar must be two nonnegative fractions with sum <= 1")
+        
+        h = float(param.get("h", np.sqrt(self.cell_area)))
+        if h <= 0:
+            raise ValueError("Microscopic spacing h must be positive")
+        
+        coeff = build_schelling_theta_coeff(float(param["beta"]), param["kappa"])
+        theta_bar = schelling_theta(rho_bar[:, None, None], coeff)[:, :, 0, 0]
+
+        self._schelling_new = {"coeff": coeff, "Gamma": 2.0 * h**2 * theta_bar, "rho_bar": rho_bar.copy(), "h": h}
+        return self._schelling_new
+
+    def schelling_fv_microscopic_flux(self, phi, phi0, lap_phi, theta, Gamma, param, work):
+        """Construct conservative deterministic face fluxes for new Schelling model."""
+
+        D = np.asarray(param["D"], dtype=np.float64)
+        for axis, delta, faces in ((1, self.dx, work["det_flux_x"]), (2, self.dy, work["det_flux_y"])):
+            if self.bc == "periodic":
+                rL, rR = phi, np.roll(phi, -1, axis=axis)
+                vL, vR = phi0, np.roll(phi0, -1, axis=axis - 1)
+                lL, lR = lap_phi, np.roll(lap_phi, -1, axis=axis)
+                tL, tR = theta, np.roll(theta, -1, axis=axis + 1)
+                face = faces
+
+            elif self.bc == "Neumann":
+                faces.fill(0.0)
+                left, right = [slice(None)] * 3, [slice(None)] * 3
+                left[axis], right[axis] = slice(None, -1), slice(1, None)
+                left, right = tuple(left), tuple(right)
+
+                rL, rR = phi[left], phi[right]
+                vL, vR = phi0[left[1:]], phi0[right[1:]]
+                lL, lR = lap_phi[left], lap_phi[right]
+                tL, tR = theta[(slice(None),) + left], theta[(slice(None),) + right]
+                face = faces[:, 1:-1, :] if axis == 1 else faces[:, :, 1:-1]
+
             else:
-                h = np.sqrt(self.dx*self.dy)
-            xi = np.random.normal(0, 1, size= (2,) + phi.shape)/np.sqrt(self.dx*self.dy)
-            if self.bc == 'Neumann':
-                # Set noise to zero on the boundary for Neumann bc's
-                xi[:,:,0,:] = 0
-                xi[:,:,-1,:] = 0
-                xi[:,:,:,0] = 0
-                xi[:,:,:,-1] = 0
-            rho_face     = np.maximum(w0*phi*phi0, 1e-14) 
-            noise_flux   = np.einsum("aij, laij -> laij", h*np.sqrt(2*rho_face/dt), xi)
-            dnoise_dx    = self.div2d(noise_flux) 
-        
-            divJ += dnoise_dx
-        
-        return divJ
+                raise ValueError(f"Unknown boundary condition: {self.bc}")
+
+            drho, dlap = (rR - rL) / delta, (lR - lL) / delta
+            th_face = 0.5 * (tL + tR)
+
+            for a in range(2):
+                mobility = 0.5 * (rL[a] * vR + rR[a] * vL)
+                drift = 10.0 * (th_face[a, 0] * drho[0] + th_face[a, 1] * drho[1])
+                drift += Gamma[a, 0] * dlap[0] + Gamma[a, 1] * dlap[1]
+
+                face[a] = D[a] * ((vL * rR[a] - vR * rL[a]) / delta - mobility * drift)
+
+    def rhs_Schelling(self, phi, param, dt, toggle_noise, work=None):
+        """Schelling-only RHS: exact Theta(rho), matched stiffness, existing Gaussian face noise."""
+        if work is None:
+            work = self._ensure_work(phi.dtype)
+        if not hasattr(self, "_schelling_new"):
+            self.prepare_schelling(phi, param)
+
+        cache = self._schelling_new
+        theta = schelling_theta(phi, cache["coeff"])
+        Gamma, D = cache["Gamma"], np.asarray(param["D"], dtype=np.float64)
+        phi0, out = work["phi0"], work["divJ"]
+        np.subtract(1.0, phi.sum(axis=0), out=phi0)
+
+        if self.schelling_flux == "finite_volume":
+            lap_phi = self.lapl(phi, out=work["lap_phi"])
+            self.schelling_fv_microscopic_flux(phi, phi0, lap_phi, theta, Gamma, param, work)
+            self.div_face_flux(work["det_flux_x"], work["det_flux_y"], out=out, work=work)
+        elif self.schelling_flux == "collocated":
+            grad_phi, grad_lap = self.grad(phi), self.grad_lapl(phi)
+            flux = work["flux"]
+            for a in range(2):
+                mobility = phi[a] * phi0
+                for dim in range(2):
+                    drift = 10.0 * (theta[a, 0] * grad_phi[dim, 0] + theta[a, 1] * grad_phi[dim, 1])
+                    drift += Gamma[a, 0] * grad_lap[dim, 0] + Gamma[a, 1] * grad_lap[dim, 1]
+                    flux[dim, a] = D[a] * (phi0 * grad_phi[dim, a] + phi[a] * (grad_phi[dim, 0] + grad_phi[dim, 1]) - mobility * drift)
+            self.div2d(flux, out=out)
+        else:
+            raise ValueError("New Schelling supports schelling_flux='finite_volume' or 'collocated' only")
+
+        if toggle_noise:
+            self.conservative_face_noise_flux(phi, phi0, param, dt, work)
+            self.div_face_flux(work["noise_flux_x"], work["noise_flux_y"], out=work["dnoise_dx"], work=work)
+            out += work["dnoise_dx"]
+        return out
 
     def prepare_voter_noise(
         self,
@@ -4857,7 +4957,14 @@ class fhd_2d:
             else:
                 dphidt = rhs(phi, param, dt, toggle_noise, work)
                 rho_next = phi + dt * dphidt
-                rho_next = self.project_density(rho_next, work=work, step=step, record_history=record_projection_history,) 
+                self.project_density(
+                    rho_next,
+                    work=work,
+                    step=step,
+                    record_history=record_projection_history,
+                    projection_mode="redistribute",
+                    stage="schelling",
+                )
 
         elif scheme == "PC":
             dphidt = rhs(phi, param, dt, toggle_noise, work)
@@ -5053,10 +5160,12 @@ class fhd_2d:
                         'Gamma': numpy array of shape (nspecies, nspecies) for the lapl(phi) term in the utility \Gamma^{ab} \nabla^2 \phi_b
                         'nu':    Optional np.array of shape (nspecies, nspecies, nspecies) for the quadratic term in the utility: nu^{abc} \phi_b \phi_c
                     "Schelling" with expected parameters in dictionary param:
-                        'D':     numpy array of shape (nspecies): diffusion constants for each species
-                        'theta': float: satisfaction threshold (between 0 and 1)
-                        'sigma': Coefficient of the lapl(phi) term in pi (sigma^2/2 of the Gaussian neighborhood kernel)
-                        'beta':  Inverse temperature, large beta means scricter enforcement of threshold moves
+                        'D':     array of shape (2,) with species diffusion constants
+                        'kappa': microscopic 2x2 preference matrix
+                        'beta':  microscopic logistic inverse-noise strength
+                        'h':     optional microscopic spacing, defaults to sqrt(dx*dy)
+                        'rho_bar': optional 2-vector reference composition for Gamma; defaults to initial spatial mean
+                        Gamma is computed internally: 2*h**2*Theta(rho_bar). Do NOT pass theta or sigma.
                     "Schelling+Voter" with expected parameters
                         'D':     numpy array of shape (nspecies): diffusion constants for each species
                         'kappa': numpy array of shape (nspecies, nspecies) with linear utility parameters \kappa^{ab} \phi_b
@@ -5084,6 +5193,8 @@ class fhd_2d:
                 "evaluated as an RK/PC RHS."
             )
 
+        if model == "Schelling" and toggle_noise and scheme != "FE":
+            raise ValueError("For stochastic Schelling use scheme='FE' (Ito Euler-Maruyama)")
         plot_every = nsteps//no_frames
         phi = self.project_density_fast(phi)
         phi = np.maximum(phi, self.phi_floor)
@@ -5097,8 +5208,10 @@ class fhd_2d:
             self.prepare_voter_noise(param,dt,)
 
         phi_current = phi.copy()
+        if model == "Schelling":
+            self.prepare_schelling(phi_current, param)
 
-        if use_fastpath and self._use_neumann_fv_fe_fastpath(scheme):
+        if use_fastpath and model != "Schelling" and self._use_neumann_fv_fe_fastpath(scheme):
             return self._run_neumann_fv_fe_fast(
                 phi_init=phi_current,
                 param=param,
@@ -5128,7 +5241,8 @@ class fhd_2d:
                                         step = n, 
                                         record_projection_history=record_projection_history)
             elif model == "Schelling":
-                phi_current = self.step(self.rhs_Schelling, phi_current, param, dt, toggle_noise, scheme)
+                phi_current = self.step(self.rhs_Schelling, phi_current, param, dt, toggle_noise, scheme,
+                                        work=work, step=n, record_projection_history=record_projection_history)
             elif model == "Schelling+Voter":
                 phi_current = self.step(
                     self.rhs_SchellingwithVoter,
@@ -5155,8 +5269,8 @@ class fhd_2d:
             im =plt.imshow(phi_diff[-1], cmap = 'RdBu', aspect='auto', origin='lower', extent=[-self.Lx/2,self.Lx/2,-self.Ly/2,self.Ly/2], vmin=-1, vmax=1)
             kappa = param['kappa']
             D = param['D']
-            Gamma = param['Gamma']
-            D_v = param['D_v']
+            Gamma = self._schelling_new["Gamma"] if model == "Schelling" else param["Gamma"]
+            D_v = 0.0 if model == "Schelling" else param["D_v"]
             title = fr"$D = [{D[0]:.1f}, {D[1]:.1f}],\, \kappa = [[{kappa[0,0]:.1f}, {kappa[0,1]:.1f}], [{kappa[1,0]:.1f} , {kappa[1,1]:.1f}]] \,, \Gamma = [[{Gamma[0,0]:.1f}, {Gamma[0,1]:.1f}], [{Gamma[1,0]:.1f} , {Gamma[1,1]:.1f}]], \, D_v = {D_v} $"
             plt.title(title)
             plt.xlabel("x")
@@ -5190,10 +5304,12 @@ class fhd_2d:
                         'Gamma': numpy array of shape (nspecies, nspecies) for the lapl(phi) term in the utility \Gamma^{ab} \nabla^2 \phi_b
                         'nu':    Optional np.array of shape (nspecies, nspecies, nspecies) for the quadratic term in the utility: nu^{abc} \phi_b \phi_c
                     "Schelling" with expected parameters in dictionary param:
-                        'D':     numpy array of shape (nspecies): diffusion constants for each species
-                        'theta': float: satisfaction threshold (between 0 and 1)
-                        'sigma': Coefficient of the lapl(phi) term in pi (sigma^2/2 of the Gaussian neighborhood kernel)
-                        'beta':  Inverse temperature, large beta means scricter enforcement of threshold moves
+                        'D':     array of shape (2,) with species diffusion constants
+                        'kappa': microscopic 2x2 preference matrix
+                        'beta':  microscopic logistic inverse-noise strength
+                        'h':     optional microscopic spacing, defaults to sqrt(dx*dy)
+                        'rho_bar': optional 2-vector reference composition for Gamma; defaults to initial spatial mean
+                        Gamma is computed internally: 2*h**2*Theta(rho_bar). Do NOT pass theta or sigma.
                     "Schelling+Voter" with expected parameters
                         'D':     numpy array of shape (nspecies): diffusion constants for each species
                         'kappa': numpy array of shape (nspecies, nspecies) with linear utility parameters \kappa^{ab} \phi_b
@@ -5206,11 +5322,15 @@ class fhd_2d:
             phi_run: numpy array of shape (nspecies, frames+1, N) with the simulation timeseries
                     
         '''
+        if model == "Schelling" and toggle_noise and scheme != "FE":
+            raise ValueError("For stochastic Schelling use scheme='FE' (Ito Euler-Maruyama)")
         plot_every = save_every
         phi = self.project_density_fast(phi)
         phi = np.maximum(phi, self.phi_floor)
         
         phi_current = phi.copy()
+        if model == "Schelling":
+            self.prepare_schelling(phi_current, param)
         phi_run = [phi_current]
         
         converged = False
@@ -5252,8 +5372,8 @@ class fhd_2d:
             im =plt.imshow(phi_diff[-1], cmap = 'RdBu', aspect='auto', origin='lower', extent=[-self.Lx/2,self.Lx/2,-self.Ly/2,self.Ly/2], vmin=-1, vmax=1)
             kappa = param['kappa']
             D = param['D']
-            Gamma = param['Gamma']
-            D_v = param['D_v']
+            Gamma = self._schelling_new["Gamma"] if model == "Schelling" else param["Gamma"]
+            D_v = 0.0 if model == "Schelling" else param["D_v"]
             title = fr"$D = [{D[0]:.1f}, {D[1]:.1f}],\, \kappa = [[{kappa[0,0]:.1f}, {kappa[0,1]:.1f}], [{kappa[1,0]:.1f} , {kappa[1,1]:.1f}]] \,, \Gamma = [[{Gamma[0,0]:.1f}, {Gamma[0,1]:.1f}], [{Gamma[1,0]:.1f} , {Gamma[1,1]:.1f}]], \, D_v = {D_v} $"
             plt.title(title)
             plt.xlabel("x")
