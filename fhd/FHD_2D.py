@@ -4714,9 +4714,17 @@ class fhd_2d:
         return self._schelling_new
 
     def schelling_fv_microscopic_flux(self, phi, phi0, lap_phi, theta, Gamma, param, work):
-        """Construct conservative deterministic face fluxes for new Schelling model."""
+        """Conservative, positivity-compatible bounded directed-hopping face flux.
+
+        theta_face='midpoint' (default), 'endpoints', or 'gauss3' (exact line average).
+        All options have the same continuum limit; the bounded rates avoid outward
+        flux from an empty species and inward flux into an already-full cell.
+        """
 
         D = np.asarray(param["D"], dtype=np.float64)
+        mode = param.get("theta_face", "midpoint")
+        coeff = self._schelling_new["coeff"]
+
         for axis, delta, faces in ((1, self.dx, work["det_flux_x"]), (2, self.dy, work["det_flux_y"])):
             if self.bc == "periodic":
                 rL, rR = phi, np.roll(phi, -1, axis=axis)
@@ -4740,15 +4748,25 @@ class fhd_2d:
             else:
                 raise ValueError(f"Unknown boundary condition: {self.bc}")
 
-            drho, dlap = (rR - rL) / delta, (lR - lL) / delta
-            th_face = 0.5 * (tL + tR)
+            delta_rho, delta_lap = rR - rL, lR - lL
+            if mode == "endpoints":
+                theta_face = 0.5 * (tL + tR)
+            elif mode == "midpoint":
+                theta_face = schelling_theta(0.5 * (rL + rR), coeff)
+            elif mode == "gauss3":
+                z = np.sqrt(15.0) / 10.0
+                theta_face = (5 * schelling_theta(rL + (0.5 - z) * delta_rho, coeff)
+                              + 8 * schelling_theta(0.5 * (rL + rR), coeff)
+                              + 5 * schelling_theta(rL + (0.5 + z) * delta_rho, coeff)) / 18.0
+            else:
+                raise ValueError("theta_face must be 'midpoint', 'endpoints', or 'gauss3'")
 
             for a in range(2):
-                mobility = 0.5 * (rL[a] * vR + rR[a] * vL)
-                drift = 10.0 * (th_face[a, 0] * drho[0] + th_face[a, 1] * drho[1])
-                drift += Gamma[a, 0] * dlap[0] + Gamma[a, 1] * dlap[1]
+                bias_gradient = 10.0 * (theta_face[a, 0] * delta_rho[0] + theta_face[a, 1] * delta_rho[1]) / delta
+                bias_gradient += (Gamma[a, 0] * delta_lap[0] + Gamma[a, 1] * delta_lap[1]) / delta
+                s = np.tanh(0.5 * delta * bias_gradient)
+                face[a] = D[a] / delta * (rR[a] * vL * (1.0 - s) - rL[a] * vR * (1.0 + s))
 
-                face[a] = D[a] * ((vL * rR[a] - vR * rL[a]) / delta - mobility * drift)
 
     def rhs_Schelling(self, phi, param, dt, toggle_noise, work=None):
         """Schelling-only RHS: exact Theta(rho), matched stiffness, existing Gaussian face noise."""
