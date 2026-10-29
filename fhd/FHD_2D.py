@@ -49,6 +49,72 @@ from numba import njit, prange
 
 from .operations import *
 
+@njit(cache=True)
+def _limit_schelling_noise_faces(phi, fx, fy, dt, dx, dy, periodic):
+    """Budget simultaneous signed face transfers against species and vacancy stocks.
+
+    Flux convention: positive F moves particles from right/top to left/bottom.
+    The cap includes every face of both species, so it guarantees the local
+    simplex after ONE noise-only Euler update, provided phi is physical.
+    """
+    na, nx, ny = phi.shape
+    outgoing = np.zeros((na, nx, ny), dtype=phi.dtype)
+    incoming = np.zeros((nx, ny), dtype=phi.dtype)
+
+    # First pass: how much each face proposes to remove/add in density units.
+    for axis in range(2):
+        flux = fx if axis == 0 else fy
+        delta = dx if axis == 0 else dy
+        ni = nx if (periodic or axis == 1) else nx - 1
+        nj = ny if (periodic or axis == 0) else ny - 1
+        for a in range(na):
+            for i in range(ni):
+                for j in range(nj):
+                    fi, fj = (i, j) if periodic else ((i + 1, j) if axis == 0 else (i, j + 1))
+                    f = flux[a, fi, fj]
+                    if f == 0.0:
+                        continue
+                    ri, rj = ((i + 1) % nx, j) if axis == 0 else (i, (j + 1) % ny)
+                    di, dj, ti, tj = (ri, rj, i, j) if f > 0.0 else (i, j, ri, rj)
+                    q = dt * abs(f) / delta
+                    outgoing[a, di, dj] += q
+                    incoming[ti, tj] += q
+
+    give = np.ones((na, nx, ny), dtype=phi.dtype)
+    take = np.ones((nx, ny), dtype=phi.dtype)
+    for i in range(nx):
+        for j in range(ny):
+            vac = max(0.0, 1.0 - phi[:, i, j].sum())
+            if incoming[i, j] > vac and incoming[i, j] > 0.0:
+                take[i, j] = vac / incoming[i, j]
+            for a in range(na):
+                if outgoing[a, i, j] > phi[a, i, j] and outgoing[a, i, j] > 0.0:
+                    give[a, i, j] = max(0.0, phi[a, i, j]) / outgoing[a, i, j]
+
+    # Second pass: multiply each shared face by the tighter of its donor and
+    # recipient budgets. Both sides receive the same signed conservative flux.
+    n_limited, suppressed = 0, 0.0
+    for axis in range(2):
+        flux = fx if axis == 0 else fy
+        delta = dx if axis == 0 else dy
+        ni = nx if (periodic or axis == 1) else nx - 1
+        nj = ny if (periodic or axis == 0) else ny - 1
+        for a in range(na):
+            for i in range(ni):
+                for j in range(nj):
+                    fi, fj = (i, j) if periodic else ((i + 1, j) if axis == 0 else (i, j + 1))
+                    f = flux[a, fi, fj]
+                    if f == 0.0:
+                        continue
+                    ri, rj = ((i + 1) % nx, j) if axis == 0 else (i, (j + 1) % ny)
+                    di, dj, ti, tj = (ri, rj, i, j) if f > 0.0 else (i, j, ri, rj)
+                    factor = min(give[a, di, dj], take[ti, tj])
+                    if factor < 1.0:
+                        n_limited += 1
+                        suppressed += dt * abs(f) * (1.0 - factor) / delta
+                        flux[a, fi, fj] = factor * f
+    return n_limited, suppressed
+
 @njit
 def _redistribute_low_species_local_numba(
     rho,
@@ -596,11 +662,6 @@ def build_qm_table(
     )
 
 
-# -----------------------------------------------------------------------------
-# New microscopic Schelling transport: Appendix S3, Eq. (S47)
-# Insert at module level (after imports, before class fhd_2d).
-# -----------------------------------------------------------------------------
-
 def build_schelling_theta_coeff(beta, kappa):
     """Exact degree-five Bernstein coefficients of Theta[a,b](rhoA,rhoB)."""
     from math import comb
@@ -695,9 +756,10 @@ class fhd_2d:
                     Schelling noise.
 
                 "face_reaction":
-                    finite-volume utility flux combined with the exact
-                    directed-reaction face sampler for passive Schelling
-                    hopping and its fluctuations. Currently Neumann + FE only.  
+                    Schelling-only: full microscopic-Theta biased directed face
+                    reactions (passive drift, preference drift, stiffness and
+                    fluctuations in one process), periodic or Neumann, FE only.
+                    Legacy coupled model keeps its old Neumann behavior.
 
                 "face_reaction_biased":
                     utility flux incorporated into exact directed-reaction face sampler
@@ -746,12 +808,6 @@ class fhd_2d:
                 f"got {self.schelling_flux}"
             )
 
-        if self.schelling_flux in ("face_reaction", "face_reaction_biased", "face_reaction_linear_bias"):
-            if self.bc != "Neumann":
-                raise ValueError(
-                    "schelling_flux='face_reaction' is currently "
-                    "implemented only for Neumann boundary conditions."
-                )
         
         self.projection_floor = projection_floor
         self.projection_mode = projection_mode
@@ -835,8 +891,8 @@ class fhd_2d:
             self.D3x = makeD3(self.Nx, self.dx, self.bc)
             self.D3y = makeD3(self.Ny, self.dy, self.bc)
 
-        if schelling_flux in  ("face_reaction", "face_reaction_biased", "face_reaction_linear_bias"):
-            self._reaction_face_colors = (self._build_neumann_reaction_face_colors())
+        if schelling_flux in ("face_reaction", "face_reaction_biased", "face_reaction_linear_bias"):
+            self._reaction_face_colors = (self._build_reaction_face_colors())
 
     def _init_projection_diagnostics(self):
         return {
@@ -928,6 +984,8 @@ class fhd_2d:
             "n_schelling_M0_faces": 0,
             "n_schelling_M1_faces": 0,
             "n_schelling_Mge2_faces": 0,
+            "n_schelling_noise_limited_faces": 0,
+            "schelling_noise_transfer_suppressed": 0.0,
             "n_schelling_negative_linear_rates": 0,
             "min_schelling_linear_bias": 0.0,
 
@@ -1027,11 +1085,40 @@ class fhd_2d:
         """
         if not hasattr(self, "_reaction_face_colors"):
             self._reaction_face_colors = (
-                self._build_neumann_reaction_face_colors()
-            )
+                self._build_reaction_face_colors()
+            )            
 
         return self._reaction_face_colors
-    
+
+    def _build_reaction_face_colors(self):
+        """Disjoint bond matchings for Neumann and periodic grids (odd sizes too)."""
+        if self.bc == "Neumann":
+            return self._build_neumann_reaction_face_colors()
+
+        def periodic_colors(axis):
+            n, other = self.N[axis], self.N[1-axis]
+            if n < 3:
+                raise ValueError("Periodic face reactions require >=3 cells per direction")
+            starts = [np.arange(0, n-1, 2), np.arange(1, n, 2)]
+            if n % 2:
+                starts[1] = np.arange(1, n-1, 2)
+                starts.append(np.array([n-1]))
+            colors = []
+            for i in starts:
+                j = (i + 1) % n
+                if axis == 0:
+                    y = np.arange(other)
+                    src = (np.broadcast_to(i[:, None], (len(i), other)), np.broadcast_to(y[None, :], (len(i), other)))
+                    dst = (np.broadcast_to(j[:, None], (len(j), other)), src[1])
+                else:
+                    x = np.arange(other)
+                    src = (np.broadcast_to(x[:, None], (other, len(i))), np.broadcast_to(i[None, :], (other, len(i))))
+                    dst = (src[0], np.broadcast_to(j[None, :], (other, len(j))))
+                colors.append((src, dst))
+            return colors
+
+        return {"x": periodic_colors(0), "y": periodic_colors(1)}
+  
     def _build_neumann_reaction_face_colors(self):
         """Build the two disjoint face colors in each direction using slices."""
         all_ = slice(None)
@@ -2881,23 +2968,23 @@ class fhd_2d:
 
         return out
 
-    def conservative_face_noise_flux(self, phi, phi0, param, dt, work):
+    def conservative_face_noise_flux(self, phi, phi0, param, dt, work, bounded=False):
         """
         Fill work["noise_flux_x"] and work["noise_flux_y"] with conservative
         stochastic fluxes on cell faces.
 
-        The face mobility is the cross-cell species-vacancy mobility
+        schelling_noise_mobility='symmetric' (default):
+            M_f^a = (rho_L^a rho_R^0 + rho_R^a rho_L^0) / 2.
+            This is the zero-mean Gaussian matching the face-reaction covariance.
 
-            M_f^a = 1/2 * (
-                rho_L^a rho_R^0
-                + rho_R^a rho_L^0
-            ).
-
-        This is the same face mobility that follows from the infinitesimal
-        covariance of the exact passive face-reaction process. Therefore the
-        Gaussian FV noise and the face-reaction scheme have the same
-        semi-discrete second moment; they differ only in the finite-time
-        stochastic statistics and boundary treatment.
+        schelling_noise_mobility='directed_sign' (EXPERIMENTAL ONLY):
+            Draw the signed normal FIRST, then use rho_R^a rho_L^0
+            if Z>0 (positive divergence flux R -> L), or rho_L^a rho_R^0
+            if Z<0 (negative divergence flux L -> R).
+            The all-face donor/vacancy limiter still runs afterward.
+            WARNING: sign selection creates a NONZERO mean flux O(dt**-1/2).
+            It does not reproduce the stochastic hydrodynamic equation and
+            should not be used for scientific production simulations.
 
         Periodic:
             noise_flux_x shape = (nspecies, Nx, Ny)
@@ -2908,6 +2995,9 @@ class fhd_2d:
             noise_flux_y shape = (nspecies, Nx, Ny+1)
             boundary normal fluxes are zero.
         """
+        mode = param.get("schelling_noise_mobility", "symmetric")
+        if mode not in ("symmetric", "directed_sign"):
+            raise ValueError("schelling_noise_mobility must be 'symmetric' or 'directed_sign'")
         D = param["D"]
         h = param.get("h", np.sqrt(self.dx * self.dy))
 
@@ -2922,6 +3012,11 @@ class fhd_2d:
 
         inv_sqrt_cell = 1.0 / np.sqrt(self.dx * self.dy)
 
+        # The sign is drawn before selecting donor and recipient mobilities.
+        # With this code's +div flux convention: Z>0 transfers R -> L.
+        self.rng.standard_normal(out=flux_x)
+        self.rng.standard_normal(out=flux_y)
+ 
         if self.bc == "periodic":
 
             # ------------------------------------------------------------
@@ -2945,14 +3040,16 @@ class fhd_2d:
                 out=scratch[:, :-1, :],
             )
 
-            amp_x[:, :-1, :] += scratch[:, :-1, :]
-            amp_x[:, :-1, :] *= 0.5
+            if mode == "directed_sign":
+                np.copyto(amp_x[:, :-1, :], scratch[:, :-1, :], where=flux_x[:, :-1, :] > 0.0)
+            else:
+                amp_x[:, :-1, :] += scratch[:, :-1, :]
+                amp_x[:, :-1, :] *= 0.5
 
             # Periodic wrap face: last cell <-> first cell.
-            amp_x[:, -1, :] = 0.5 * (
-                phi[:, -1, :] * phi0[np.newaxis, 0, :]
-                + phi[:, 0, :] * phi0[np.newaxis, -1, :]
-            )
+            m_lr = phi[:, -1, :] * phi0[np.newaxis, 0, :]
+            m_rl = phi[:, 0, :] * phi0[np.newaxis, -1, :]
+            amp_x[:, -1, :] = np.where(flux_x[:, -1, :] > 0.0, m_rl, m_lr) if mode == "directed_sign" else 0.5 * (m_lr + m_rl)
 
             # ------------------------------------------------------------
             # y-faces between cells j and j+1.
@@ -2970,14 +3067,16 @@ class fhd_2d:
                 out=scratch[:, :, :-1],
             )
 
-            amp_y[:, :, :-1] += scratch[:, :, :-1]
-            amp_y[:, :, :-1] *= 0.5
+            if mode == "directed_sign":
+                np.copyto(amp_y[:, :, :-1], scratch[:, :, :-1], where=flux_y[:, :, :-1] > 0.0)
+            else:
+                amp_y[:, :, :-1] += scratch[:, :, :-1]
+                amp_y[:, :, :-1] *= 0.5
 
             # Periodic wrap face.
-            amp_y[:, :, -1] = 0.5 * (
-                phi[:, :, -1] * phi0[np.newaxis, :, 0]
-                + phi[:, :, 0] * phi0[np.newaxis, :, -1]
-            )
+            m_lr = phi[:, :, -1] * phi0[np.newaxis, :, 0]
+            m_rl = phi[:, :, 0] * phi0[np.newaxis, :, -1]
+            amp_y[:, :, -1] = np.where(flux_y[:, :, -1] > 0.0, m_rl, m_lr) if mode == "directed_sign" else 0.5 * (m_lr + m_rl)
 
         elif self.bc == "Neumann":
 
@@ -3000,8 +3099,11 @@ class fhd_2d:
                 out=scratch[:, :-1, :],
             )
 
-            amp_x[:, 1:-1, :] += scratch[:, :-1, :]
-            amp_x[:, 1:-1, :] *= 0.5
+            if mode == "directed_sign":
+                np.copyto(amp_x[:, 1:-1, :], scratch[:, :-1, :], where=flux_x[:, 1:-1, :] > 0.0)
+            else:
+                amp_x[:, 1:-1, :] += scratch[:, :-1, :]
+                amp_x[:, 1:-1, :] *= 0.5
 
             # No normal stochastic flux through Neumann boundaries.
             amp_x[:, 0, :] = 0.0
@@ -3023,8 +3125,11 @@ class fhd_2d:
                 out=scratch[:, :, :-1],
             )
 
-            amp_y[:, :, 1:-1] += scratch[:, :, :-1]
-            amp_y[:, :, 1:-1] *= 0.5
+            if mode == "directed_sign":
+                np.copyto(amp_y[:, :, 1:-1], scratch[:, :, :-1], where=flux_y[:, :, 1:-1] > 0.0)
+            else:
+                amp_y[:, :, 1:-1] += scratch[:, :, :-1]
+                amp_y[:, :, 1:-1] *= 0.5
 
             amp_y[:, :, 0] = 0.0
             amp_y[:, :, -1] = 0.0
@@ -3040,11 +3145,7 @@ class fhd_2d:
         np.maximum(amp_x, 0.0, out=amp_x)
         np.maximum(amp_y, 0.0, out=amp_y)
 
-        # Draw standard normals directly into the flux buffers.
-        self.rng.standard_normal(out=flux_x)
-        self.rng.standard_normal(out=flux_y)
-
-        # Convert mobility to stochastic flux amplitude:
+        # Convert selected mobility to stochastic flux amplitude:
         #
         #     h sqrt(2 D_a M_f / dt) / sqrt(dx dy).
         #
@@ -3070,6 +3171,12 @@ class fhd_2d:
             flux_x[:, -1, :] = 0.0
             flux_y[:, :, 0] = 0.0
             flux_y[:, :, -1] = 0.0
+
+        if bounded:
+            n, lost = _limit_schelling_noise_faces(phi, flux_x, flux_y, dt, self.dx, self.dy, self.bc == "periodic")
+            diag = work["projection_diag"]
+            diag["n_schelling_noise_limited_faces"] += n
+            diag["schelling_noise_transfer_suppressed"] += lost * self.cell_area
 
     def div_face_flux(self, flux_x, flux_y, out, work):
         """
@@ -3120,7 +3227,7 @@ class fhd_2d:
         return out
 
     def _directed_face_reaction_vectorized(self, phi, phi0, species, source, target, D_a, delta, dt, h,
-                                        U=None, beta=0.0, work = None, diag=None):
+                                        U=None, beta=0.0, work = None, diag=None, rate_bias=None):
         """
         Exact uniformization sampler for many NON-OVERLAPPING directed face reactions
 
@@ -3227,7 +3334,7 @@ class fhd_2d:
         if np.any(source_view < -self.projection_tol):
             raise RuntimeError("Negative source density before directed Schelling reaction.")
 
-        if np.any(target_view < -self.projection_tol):
+        if np.any(target_vac_view < -self.projection_tol):
             raise RuntimeError("Negative target vacancy before directed Schelling reaction.")
 
         # Remove only tiny roundoff negatives before converting available density
@@ -3236,7 +3343,7 @@ class fhd_2d:
         # np.maximum(target_vac0, 0.0, out=target_vac0)
 
         # Only one event needs to be possible initially.
-        reactive = (source_view  >= epsilon) & (target_view >= epsilon)
+        reactive = (source_view  >= epsilon) & (target_vac_view >= epsilon)
 
         # Initial uniformization rate
         #
@@ -3272,6 +3379,15 @@ class fhd_2d:
 
             else:
                 raise ValueError(f"Unknown reaction bias mode '{self.schelling_flux}'")
+
+        if rate_bias is not None:
+            # Dimensionless nonnegative directed hopping factor (1 +/- tanh).
+            # Fixed during this directed substep; refreshed at each face color.
+            if U is not None:
+                raise ValueError("Specify either rate_bias or utility U, not both")
+            if np.any(rate_bias < 0) or not np.all(np.isfinite(rate_bias)):
+                raise ValueError("Invalid directional reaction bias")
+            rate0 *= rate_bias
 
         # Convert rates to Poisson means in place, avoiding a temporary rate0 * dt.
         try:
@@ -3353,6 +3469,14 @@ class fhd_2d:
         target_view += transfer
         source_vac_view += transfer
         target_vac_view -= transfer
+
+        # Integer-array (advanced) indexing returns copies, not views. Explicit
+        # scatter-back is ESSENTIAL: without it the reaction changes no cells.
+        phi[(species,) + source] = source_view
+        phi[(species,) + target] = target_view
+        phi0[source] = source_vac_view
+        phi0[target] = target_vac_view
+
 
         # Diagnostics are deliberately kept outside the numerical hot path.
         # When diag=None, all global sums/counts/maxima below are skipped.
@@ -3715,7 +3839,70 @@ class fhd_2d:
                                               reverse_sweep=reverse, reverse_direction=reverse, work=work, diag=diag)
 
         return 
-    
+ 
+    def _microscopic_schelling_reaction_step(self, phi, param, dt, step_index=0, work=None):
+        """Full stochastic Schelling hopping with exact local Theta and matched Gamma.
+
+        The mean face flux is the existing bounded FV flux, while the sum of
+        the forward/backward event rates supplies its conservative noise.
+        Both replace, rather than supplement, Euler drift and Gaussian noise.
+        Bias is refreshed on each disjoint bond color (frozen within that
+        color's two directed substeps). The reaction sampler uses one density
+        quantum epsilon=h**2/(dx*dy) per accepted hop.
+        """
+        if work is None:
+            work = self._ensure_work(phi.dtype)
+        if not hasattr(self, "_schelling_new"):
+            self.prepare_schelling(phi, param)
+        cache = self._schelling_new
+        coeff, Gamma, h = cache["coeff"], cache["Gamma"], cache["h"]
+        D = np.asarray(param["D"], dtype=np.float64)
+        mode = param.get("theta_face", "midpoint")
+        diag = work["projection_diag"] if self.reaction_diagnostics else None
+        phi0 = work["phi0"]
+        np.subtract(1.0, phi.sum(axis=0), out=phi0)
+        reverse = bool((step_index or 0) % 2)
+        species_order = (1, 0) if reverse else (0, 1)
+        colors = self._get_reaction_face_colors()
+        bonds = [(left, right, self.dx) for left, right in colors["x"]]
+        bonds += [(left, right, self.dy) for left, right in colors["y"]]
+        if reverse:
+            bonds.reverse()
+
+        for a in species_order:
+            for left, right, delta in bonds:
+                # Recompute curvature and local response as previously updated
+                # face colors can change the fields. Use midpoint by default.
+                self.lapl(phi, out=work["lap_phi"])
+                rhoL, rhoR = phi[(slice(None),) + left], phi[(slice(None),) + right]
+                drho = rhoR - rhoL
+                if mode == "midpoint":
+                    th = schelling_theta(0.5 * (rhoL + rhoR), coeff)
+                elif mode == "endpoints":
+                    th = 0.5 * (schelling_theta(rhoL, coeff) + schelling_theta(rhoR, coeff))
+                elif mode == "gauss3":
+                    z = np.sqrt(15.0) / 10.0
+                    th = (5 * schelling_theta(rhoL + (0.5-z)*drho, coeff) + 8 * schelling_theta(0.5*(rhoL+rhoR), coeff)
+                          + 5 * schelling_theta(rhoL + (0.5+z)*drho, coeff)) / 18.0
+                else:
+                    raise ValueError("theta_face must be 'midpoint', 'endpoints', or 'gauss3'")
+
+                lap = work["lap_phi"]
+                dlap = lap[(slice(None),) + right] - lap[(slice(None),) + left]
+                u = 0.5 * (10.0 * (th[a, 0] * drho[0] + th[a, 1] * drho[1])
+                           + Gamma[a, 0] * dlap[0] + Gamma[a, 1] * dlap[1])
+                s = np.tanh(u)   # s>0 favors L->R, as in bounded finite-volume flux
+                if reverse:
+                    directions = ((right, left, 1.0-s), (left, right, 1.0+s))
+                else:
+                    directions = ((left, right, 1.0+s), (right, left, 1.0-s))
+                for source, target, bias in directions:
+                    self._directed_face_reaction_vectorized(phi, phi0, a, source, target, D[a], delta,
+                                                            dt, h, work=work, diag=diag, rate_bias=bias)
+
+        return phi
+
+
     def rhs_Vitelli(self, phi, param, dt, toggle_noise):
         """Compute RHS of the equation"""
 
@@ -4698,6 +4885,10 @@ class fhd_2d:
 
     def prepare_schelling(self, phi, param):
         """Prepare exact Theta polynomial and microscopic Gamma=2*h**2*Theta(rho_bar)."""
+        if param.get("schelling_noise_mobility") == "directed_sign":
+            import warnings
+            warnings.warn("directed_sign Gaussian noise has nonzero mean and is not a valid SPDE noise scheme; use for diagnostic comparisons only.", RuntimeWarning, stacklevel=2)
+
         rho_bar = np.asarray(param.get("rho_bar", phi.mean(axis=(1, 2))), dtype=np.float64)
 
         if rho_bar.shape != (2,) or np.any(rho_bar < 0) or rho_bar.sum() > 1:
@@ -4730,7 +4921,8 @@ class fhd_2d:
                 rL, rR = phi, np.roll(phi, -1, axis=axis)
                 vL, vR = phi0, np.roll(phi0, -1, axis=axis - 1)
                 lL, lR = lap_phi, np.roll(lap_phi, -1, axis=axis)
-                tL, tR = theta, np.roll(theta, -1, axis=axis + 1)
+                if mode == "endpoints":
+                    tL, tR = theta, np.roll(theta, -1, axis=axis + 1)
                 face = faces
 
             elif self.bc == "Neumann":
@@ -4742,7 +4934,8 @@ class fhd_2d:
                 rL, rR = phi[left], phi[right]
                 vL, vR = phi0[left[1:]], phi0[right[1:]]
                 lL, lR = lap_phi[left], lap_phi[right]
-                tL, tR = theta[(slice(None),) + left], theta[(slice(None),) + right]
+                if mode == "endpoints":
+                    tL, tR = theta[(slice(None),) + left], theta[(slice(None),) + right]
                 face = faces[:, 1:-1, :] if axis == 1 else faces[:, :, 1:-1]
 
             else:
@@ -4776,12 +4969,13 @@ class fhd_2d:
             self.prepare_schelling(phi, param)
 
         cache = self._schelling_new
-        theta = schelling_theta(phi, cache["coeff"])
+        mode = param.get("theta_face", "midpoint")
+        theta = schelling_theta(phi, cache["coeff"]) if self.schelling_flux == "collocated" or mode == "endpoints" else None
         Gamma, D = cache["Gamma"], np.asarray(param["D"], dtype=np.float64)
         phi0, out = work["phi0"], work["divJ"]
         np.subtract(1.0, phi.sum(axis=0), out=phi0)
 
-        if self.schelling_flux == "finite_volume":
+        if self.schelling_flux in ("finite_volume", "face_reaction"):
             lap_phi = self.lapl(phi, out=work["lap_phi"])
             self.schelling_fv_microscopic_flux(phi, phi0, lap_phi, theta, Gamma, param, work)
             self.div_face_flux(work["det_flux_x"], work["det_flux_y"], out=out, work=work)
@@ -4797,6 +4991,9 @@ class fhd_2d:
             self.div2d(flux, out=out)
         else:
             raise ValueError("New Schelling supports schelling_flux='finite_volume' or 'collocated' only")
+
+        if toggle_noise and self.schelling_flux == "finite_volume":
+            raise ValueError("Use step(..., scheme='FE') for bounded stochastic Schelling; direct noisy RHS is not bounded.")
 
         if toggle_noise:
             self.conservative_face_noise_flux(phi, phi0, param, dt, work)
@@ -4971,7 +5168,32 @@ class fhd_2d:
                                         projection_mode="transfer_to_other", stage="voter",)
 
                 return rho_next
-            
+
+            elif rhs == self.rhs_Schelling and toggle_noise and self.schelling_flux == "face_reaction":
+                np.copyto(rho_next, phi)
+                self._microscopic_schelling_reaction_step(rho_next, param, dt, step_index=step, work=work)
+                # Projection is a diagnostic safeguard; the reaction sampler
+                # should not require any repair of the physical simplex.
+                self.project_density(rho_next, work=work, step=step,
+                                     record_history=record_projection_history)
+                return rho_next
+
+            elif rhs == self.rhs_Schelling and toggle_noise and self.schelling_flux == "finite_volume":
+                # Split deterministic transport and bounded stochastic transfers.
+                # A limiter applied to noise around the OLD state cannot ensure
+                # positivity after adding the deterministic increment as well.
+                drift = rhs(phi, param, dt, False, work)
+                rho_next = phi + dt * drift
+                vacancy = work["phi0"]
+                np.subtract(1.0, rho_next.sum(axis=0), out=vacancy)
+                if np.min(rho_next) < -1e-12 or np.min(vacancy) < -1e-12:
+                    raise RuntimeError("Deterministic Schelling step left the simplex; reduce dt before bounded noise.")
+                self.conservative_face_noise_flux(rho_next, vacancy, param, dt, work, bounded=True)
+                self.div_face_flux(work["noise_flux_x"], work["noise_flux_y"], out=work["dnoise_dx"], work=work)
+                rho_next += dt * work["dnoise_dx"]
+                rho_next = self.project_density(rho_next, work=work, step=step,
+                                                record_history=record_projection_history)
+
             else:
                 dphidt = rhs(phi, param, dt, toggle_noise, work)
                 rho_next = phi + dt * dphidt
@@ -5178,6 +5400,8 @@ class fhd_2d:
                         'Gamma': numpy array of shape (nspecies, nspecies) for the lapl(phi) term in the utility \Gamma^{ab} \nabla^2 \phi_b
                         'nu':    Optional np.array of shape (nspecies, nspecies, nspecies) for the quadratic term in the utility: nu^{abc} \phi_b \phi_c
                     "Schelling" with expected parameters in dictionary param:
+                        schelling_flux='face_reaction' uses discrete biased directed
+                        face events with exact Theta and matched Gamma (no Gaussian noise).
                         'D':     array of shape (2,) with species diffusion constants
                         'kappa': microscopic 2x2 preference matrix
                         'beta':  microscopic logistic inverse-noise strength
@@ -5322,6 +5546,8 @@ class fhd_2d:
                         'Gamma': numpy array of shape (nspecies, nspecies) for the lapl(phi) term in the utility \Gamma^{ab} \nabla^2 \phi_b
                         'nu':    Optional np.array of shape (nspecies, nspecies, nspecies) for the quadratic term in the utility: nu^{abc} \phi_b \phi_c
                     "Schelling" with expected parameters in dictionary param:
+                        schelling_flux='face_reaction' uses discrete biased directed
+                        face events with exact Theta and matched Gamma (no Gaussian noise).
                         'D':     array of shape (2,) with species diffusion constants
                         'kappa': microscopic 2x2 preference matrix
                         'beta':  microscopic logistic inverse-noise strength
@@ -5463,7 +5689,10 @@ class fhd_2d:
         print(f"no. expensive proj:    {diag['n_expensive_projection_calls']}")
         print(f"no. roundoff cleanups: {diag['n_roundoff_cleanup_calls']}")
         print(f"mass roundoff cleanup: {diag['mass_roundoff_cleanup']:.8e}")
-
+        print("")
+        
+        print(f"Bounded Schelling noise faces: {diag['n_schelling_noise_limited_faces']}")
+        print(f"Suppressed Schelling transfer: {diag['schelling_noise_transfer_suppressed']:.8e}")
         print("")
         print("Schelling face reaction diagnostics")
         print("-----------------------------------")
