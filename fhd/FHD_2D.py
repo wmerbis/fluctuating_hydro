@@ -4895,13 +4895,15 @@ class fhd_2d:
             raise ValueError("rho_bar must be two nonnegative fractions with sum <= 1")
         
         h = float(param.get("h", np.sqrt(self.cell_area)))
+        sigma = float(param.get("sigma", 1))
         if h <= 0:
             raise ValueError("Microscopic spacing h must be positive")
-        
+        if sigma <= 0:
+            raise ValueError("Stiffness length scale sigma must be positive")
         coeff = build_schelling_theta_coeff(float(param["beta"]), param["kappa"])
         theta_bar = schelling_theta(rho_bar[:, None, None], coeff)[:, :, 0, 0]
 
-        self._schelling_new = {"coeff": coeff, "Gamma": 2.0 * h**2 * theta_bar, "rho_bar": rho_bar.copy(), "h": h}
+        self._schelling_new = {"coeff": coeff, "Gamma": 2.0 * (sigma**2) * theta_bar, "rho_bar": rho_bar.copy(), "h": h}
         return self._schelling_new
 
     def schelling_fv_microscopic_flux(self, phi, phi0, lap_phi, theta, Gamma, param, work):
