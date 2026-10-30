@@ -2,7 +2,7 @@ import numpy as np
 import time
 from scipy.stats import ks_2samp, wasserstein_distance
 
-from fhd.FHD_2D import fhd_2d
+from fhd.FHD_2D_old import fhd_2d
 
 # ============================================================
 # SETTINGS

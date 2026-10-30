@@ -80,7 +80,7 @@ def measure_mode_growth(sim, rho_bar, param, kx_index, ky_index):
 
     work = sim._ensure_work(phi.dtype)
 
-    rhs = sim.rhs_SchellingwithVoter(
+    rhs = sim.rhs_Schelling(
         phi, param, dt=1.0, toggle_noise=False, work=work
     ).copy()
 

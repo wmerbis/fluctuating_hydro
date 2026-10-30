@@ -36,7 +36,7 @@ from scipy.ndimage import gaussian_filter, label, generate_binary_structure
 
 # This is the import used in the FHD repository in our earlier scripts.
 # Change only this line if your local checkout exposes FHD_2D differently.
-from fhd import FHD_2D as fhd
+from fhd import FHD_2D_old as fhd
 
 
 # -----------------------------------------------------------------------------
