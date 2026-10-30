@@ -31,7 +31,7 @@ from scipy.fft import dctn
 try:
     import fhd
 except ImportError:
-    import fhd.FHD_2D as fhd
+    import fhd.FHD_2D_old as fhd
 
 try:
     from fhd.operations import dissimilarity, mean_relative_entropy
