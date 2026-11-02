@@ -17,3 +17,10 @@ processed_det_run2/
 interface_ensemble/
 spectral_validation/
 phase_sweep/
+phase_sweep_lattice/
+notebooks/FHD.ipynb
+notebooks/FHD2d.ipynb
+notebooks/gif_maker.ipynb
+notebooks/power_spectrum_plot.ipynb
+notebooks/run_analysis_npz.ipynb
+notebooks/finite_N_sensitivity.ipynb
