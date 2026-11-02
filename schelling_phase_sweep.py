@@ -64,14 +64,14 @@ def parse_args(argv=None):
     p.add_argument('--n-grid', type=int, default=21, help='Grid points along each axis')
     p.add_argument('--family', choices=('both', *FAMILIES), default='both')
     p.add_argument('--beta-min', type=float, default=0.)
-    p.add_argument('--beta-max', type=float, default=3.)
+    p.add_argument('--beta-max', type=float, default=8.)
     p.add_argument('--N', nargs=2, type=int, default=(128,128))
     p.add_argument('--L', nargs=2, type=float, default=(50.,50.))
     p.add_argument('--people-per-cell', type=float, default=400.)
     p.add_argument('--sigma', type=float, default=0.5)
     p.add_argument('--D', nargs=2, type=float, default=(1.,1.))
-    p.add_argument('--dt', type=float, default=1e-3)
-    p.add_argument('--nsteps', type=int, default=10000)
+    p.add_argument('--dt', type=float, default=5e-4)
+    p.add_argument('--nsteps', type=int, default=50000)
     p.add_argument('--frames', type=int, default=500)
     p.add_argument('--rho-a', type=float, default=0.35)
     p.add_argument('--rho-b', type=float, default=0.35)
@@ -81,6 +81,8 @@ def parse_args(argv=None):
     p.add_argument('--noise', action=argparse.BooleanOptionalAction, default=True)
     p.add_argument('--bc', choices=('Neumann','periodic'), default='Neumann')
     p.add_argument('--bins', type=int, default=40)
+    p.add_argument('--k-definition', choices=('physical','lattice'), default='physical',
+                   help='Radial shells: physical DCT k or second-order FV lattice k.')
     p.add_argument('--k-band', nargs=2, type=float, default=None,
                    help='For excess order parameters (physical k); default all spatial modes')
     p.add_argument('--burn-fraction', type=float, default=0.5,
@@ -248,9 +250,11 @@ def make_result(a,args,job,sim,elapsed):
     burn=min(n_frames-2,int(args.burn_fraction*(n_frames-1)))
     late=slice(burn,None)
     cap=args.people_per_cell
-    spatial=spatial_structure_factor(a,args.L,bc=args.bc,n_bins=args.bins)
+    spatial=spatial_structure_factor(a,args.L,bc=args.bc,n_bins=args.bins,
+                                      k_definition=args.k_definition)
     excess=excess_spectral_power(a,args.L,bc=args.bc,n_bins=args.bins,
-                                 reference='white',k_band=args.k_band)
+                                 reference='white',k_band=args.k_band,
+                                 k_definition=args.k_definition)
     segreg=segregation_index(a,cell_capacity=cap,subtract_mixing=True)
     occupation=occupation_index(a,reference='initial')
     legacy=legacy_indices(a)
@@ -299,7 +303,11 @@ def make_result(a,args,job,sim,elapsed):
       'min_vacancy_full':np.float64(v.min()),
       'times':times.astype('float32'), 'burn_frame':np.int64(burn),
       'elapsed_seconds':np.float64(elapsed),
+      'k_definition':np.array(args.k_definition),
       'k':spatial['k'].astype('float32'),
+      'k_physical_mean':spatial['k_physical_mean'].astype('float32'),
+      'k_lattice_mean':spatial['k_lattice_mean'].astype('float32'),
+      'k_lattice_std':spatial['k_lattice_std'].astype('float32'),
       'k_edges':spatial['k_edges'].astype('float32'),
       'k_counts':spatial['counts'].astype('int32'),
       'S_dct':spatial['S'].real.astype('float32'),
@@ -326,9 +334,11 @@ def make_result(a,args,job,sim,elapsed):
             maxlag=min(args.max_lag,dyn.shape[1]-1)
             lags=np.arange(0,maxlag+1,dtype=int)
             tc=connected_time_lag_covariance(dyn,dtd,args.L,bc=args.bc,
-                        n_bins=args.bins,k_max=kmax,lags=lags,burn_in=0)
+                        n_bins=args.bins,k_max=kmax,lags=lags,burn_in=0,
+                        k_definition=args.k_definition)
             st=spatiotemporal_structure_factor(dyn,dtd,args.L,bc=args.bc,
-                        n_bins=args.bins,k_max=kmax,burn_in=0,window='hann')
+                        n_bins=args.bins,k_max=kmax,burn_in=0,window='hann',
+                        k_definition=args.k_definition)
             result.update({
                 'dynamic_frame_indices':np.arange(burn,n_frames,args.dynamic_stride,dtype=np.int32),
                 'k_dynamic':tc['k'].astype('float32'),
@@ -555,7 +565,7 @@ def main(argv=None):
                    'D','dt','nsteps','frames','rho_a','rho_b','initial_std',
                    'seed','replicates','noise','bc','bins','k_band',
                    'burn_fraction','dynamic_kmax','dynamic_stride','max_lag',
-                   'no_dynamics','snapshots','save_trajectory')
+                   'no_dynamics','snapshots','save_trajectory','k_definition')
     if config_path.exists() and not args.overwrite:
         prev=json.loads(config_path.read_text())
         changed=[k for k in physical_keys if k in prev and prev[k]!=config_data[k]]
