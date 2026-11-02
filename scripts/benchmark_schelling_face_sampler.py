@@ -30,7 +30,7 @@ import matplotlib.pyplot as plt
 # ---------------------------------------------------------------------
 # Adjust this import if needed
 # ---------------------------------------------------------------------
-from fhd.FHD_2D import fhd_2d
+from fhd.FHD_2D_old import fhd_2d
 
 # =====================================================================
 # USER SETTINGS

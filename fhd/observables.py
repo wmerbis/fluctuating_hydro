@@ -11,6 +11,11 @@ Units and conventions
   norm='ortho' for cell-centered Neumann BC.
 * k=0 is excluded from all spectral statistics (conserved global masses).
 * FFT k vectors are 2*pi*fftfreq(N, dx); Neumann DCT k=pi*n/L.
+* k_definition='physical' bins those continuum mode labels (legacy default).
+  k_definition='lattice' bins the exact second-order FV Laplacian
+  eigen-wavenumber: 2*sin(kx*dx/2)/dx in each direction. Using lattice k
+  changes BIN MEMBERSHIP, not just x-axis labels.
+
 * Dynamic structure factor S_ab(k,omega) uses angular frequencies and
   satisfies int S(k,omega) d omega/(2*pi) = time-averaged equal-time
   connected S(k), for a rectangular time window.
@@ -34,7 +39,8 @@ __all__ = [
     'spatial_structure_factor', 'excess_spectral_power',
     'segregation_index', 'occupation_index',
     'connected_time_lag_covariance', 'spatiotemporal_structure_factor',
-    'compute_observables',
+    'compute_observables', 'radial_wavenumber_map',
+    'radial_bin_spectrum_2d',
 ]
 
 
@@ -49,7 +55,7 @@ def _frames(phi_run):
     return a
 
 
-def _geometry(shape, L, bc, n_bins, bin_edges, k_max):
+def _geometry(shape, L, bc, n_bins, bin_edges, k_max, k_definition='physical'):
     nx, ny = shape
     lx, ly = map(float, L)
     if lx <= 0 or ly <= 0:
@@ -66,9 +72,19 @@ def _geometry(shape, L, bc, n_bins, bin_edges, k_max):
         transform = 'dct'
     else:
         raise ValueError("bc must be 'periodic' or 'Neumann'")
-    k = np.hypot(kx[:, None], ky[None, :])
+    # Physical (continuum) mode labels and lattice-effective wavenumbers.
+    # The second-order finite-volume Laplacian acts on each mode as
+    #    D2_mode = -k_lattice**2 * mode.
+    # Neumann uses DCT-II modes n*pi/L; periodic uses FFT modes 2*pi*n/L.
+    k_physical = np.hypot(kx[:, None], ky[None, :])
+    k_lattice = np.hypot(
+        2.0*np.sin(0.5*kx[:, None]*(lx/nx))/(lx/nx),
+        2.0*np.sin(0.5*ky[None, :]*(ly/ny))/(ly/ny))
+    if k_definition not in ('physical', 'lattice'):
+        raise ValueError("k_definition must be 'physical' or 'lattice'")
+    k = k_lattice if k_definition == 'lattice' else k_physical
     if bin_edges is None:
-        # Physical grid wavenumber range, inferred from L, N and BC.  Users
+        # Grid wavenumber range, inferred from L, N and BC. Users
         # should normally leave k_max=None, particularly when changing L.
         k_grid_max = float(np.max(k))
         if k_max is None:
@@ -95,10 +111,79 @@ def _geometry(shape, L, bc, n_bins, bin_edges, k_max):
     # Never include the exactly-zero mode, irrespective of bin edge settings.
     valid = (k.ravel()>0) & (which>=0) & (which<len(edges)-1)
     count = np.bincount(which[valid], minlength=len(edges)-1)
-    return dict(k=k, edges=edges, centers=(edges[:-1]+edges[1:])/2,
+    b = which[valid]
+    def mode_mean(values):
+        out = np.full(len(count), np.nan)
+        np.divide(np.bincount(b, weights=values.ravel()[valid],
+                              minlength=len(count)), count,
+                  out=out, where=count > 0)
+        return out
+    kp_mean = mode_mean(k_physical)
+    kl_mean = mode_mean(k_lattice)
+    kl_var = mode_mean(k_lattice**2) - kl_mean**2
+    return dict(k=k, k_physical=k_physical, k_lattice=k_lattice,
+                k_definition=k_definition,
+                k_mean_physical=kp_mean, k_mean_lattice=kl_mean,
+                k_std_lattice=np.sqrt(np.maximum(kl_var, 0)),
+                edges=edges, centers=(edges[:-1]+edges[1:])/2,
                 valid=valid, selected=np.flatnonzero(valid),
-                bins=which[valid], counts=count, area_cell=area_cell,
+                bins=b, counts=count, area_cell=area_cell,
                 transform=transform)
+
+
+def radial_wavenumber_map(N, L=(1., 1.), *, bc='Neumann',
+                          n_bins=40, bin_edges=None, k_max=None,
+                          k_definition='physical'):
+    """Map radial-bin *membership* between physical and FV lattice k.
+
+    With k_definition='physical', passing the saved ``k_edges`` from an
+    older sweep recovers exactly its original modes per bin. The returned
+    k_lattice_mean is an APPROXIMATE axis conversion only: the old bin
+    powers cannot be reconstructed as exact lattice-k bins without the
+    original DCT coefficients (i.e. the density snapshots/trajectory).
+    """
+    g = _geometry(tuple(map(int,N)), L, bc, n_bins, bin_edges, k_max,
+                  k_definition)
+    return dict(k=g['centers'], k_edges=g['edges'], counts=g['counts'],
+                k_definition=k_definition,
+                k_physical_mean=g['k_mean_physical'],
+                k_lattice_mean=g['k_mean_lattice'],
+                k_lattice_std=g['k_std_lattice'])
+
+
+def radial_bin_spectrum_2d(S2d, L=(1., 1.), *, bc='Neumann',
+                           n_bins=40, bin_edges=None, k_max=None,
+                           k_definition='lattice'):
+    """Azimuthally average an existing 2D theoretical/mode-resolved spectrum.
+
+    S2d shape (..., Nx, Ny), e.g. (2,2,Nx,Ny). The last two axes
+    must be on the same DCT/FFT mode grid as the simulation. With
+    bin_edges=simulation['k_edges'] and the same k_definition, this
+    reproduces EXACTLY the simulation's bin membership and normalization
+    (it averages values, but does not multiply by any FFT/DCT scaling).
+    """
+    a = np.asarray(S2d)
+    if a.ndim < 2:
+        raise ValueError('S2d needs spatial mode axes (Nx, Ny)')
+    g = _geometry(a.shape[-2:], L, bc, n_bins, bin_edges, k_max,
+                  k_definition)
+    nbin = len(g['counts'])
+    flat = a.reshape(-1, a.shape[-2]*a.shape[-1])[:,g['selected']]
+    avg = np.empty((flat.shape[0], nbin), dtype=complex)
+    for j in range(flat.shape[0]):
+        avg[j] = _bin_complex(flat[j], g['bins'], g['counts'], nbin)
+    avg = avg.reshape(a.shape[:-2]+(nbin,))
+    if np.isrealobj(a):
+        avg = avg.real
+    return dict(k=g['centers'], k_edges=g['edges'], counts=g['counts'],
+                S=avg, **_k_metadata(g))
+
+
+def _k_metadata(geo):
+    return dict(k_definition=geo['k_definition'],
+                k_physical_mean=geo['k_mean_physical'],
+                k_lattice_mean=geo['k_mean_lattice'],
+                k_lattice_std=geo['k_std_lattice'])
 
 
 def _transform(phi, transform):
@@ -174,7 +259,8 @@ def _mode_baseline(phi, geo, reference):
 
 
 def spatial_structure_factor(phi_run, L=(1.,1.), *, bc='periodic',
-                             n_bins=40, bin_edges=None, k_max=None):
+                             n_bins=40, bin_edges=None, k_max=None,
+                             k_definition='physical'):
     """Radially averaged equal-time S_ab(k,t) including the A/B cross spectrum.
 
     Returns dict with `S` of shape (T,n_bins,2,2), `S_plus`, `S_minus`
@@ -182,16 +268,18 @@ def spatial_structure_factor(phi_run, L=(1.,1.), *, bc='periodic',
     is NaN. k=0 is always excluded. Callers can select a low-k cutoff.
     """
     phi = _frames(phi_run)
-    geo = _geometry(phi.shape[-2:],L,bc,n_bins,bin_edges,k_max)
+    geo = _geometry(phi.shape[-2:],L,bc,n_bins,bin_edges,k_max,k_definition)
     S = _bin_covariances(_modes(phi,geo),geo)
     sp, sm = _components(S)
     return dict(k=geo['centers'], k_edges=geo['edges'], counts=geo['counts'],
-                S=S, S_plus=sp, S_minus=sm, bc=bc)
+                S=S, S_plus=sp, S_minus=sm, bc=bc,
+                **_k_metadata(geo))
 
 
 def excess_spectral_power(phi_run, L=(1.,1.), *, reference='initial',
                           bc='periodic', n_bins=40, bin_edges=None,
-                          k_max=None, k_band=None, threshold=1e-13,
+                          k_max=None, k_band=None, k_definition='physical',
+                          threshold=1e-13,
                           min_excess_fraction=0.10):
     """Excess spectra and segregation/integration order parameter C(t).
 
@@ -210,7 +298,7 @@ def excess_spectral_power(phi_run, L=(1.,1.), *, reference='initial',
     This is a pattern CHANNEL diagnostic, not an independent Z2 order param.
     """
     phi = _frames(phi_run)
-    geo = _geometry(phi.shape[-2:],L,bc,n_bins,bin_edges,k_max)
+    geo = _geometry(phi.shape[-2:],L,bc,n_bins,bin_edges,k_max,k_definition)
     S = _bin_covariances(_modes(phi,geo),geo)
     baseline = _mode_baseline(phi,geo,reference)
     excess = S - baseline[None,:,:,:]
@@ -241,7 +329,7 @@ def excess_spectral_power(phi_run, L=(1.,1.), *, reference='initial',
                 S_plus=plus,S_minus=minus,excess_plus=eplus,
                 excess_minus=eminus,P_plus=Pplus,P_minus=Pminus,C=C,
                 k_band=k_band, order_threshold=cutoff,
-                reference_total_power=ref_power)
+                reference_total_power=ref_power, **_k_metadata(geo))
 
 
 def segregation_index(phi_run, *, occupancy_threshold=1e-12,
@@ -325,6 +413,7 @@ def _validated_lags(lags, available_frames):
 def connected_time_lag_covariance(phi_run, dt, L=(1.,1.), *,
                                   bc='periodic', n_bins=40, bin_edges=None,
                                   k_max=None, lags=None, burn_in=0,
+                                  k_definition='physical',
                                   demean_time=True):
     """Connected C_ab(k-bin,tau) of spatial Fourier/DCT amplitudes.
 
@@ -343,7 +432,7 @@ def connected_time_lag_covariance(phi_run, dt, L=(1.,1.), *,
     if dt<=0: raise ValueError('dt must be the spacing BETWEEN SAVED frames')
     if burn_in<0 or burn_in>=a.shape[1]-1:
         raise ValueError('burn_in must leave >=2 frames')
-    geo=_geometry(a.shape[-2:],L,bc,n_bins,bin_edges,k_max)
+    geo=_geometry(a.shape[-2:],L,bc,n_bins,bin_edges,k_max,k_definition)
     z=_modes(a,geo,start=burn_in)
     T=z.shape[1]
     if demean_time: z=z-z.mean(axis=1,keepdims=True)
@@ -360,12 +449,13 @@ def connected_time_lag_covariance(phi_run, dt, L=(1.,1.), *,
     plus,minus=_components(cov)
     return dict(lags=lags, tau=lags*float(dt), k=geo['centers'],
                 counts=geo['counts'], C=cov, C_plus=plus,C_minus=minus,
-                demean_time=demean_time)
+                demean_time=demean_time, **_k_metadata(geo))
 
 
 def spatiotemporal_structure_factor(phi_run, dt, L=(1.,1.), *,
                                      bc='periodic', n_bins=40,
                                      bin_edges=None,k_max=None,burn_in=0,
+                                     k_definition='physical',
                                      window='hann',demean_time=True,
                                      return_mode_spectrum=False):
     """S_ab(k-bin, omega), with angular omega in rad / physical time.
@@ -383,7 +473,7 @@ def spatiotemporal_structure_factor(phi_run, dt, L=(1.,1.), *,
     if dt<=0: raise ValueError('dt must be the spacing BETWEEN SAVED frames')
     if burn_in<0 or burn_in>=a.shape[1]-1:
         raise ValueError('burn_in must leave >=2 frames')
-    geo=_geometry(a.shape[-2:],L,bc,n_bins,bin_edges,k_max)
+    geo=_geometry(a.shape[-2:],L,bc,n_bins,bin_edges,k_max,k_definition)
     z=_modes(a,geo,start=burn_in)
     T=z.shape[1]
     if demean_time: z=z-z.mean(axis=1,keepdims=True)
@@ -409,7 +499,7 @@ def spatiotemporal_structure_factor(phi_run, dt, L=(1.,1.), *,
     ret=dict(k=geo['centers'], k_edges=geo['edges'],counts=geo['counts'],
              omega=omega[sort], frequency=omega[sort]/(2*np.pi),
              S=S[:,sort],S_plus=Sp[:,sort],S_minus=Sm[:,sort],
-             window=window,dt_saved=dt)
+             window=window,dt_saved=dt, **_k_metadata(geo))
     if return_mode_spectrum:
         # The phases and cross spectra of specific directional k vectors
         # can be analyzed from F; do not use its circularly averaged power
@@ -423,6 +513,7 @@ def spatiotemporal_structure_factor(phi_run, dt, L=(1.,1.), *,
 
 def compute_observables(phi_run, L=(1.,1.), *, dt_saved=None, bc='periodic',
                         reference='white', n_bins=40, k_max=None,
+                        k_definition='physical',
                         k_band=None,cell_capacity=None,burn_in=0,
                         lags=None,compute_dynamics=True):
     """Convenient all-in-one analysis; pure NumPy/Scipy, no solver state.
@@ -437,13 +528,15 @@ def compute_observables(phi_run, L=(1.,1.), *, dt_saved=None, bc='periodic',
     """
     a=_frames(phi_run)
     out=dict(excess=excess_spectral_power(a,L,reference=reference,bc=bc,
-                     n_bins=n_bins,k_max=k_max,k_band=k_band),
+                     n_bins=n_bins,k_max=k_max,k_band=k_band,
+                     k_definition=k_definition),
              segregation=segregation_index(a,cell_capacity=cell_capacity,
                                            subtract_mixing=cell_capacity is not None),
              occupation=occupation_index(a))
     if compute_dynamics and a.shape[1]>2:
         if dt_saved is None: raise ValueError('dt_saved needed for dynamic observables')
-        kw=dict(bc=bc,n_bins=n_bins,k_max=k_max,burn_in=burn_in)
+        kw=dict(bc=bc,n_bins=n_bins,k_max=k_max,burn_in=burn_in,
+                k_definition=k_definition)
         out['time_lag']=connected_time_lag_covariance(a,dt_saved,L,lags=lags,**kw)
         out['spatiotemporal']=spatiotemporal_structure_factor(a,dt_saved,L,**kw)
     return out

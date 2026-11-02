@@ -23,7 +23,7 @@ import matplotlib.pyplot as plt
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from fhd.FHD_2D import fhd_2d
+from fhd.FHD_2D_old import fhd_2d
 from fhd.operations import dissimilarity, mean_relative_entropy
 
 
