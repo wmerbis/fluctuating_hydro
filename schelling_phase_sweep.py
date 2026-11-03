@@ -70,7 +70,7 @@ def parse_args(argv=None):
     p.add_argument('--people-per-cell', type=float, default=400.)
     p.add_argument('--sigma', type=float, default=0.5)
     p.add_argument('--D', nargs=2, type=float, default=(1.,1.))
-    p.add_argument('--dt', type=float, default=5e-4)
+    p.add_argument('--dt', type=float, default=1e-3)
     p.add_argument('--nsteps', type=int, default=50000)
     p.add_argument('--frames', type=int, default=500)
     p.add_argument('--rho-a', type=float, default=0.35)
@@ -87,9 +87,9 @@ def parse_args(argv=None):
                    help='For excess order parameters (physical k); default all spatial modes')
     p.add_argument('--burn-fraction', type=float, default=0.5,
                    help='Fraction of SAVED frames dropped when calculating late-time means/dynamics')
-    p.add_argument('--dynamic-kmax', type=float, default=3.,
+    p.add_argument('--dynamic-kmax', type=float, default=0,
                    help='Only retain |k| <= this for spatiotemporal analysis; --dynamic-kmax 0 disables cutoff')
-    p.add_argument('--dynamic-stride', type=int, default=4,
+    p.add_argument('--dynamic-stride', type=int, default=1,
                    help='Use every nth frame for temporal spectra/covariances')
     p.add_argument('--max-lag', type=int, default=32,
                    help='Maximum lag in downsampled saved frames')
@@ -335,10 +335,10 @@ def make_result(a,args,job,sim,elapsed):
             lags=np.arange(0,maxlag+1,dtype=int)
             tc=connected_time_lag_covariance(dyn,dtd,args.L,bc=args.bc,
                         n_bins=args.bins,k_max=kmax,lags=lags,burn_in=0,
-                        k_definition=args.k_definition)
+                        k_definition=args.k_definition, demean_time=False)
             st=spatiotemporal_structure_factor(dyn,dtd,args.L,bc=args.bc,
                         n_bins=args.bins,k_max=kmax,burn_in=0,window='hann',
-                        k_definition=args.k_definition)
+                        k_definition=args.k_definition, demean_time=False)
             result.update({
                 'dynamic_frame_indices':np.arange(burn,n_frames,args.dynamic_stride,dtype=np.int32),
                 'k_dynamic':tc['k'].astype('float32'),

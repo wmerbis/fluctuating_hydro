@@ -24,6 +24,7 @@ Usage:
     python plot_schelling_phase_diagram.py --out phase_sweep --save phase_diagrams.png
     python plot_schelling_phase_diagram.py --out phase_sweep --longwave
     python plot_schelling_phase_diagram.py --out phase_sweep --no-theory
+    python plot_schelling_phase_diagram.py --out phase_sweep --keys Omega_max r_max
 
 Overrides (otherwise values are read from out/config.json):
     --sigma 0.5 --N 128 128 --L 50 50 --bc Neumann
@@ -41,6 +42,14 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
 import numpy as np
+from matplotlib.colors import CenteredNorm
+
+# Works both as "python scripts/plot_schelling_phase_diagram.py" and as a module.
+if __package__:
+    from .observables import estimate_linear_eigenvalues, eigenvalues_from_covariance
+else:
+    from observables import estimate_linear_eigenvalues, eigenvalues_from_covariance
+ 
 
 FAMILIES = ('reciprocal', 'nonreciprocal')
 
@@ -71,6 +80,25 @@ def parse_args(argv=None):
                         help='Physical wavenumber band for temporal diagnostics; default all saved dynamic k bins')
     parser.add_argument('--osc-min-peak-ratio', type=float, default=1.10,
                         help='Require nonzero-frequency spectral peak > this multiple of low-frequency power')
+    parser.add_argument('--eig-k-range', nargs=2, type=float, default=(0.5,2.5),
+                        metavar=('KMIN','KMAX'),
+                        help='Physical k interval scanned for eigenvalue maxima (default 0.5 to 2.5)')
+    parser.add_argument('--eig-widths', nargs='+', type=float, default=(0.35,0.5,0.75),
+                        help='Physical widths of sliding k windows')
+    parser.add_argument('--eig-step', type=float, default=0.1,
+                        help='Physical k interval between sliding windows')
+    parser.add_argument('--eig-bin-width', type=float, default=0.1,
+                        help='Physical width of mode bins for raw phi runs')
+    parser.add_argument('--eig-lag', type=int, default=1,
+                        help='Lag in saved frames used for empirical propagator')
+    parser.add_argument('--eig-min-modes', type=int, default=20,
+                        help='Minimum spatial modes per band')
+    parser.add_argument('--eig-max-condition', type=float, default=1.e6,
+                        help='Maximum covariance condition number')
+    parser.add_argument('--eig-min-modulus', type=float, default=0.25,
+                        help='Reject weakly predictive discrete eigenvalues below this modulus')
+    parser.add_argument('--eig-min-cycles', type=float, default=0.5,
+                        help='Require at least this many oscillation cycles during the saved run')
     return parser.parse_args(argv)
 
 
@@ -338,8 +366,9 @@ def overlay_threshold(ax,family,betas,xs,params,*,fields=None,longwave_fields=No
 
 # These maps can be obtained from individual existing sweep NPZ files.
 # They were NOT included in *_grids.npz by the original sweep script.
+EIGEN_KEYS = ('Omega_max','r_max','r_at_Omega_max','k_Omega_max','k_r_max')
 DYNAMIC_KEYS = ('oscillation_peak', 'oscillation_frequency',
-                'oscillation_negative_lobe', 'temporal_antisymmetry')
+                'oscillation_negative_lobe', 'temporal_antisymmetry') + EIGEN_KEYS
 
 
 def dynamic_indicators(data, k_band=None, min_peak_ratio=1.10):
@@ -422,14 +451,86 @@ def dynamic_indicators(data, k_band=None, min_peak_ratio=1.10):
             result['temporal_antisymmetry']=float(np.sqrt(np.nanmean(np.abs(cross)**2))/trace0)
     return result
 
+def _mode_counts_for_saved_bins(k, params):
+    """Reconstruct the number of modes per saved radial bin using PHYSICAL L."""
+    k = np.asarray(k, dtype=float)
+    if k.size < 2 or not np.all(np.diff(k) > 0):
+        return None
+    edges = np.r_[k[0]-(k[1]-k[0])/2,
+                  (k[:-1]+k[1:])/2, k[-1]+(k[-1]-k[-2])/2]
+    nx, ny = params['N']
+    lx, ly = params['L']
+    if params['bc'].lower() == 'neumann':
+        kx = np.pi*np.arange(nx)/lx
+        ky = np.pi*np.arange(ny)/ly
+    else:
+        kx = 2*np.pi*np.fft.fftfreq(nx, d=lx/nx)
+        ky = 2*np.pi*np.fft.fftfreq(ny, d=ly/ny)
+    kval = np.hypot(kx[:,None],ky[None,:]).ravel()
+    return np.histogram(kval[kval>0], bins=edges)[0]
 
-def dynamic_grid(out, family, beta, xs, key, *, k_band=None, min_peak_ratio=1.10):
+
+def eigen_indicators(data, params, *, k_range=(0.5,2.5),
+                     widths=(0.35,0.5,0.75), step=0.1,
+                     bin_width=0.1, lag_frames=1, min_modes=20,
+                     max_condition=1.e6, min_modulus=0.25,
+                     min_cycles=0.5):
+    """Estimate rates in saved time units from raw phi or archived C_k_tau.
+
+    Prefer raw phi arrays, because archived C_k_tau was ordinarily time
+    demeaned by the sweep. Correlation-based results are provisional if
+    the simulation was not in a stationary homogeneous linear regime.
+    """
+    raw_key = next((key for key in ('phi_runs','phi_run') if key in data), None)
+    options = dict(k_range=k_range, widths=widths, step=step,
+                   min_modes=min_modes, max_condition=max_condition,
+                   min_modulus=min_modulus, min_cycles=min_cycles)
+    if raw_key is None and 'Omega_max' in data and 'r_max' in data:
+        # A sweep can persist the direct estimator outputs as scalars.
+        return {key: float(data[key]) if key in data else np.nan
+                for key in EIGEN_KEYS}
+    if raw_key is not None:
+        if 'dt_saved' in data:
+            dt = float(np.asarray(data['dt_saved']))
+        elif 'tau' in data:
+            time = np.asarray(data['tau'],float)
+            if len(time)<2:
+                return {key:np.nan for key in EIGEN_KEYS}
+            dt = float(time[1]-time[0])
+        else:
+            return {key:np.nan for key in EIGEN_KEYS}
+        result = estimate_linear_eigenvalues(
+            data[raw_key], dt, L=params['L'], bc=params['bc'],
+            bin_width=bin_width, lag_frames=lag_frames, **options)
+    elif all(key in data for key in ('C_k_tau','k_dynamic','tau')):
+        k=np.asarray(data['k_dynamic'],dtype=float)
+        t=np.asarray(data['tau'],dtype=float)
+        C=np.asarray(data['C_k_tau'])
+        if lag_frames>=len(t):
+            return {key:np.nan for key in EIGEN_KEYS}
+        counts = _mode_counts_for_saved_bins(k, params)
+        # The spectrum has one frequency per saved snapshot; use its length
+        # for the period-resolution check, not the maximum requested lag.
+        duration = ((len(data['omega'])-1)*(t[1]-t[0])
+                    if 'omega' in data and len(t)>1 else float(t[-1]))
+        result = eigenvalues_from_covariance(
+            k,t,C,counts=counts,lag_index=lag_frames,
+            duration=duration if duration>0 else None,**options)
+    else:
+        return {key:np.nan for key in EIGEN_KEYS}
+    return {key:result[key] for key in EIGEN_KEYS}
+
+
+
+def dynamic_grid(out, family, beta, xs, key, *, k_band=None, min_peak_ratio=1.10,
+                 eigen_options=None, params=None, eigen_cache=None):    
     """Build a [beta,x] map from saved per-run NPZs; average replicates."""
     shape=(len(beta),len(xs))
     sums=np.zeros(shape,dtype=float)
     counts=np.zeros(shape,dtype=int)
     folder=out/family
     matched=0
+    warned_covariance=False
     for path in folder.glob('b*_x*_r*.npz'):
         match=re.fullmatch(r'b(\d+)_x(\d+)_r(\d+)\.npz',path.name)
         if match is None: continue
@@ -441,7 +542,26 @@ def dynamic_grid(out, family, beta, xs, key, *, k_band=None, min_peak_ratio=1.10
                 if not (np.isclose(float(f['beta']),beta[ib]) and
                         np.isclose(float(f['x']),xs[ix])):
                     continue
-                score=dynamic_indicators(f,k_band,min_peak_ratio)[key]
+                if key in EIGEN_KEYS:
+                    if (not warned_covariance and
+                        not any(k in f for k in ('phi_run','phi_runs','Omega_max')) and
+                        'C_k_tau' in f):
+                        warnings.warn('Estimating from archived C_k_tau: earlier '
+                                      'sweeps time-demeaned the modes and used '
+                                      'unmatched zero/positive-lag time windows. '
+                                      'Growth rates can be biased; save phi_runs '
+                                      'or direct per-run eigenvalue estimates.',
+                                      stacklevel=2)
+                        warned_covariance=True
+                    if eigen_cache is not None and path in eigen_cache:
+                        score=eigen_cache[path][key]
+                    else:
+                        estimates=eigen_indicators(f,params,**(eigen_options or {}))
+                        if eigen_cache is not None:
+                            eigen_cache[path]=estimates
+                        score=estimates[key]
+                else:
+                    score=dynamic_indicators(f,k_band,min_peak_ratio)[key]
             if np.isfinite(score):
                 sums[ib,ix]+=score
                 counts[ib,ix]+=1
@@ -451,9 +571,10 @@ def dynamic_grid(out, family, beta, xs, key, *, k_band=None, min_peak_ratio=1.10
     result=np.full(shape,np.nan)
     np.divide(sums,counts,out=result,where=counts>0)
     if matched==0:
-        warnings.warn(f'No {key} found for {family}; did you run the sweep with '
-                      '--no-dynamics? Dynamic heatmaps require C_k_tau and S_k_omega '
-                      'in the per-run NPZ files.',stacklevel=2)
+        required = ('phi_runs or directly saved eigenvalue scalars, or C_k_tau'
+                    if key in EIGEN_KEYS else 'C_k_tau and S_k_omega')
+        warnings.warn(f'No {key} found for {family}; need {required} in '
+                      'per-run NPZ files.',stacklevel=2)
     return result
 
 
@@ -467,6 +588,11 @@ def pretty_label(key):
         'oscillation_frequency': r'Oscillation peak $\omega$',
         'oscillation_negative_lobe': r'Negative temporal-correlation lobe',
         'temporal_antisymmetry': r'Cross-lag time asymmetry',
+        'Omega_max': r'Empirical $\Omega_{\max}$',
+        'r_max': r'Empirical $r_{\max}$',
+        'r_at_Omega_max': r'$r$ at $\Omega_{\max}$',
+        'k_Omega_max': r'$k$ at $\Omega_{\max}$',
+        'k_r_max': r'$k$ at $r_{\max}$',
     }.get(key,key)
 
 def cell_edges(values):
@@ -496,9 +622,23 @@ def main(argv=None):
         raise ValueError('--osc-k-band must be 0 <= lower < upper')
     if args.osc_min_peak_ratio<=1:
         raise ValueError('--osc-min-peak-ratio must exceed 1')
+    # Fail early if a requested k scan has impossible width/spacing.
+    if (args.eig_k_range[0] <= 0 or args.eig_k_range[1] <= args.eig_k_range[0] or
+        args.eig_step <= 0 or args.eig_bin_width <= 0 or
+        args.eig_lag < 1 or args.eig_min_modes < 1 or args.eig_max_condition <= 1 or
+        not 0 <= args.eig_min_modulus < 1 or args.eig_min_cycles < 0 or
+        any(w<=0 or w>args.eig_k_range[1]-args.eig_k_range[0] for w in args.eig_widths)):
+        raise ValueError('Invalid --eig-* options')
+    eigen_options=dict(k_range=args.eig_k_range, widths=args.eig_widths,
+                       step=args.eig_step, bin_width=args.eig_bin_width,
+                       lag_frames=args.eig_lag, min_modes=args.eig_min_modes,
+                       max_condition=args.eig_max_condition,
+                       min_modulus=args.eig_min_modulus,
+                       min_cycles=args.eig_min_cycles)
     fig,axes=plt.subplots(len(found),len(args.keys),
              figsize=(5.*len(args.keys),4.5*len(found)),squeeze=False,
              constrained_layout=True)
+    eigen_cache={}  # Avoid repeating a DCT regression for every plotted eigen key.
     for irow,(family,path) in enumerate(found):
         with np.load(path,allow_pickle=False) as data:
             bs=np.asarray(data['beta'],dtype=float)
@@ -519,7 +659,9 @@ def main(argv=None):
                 if key in DYNAMIC_KEYS:
                     values=dynamic_grid(args.out,family,bs,xs,key,
                                         k_band=args.osc_k_band,
-                                        min_peak_ratio=args.osc_min_peak_ratio)
+                                        min_peak_ratio=args.osc_min_peak_ratio,
+                                        eigen_options=eigen_options, params=params,
+                                        eigen_cache=eigen_cache)
                 elif key in data:
                     values=np.asarray(data[key],dtype=float)
                 else:
@@ -533,10 +675,14 @@ def main(argv=None):
                     kwargs={}
                     if key=='C_late': kwargs.update(cmap='RdYlGn',vmin=-1,vmax=1)
                     elif key in ('oscillation_peak','oscillation_negative_lobe'):
-                        kwargs.update(cmap='magma',vmin=0,vmax=1)
+                        kwargs.update(cmap='magma',vmin=0)
                     elif key == 'entropy_kl_late': kwargs.update(cmap = 'plasma')
                     elif key=='temporal_antisymmetry': kwargs.update(cmap='magma',vmin=0)
                     elif key=='oscillation_frequency': kwargs.update(cmap='plasma',vmin=0)
+                    elif key in ('r_max','r_at_Omega_max'):
+                        kwargs.update(cmap='coolwarm',norm=CenteredNorm(vcenter=0))
+                    elif key in EIGEN_KEYS:
+                        kwargs.update(cmap='viridis',vmin=0)
                     else: kwargs.update(cmap='viridis',vmin=0)
                     # Sweep values indexed [beta,x], pcolormesh rows=x cols=beta.
                     im=ax.pcolormesh(cell_edges(bs),cell_edges(xs),

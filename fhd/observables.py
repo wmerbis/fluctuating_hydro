@@ -1,8 +1,9 @@
 """Spatial and spatiotemporal observables for two-species Schelling models.
 
 Works directly with FHD ``phi_run`` of shape (2, T, Nx, Ny), or with one
-configuration (2, Nx, Ny). The same density-field interface works for a
-coarse-grained ABM (use counts divided by the number of lattice sites/box).
+configuration (2, Nx, Ny).  Physical domain defaults to L=(50,50).The same 
+density-field interface works for a coarse-grained ABM (use counts divided 
+by the number of lattice sites/box).
 
 Units and conventions
 ---------------------
@@ -39,6 +40,7 @@ __all__ = [
     'spatial_structure_factor', 'excess_spectral_power',
     'segregation_index', 'occupation_index',
     'connected_time_lag_covariance', 'spatiotemporal_structure_factor',
+    'estimate_linear_eigenvalues', 'eigenvalues_from_covariance',
     'compute_observables', 'radial_wavenumber_map',
     'radial_bin_spectrum_2d',
 ]
@@ -131,7 +133,7 @@ def _geometry(shape, L, bc, n_bins, bin_edges, k_max, k_definition='physical'):
                 transform=transform)
 
 
-def radial_wavenumber_map(N, L=(1., 1.), *, bc='Neumann',
+def radial_wavenumber_map(N, L=(50., 50.), *, bc='Neumann',
                           n_bins=40, bin_edges=None, k_max=None,
                           k_definition='physical'):
     """Map radial-bin *membership* between physical and FV lattice k.
@@ -151,7 +153,7 @@ def radial_wavenumber_map(N, L=(1., 1.), *, bc='Neumann',
                 k_lattice_std=g['k_std_lattice'])
 
 
-def radial_bin_spectrum_2d(S2d, L=(1., 1.), *, bc='Neumann',
+def radial_bin_spectrum_2d(S2d, L=(50., 50.), *, bc='Neumann',
                            n_bins=40, bin_edges=None, k_max=None,
                            k_definition='lattice'):
     """Azimuthally average an existing 2D theoretical/mode-resolved spectrum.
@@ -258,7 +260,7 @@ def _mode_baseline(phi, geo, reference):
         return np.mean(_bin_covariances(modes,geo),axis=0)
 
 
-def spatial_structure_factor(phi_run, L=(1.,1.), *, bc='periodic',
+def spatial_structure_factor(phi_run, L=(50.,50.), *, bc='periodic',
                              n_bins=40, bin_edges=None, k_max=None,
                              k_definition='physical'):
     """Radially averaged equal-time S_ab(k,t) including the A/B cross spectrum.
@@ -276,7 +278,7 @@ def spatial_structure_factor(phi_run, L=(1.,1.), *, bc='periodic',
                 **_k_metadata(geo))
 
 
-def excess_spectral_power(phi_run, L=(1.,1.), *, reference='initial',
+def excess_spectral_power(phi_run, L=(50.,50.), *, reference='initial',
                           bc='periodic', n_bins=40, bin_edges=None,
                           k_max=None, k_band=None, k_definition='physical',
                           threshold=1e-13,
@@ -410,7 +412,7 @@ def _validated_lags(lags, available_frames):
     return requested[keep]
 
 
-def connected_time_lag_covariance(phi_run, dt, L=(1.,1.), *,
+def connected_time_lag_covariance(phi_run, dt, L=(50.,50.), *,
                                   bc='periodic', n_bins=40, bin_edges=None,
                                   k_max=None, lags=None, burn_in=0,
                                   k_definition='physical',
@@ -452,7 +454,7 @@ def connected_time_lag_covariance(phi_run, dt, L=(1.,1.), *,
                 demean_time=demean_time, **_k_metadata(geo))
 
 
-def spatiotemporal_structure_factor(phi_run, dt, L=(1.,1.), *,
+def spatiotemporal_structure_factor(phi_run, dt, L=(50.,50.), *,
                                      bc='periodic', n_bins=40,
                                      bin_edges=None,k_max=None,burn_in=0,
                                      k_definition='physical',
@@ -510,12 +512,202 @@ def spatiotemporal_structure_factor(phi_run, dt, L=(1.,1.), *,
         ret['mode_spectrum_scale']=scale
     return ret
 
+def _scanning_bands(k_range, widths, step):
+    """Physical-k windows, including the rightmost window of every width."""
+    lo, hi = map(float, k_range)
+    if not (np.isfinite(lo) and np.isfinite(hi) and 0 < lo < hi):
+        raise ValueError('k_range must satisfy 0 < lower < upper')
+    if not np.isfinite(step) or step <= 0:
+        raise ValueError('step must be positive')
+    bands = []
+    for width in widths:
+        width = float(width)
+        if not (np.isfinite(width) and 0 < width <= hi - lo):
+            raise ValueError('Every band width must be in (0, k_range span]')
+        starts = np.arange(lo, hi-width+1.e-10, step)
+        starts = np.unique(np.r_[starts, hi-width])
+        for left in starts:
+            bands.append((float(left), float(left+width)))
+    return np.asarray(bands)
 
-def compute_observables(phi_run, L=(1.,1.), *, dt_saved=None, bc='periodic',
+
+def eigenvalues_from_covariance(k, tau, C, *, counts=None,
+                                k_range=(0.5, 3.0),
+                                widths=(0.35, 0.5, 0.75), step=0.1,
+                                lag_index=1, min_modes=20,
+                                max_condition=1.e6, min_modulus=0.25,
+                                min_cycles=0.5, duration=None):
+    """Estimate bandwise rates from C(k,tau) and scan over physical k bands.
+
+    For each band, A=C(tau)@inv(C(0)), with eigenvalues mu, and
+    lambda=log(mu)/tau.  The 2x2 real propagator is estimated from the
+    *mode-count weighted* covariances (counts=None gives equal bin weights).
+    In the stable linear regime the result estimates the response generator.
+    In a nonlinear or non-stationary regime it is an effective local fit.
+
+    IMPORTANT: C must be computed WITHOUT temporal demeaning for an evolving
+    state.  Pre-existing C_k_tau files might have been time demeaned, in
+    which case inferred rates may be biased.  Spatial demeaning is fine.
+    Direct estimators should use estimate_linear_eigenvalues below.
+
+    Omega_max=max |Im(lambda)| and r_max=max Re(lambda) are INDEPENDENT
+    maxima over the scanned bands. Missing/ill-conditioned bands are skipped.
+    Small propagator eigenvalues (poor one-lag predictability) are rejected.
+    If duration is supplied, oscillations with <min_cycles cycles over that
+    duration are unresolved and receive Omega=0. These are heuristics, not
+    formal hypothesis tests. No complex pair -> 0; no valid fits -> NaN.
+    """
+    k = np.asarray(k, dtype=float)
+    tau = np.asarray(tau, dtype=float)
+    C = np.asarray(C)
+    if k.ndim != 1 or tau.ndim != 1 or C.shape != (len(tau), len(k), 2, 2):
+        raise ValueError('Require k[nk], tau[nt], C[nt,nk,2,2]')
+    if lag_index <= 0 or lag_index >= len(tau) or not np.isclose(tau[0], 0):
+        raise ValueError('lag_index must select a positive lag, and tau[0]=0')
+    delta_t = float(tau[lag_index])
+    if not np.isfinite(delta_t) or delta_t <= 0:
+        raise ValueError('Selected lag must be positive')
+    if counts is None:
+        weights = np.ones(len(k), dtype=float)
+        # At least two independent radial bins for a pre-averaged C.
+        minimum = 2
+    else:
+        weights = np.asarray(counts, dtype=float)
+        if weights.shape != k.shape or np.any(weights < 0):
+            raise ValueError('counts must be nonnegative and match k')
+        minimum = int(min_modes)
+    if (minimum < 1 or max_condition <= 1 or
+        not 0 <= min_modulus < 1 or min_cycles < 0 or
+        (duration is not None and duration <= 0)):
+        raise ValueError('Invalid covariance-fit or resolution thresholds')
+
+    bands = _scanning_bands(k_range, widths, step)
+    omega = np.full(len(bands), np.nan)
+    growth = np.full(len(bands), np.nan)
+    cond = np.full(len(bands), np.nan)
+    n_modes = np.zeros(len(bands), dtype=int)
+    for i, (lo, hi) in enumerate(bands):
+        selected = (k >= lo-1.e-12) & (k <= hi+1.e-12) & (weights > 0)
+        selected &= np.isfinite(C[0]).all(axis=(1, 2))
+        selected &= np.isfinite(C[lag_index]).all(axis=(1, 2))
+        n_modes[i] = int(np.sum(weights[selected]))
+        if n_modes[i] < minimum:
+            continue
+        w = weights[selected]
+        # FFT +/-k pairs or real DCT modes give a real-space response matrix.
+        C0 = np.average(C[0, selected].real, axis=0, weights=w)
+        C1 = np.average(C[lag_index, selected].real, axis=0, weights=w)
+        C0 = 0.5 * (C0 + C0.T)
+        cond[i] = np.linalg.cond(C0)
+        if not np.isfinite(cond[i]) or cond[i] > max_condition:
+            continue
+        try:
+            A = np.linalg.solve(C0.T, C1.T).T
+        except np.linalg.LinAlgError:
+            continue
+        # Real 2x2: exclude nonphysical negative real discrete eigenvalues,
+        # for which the principal complex logarithm would invent pi/dt.
+        disc = (A[0, 0]-A[1, 1])**2 + 4.*A[0, 1]*A[1, 0]
+        if disc < 0:
+            mu = np.linalg.eigvals(A.astype(complex))
+            if (not np.all(np.isfinite(mu)) or
+                np.min(np.abs(mu)) < min_modulus or np.any(np.abs(mu) <= 0)):
+                continue
+            rates = np.log(mu)/delta_t
+            omega[i] = float(np.max(np.abs(rates.imag)))
+            if (duration is not None and
+                omega[i]*duration < 2*np.pi*min_cycles):
+                omega[i] = 0.
+            growth[i] = float(np.max(rates.real))
+        else:
+            mu = np.linalg.eigvalsh(A) if np.allclose(A, A.T) else np.linalg.eigvals(A)
+            if (np.any(~np.isfinite(mu)) or
+                np.any(np.real(mu) <= 0) or np.max(np.real(mu)) < min_modulus):
+                continue
+            omega[i] = 0.
+            growth[i] = float(np.max(np.log(np.real(mu)))/delta_t)
+
+    good_omega = np.flatnonzero(np.isfinite(omega))
+    good_growth = np.flatnonzero(np.isfinite(growth))
+    i_omega = int(good_omega[np.argmax(omega[good_omega])]) if len(good_omega) else None
+    i_growth = int(good_growth[np.argmax(growth[good_growth])]) if len(good_growth) else None
+    def center(i):
+        return float(bands[i].mean()) if i is not None else np.nan
+    return dict(Omega_max=float(omega[i_omega]) if i_omega is not None else np.nan,
+                r_max=float(growth[i_growth]) if i_growth is not None else np.nan,
+                r_at_Omega_max=float(growth[i_omega]) if i_omega is not None else np.nan,
+                k_Omega_max=center(i_omega), k_r_max=center(i_growth),
+                band_Omega_max=bands[i_omega].copy() if i_omega is not None else np.full(2,np.nan),
+                band_r_max=bands[i_growth].copy() if i_growth is not None else np.full(2,np.nan),
+                bands=bands, omega_by_band=omega, r_by_band=growth,
+                condition_by_band=cond, n_modes_by_band=n_modes,
+                lag_time=delta_t)
+
+
+def estimate_linear_eigenvalues(phi_runs, dt_saved, L=(50., 50.), *,
+                                bc='Neumann', k_range=(0.5, 2.5),
+                                widths=(0.35, 0.5, 0.75), step=0.1,
+                                bin_width=0.1, lag_frames=1,
+                                burn_in=0, end_frame=None,
+                                min_modes=20, max_condition=1.e6,
+                                min_modulus=0.25, min_cycles=0.5):
+    """Fit dynamic eigenvalues from raw runs without temporal demeaning.
+
+    Accepts (2,T,Nx,Ny) or (R,2,T,Nx,Ny). Multiple runs are pooled at
+    the covariance level *before* fitting, reducing maximal-band selection
+    bias. The domain L sets physical k=pi*n/L for Neumann DCT modes.
+    dt_saved is the interval BETWEEN SAVED snapshots, not the solver dt.
+    Use time windows that remain approximately homogeneous and linear.
+    """
+    a = np.asarray(phi_runs)
+    if a.ndim == 4:
+        a = a[None, ...]
+    if a.ndim != 5 or a.shape[1] != 2:
+        raise ValueError('phi_runs must have shape (2,T,Nx,Ny) or (R,2,T,Nx,Ny)')
+    if end_frame is None:
+        end_frame = a.shape[2]
+    if not (0 <= burn_in < end_frame <= a.shape[2] and
+            end_frame-burn_in > lag_frames >= 1):
+        raise ValueError('Need at least lag_frames+1 frames after burn_in')
+    if bin_width <= 0 or not np.isfinite(bin_width):
+        raise ValueError('bin_width must be positive')
+    hi = float(k_range[1])
+    edges = np.arange(0., hi+bin_width, bin_width)
+    if edges[-1] < hi:
+        edges = np.r_[edges, hi]
+    # Match the source times in C0 and C1.  In particular, an estimator
+    # using an all-times C(0) and a shorter-lag C(dt) can severely bias
+    # growing (nonstationary) modes. Both use t=0,...,T-lag-1 here.
+    geo = _geometry(a.shape[-2:], L, bc, n_bins=len(edges)-1,
+                    bin_edges=edges, k_max=None)
+    nb = len(geo['counts'])
+    cov = np.zeros((2, nb, 2, 2), dtype=complex)
+    n_pairs = end_frame - burn_in - lag_frames
+    for run in a:
+        z = _modes(run[:, burn_in:end_frame], geo)
+        X, Y = z[:, :-lag_frames], z[:, lag_frames:]
+        for aa in range(2):
+            for bb in range(2):
+                for lag, Z in enumerate((X, Y)):
+                    per_mode = np.einsum('tm,tm->m', Z[aa], X[bb].conj(),
+                                         optimize=True) / n_pairs
+                    cov[lag, :, aa, bb] += geo['area_cell'] * _bin_complex(
+                        per_mode, geo['bins'], geo['counts'], nb)
+    cov /= len(a)
+    return eigenvalues_from_covariance(
+        geo['centers'], [0., lag_frames*float(dt_saved)], cov,
+        counts=geo['counts'], k_range=k_range, widths=widths,
+        step=step, lag_index=1, min_modes=min_modes,
+        max_condition=max_condition, min_modulus=min_modulus,
+        min_cycles=min_cycles,
+        duration=(end_frame-burn_in-1)*float(dt_saved))
+
+def compute_observables(phi_run, L=(50.,50.), *, dt_saved=None, bc='periodic',
                         reference='white', n_bins=40, k_max=None,
                         k_definition='physical',
                         k_band=None,cell_capacity=None,burn_in=0,
-                        lags=None,compute_dynamics=True):
+                        lags=None,compute_dynamics=True, demean_time = False,
+                        compute_eigenmodes=False, eigen_kwargs=None):
     """Convenient all-in-one analysis; pure NumPy/Scipy, no solver state.
 
     `dt_saved` MUST be the separation of stored phi_run frames, i.e.
@@ -524,7 +716,9 @@ def compute_observables(phi_run, L=(1.,1.), *, dt_saved=None, bc='periodic',
     from L, shape(phi_run) and bc. For nonlinear phase classification, you
     may optionally restrict k_max/k_band to large-scale patterns. Supplied
     lags too large for the frames remaining after burn_in are omitted with
-    a warning; lags=None always works.
+    a warning; lags=None always works. To add the direct (matched-pair)
+    eigenvalue estimate set compute_eigenmodes=True and optionally pass
+    eigen_kwargs (for k range, widths, lag, etc.).
     """
     a=_frames(phi_run)
     out=dict(excess=excess_spectral_power(a,L,reference=reference,bc=bc,
@@ -536,7 +730,10 @@ def compute_observables(phi_run, L=(1.,1.), *, dt_saved=None, bc='periodic',
     if compute_dynamics and a.shape[1]>2:
         if dt_saved is None: raise ValueError('dt_saved needed for dynamic observables')
         kw=dict(bc=bc,n_bins=n_bins,k_max=k_max,burn_in=burn_in,
-                k_definition=k_definition)
+                k_definition=k_definition, demean_time = demean_time)
         out['time_lag']=connected_time_lag_covariance(a,dt_saved,L,lags=lags,**kw)
         out['spatiotemporal']=spatiotemporal_structure_factor(a,dt_saved,L,**kw)
+        if compute_eigenmodes:
+            out['eigenmodes']=estimate_linear_eigenvalues(
+                a,dt_saved,L=L,bc=bc,burn_in=burn_in,**(eigen_kwargs or {}))
     return out
