@@ -817,7 +817,6 @@ def compute_observables(phi_run, L=(50.,50.), *, dt_saved=None, bc='periodic',
     a=_frames(phi_run)
     out=dict(excess=excess_spectral_power(a,L,reference=reference,bc=bc,
                      n_bins=n_bins,k_max=k_max,k_band=k_band,
-                     n_bins=n_bins,k_max=k_max,k_band=k_band,
                      reference_cell_capacity=reference_cell_capacity,
                      reference_rho=reference_rho, k_definition=k_definition),
              segregation=segregation_index(a,cell_capacity=cell_capacity,
@@ -830,10 +829,10 @@ def compute_observables(phi_run, L=(50.,50.), *, dt_saved=None, bc='periodic',
         out['time_lag']=connected_time_lag_covariance(a,dt_saved,L,lags=lags,**kw)
         out['spatiotemporal']=spatiotemporal_structure_factor(a,dt_saved,L,**kw)
         out['time_lag']=connected_time_lag_covariance(
-            a,dt_saved,L,lags=lags,demean_time=demean_time,
+            a,dt_saved,L,lags=lags,
             method=corr_method,mode_chunk_size=mode_chunk_size,**kw)
         out['spatiotemporal']=spatiotemporal_structure_factor(
-            a,dt_saved,L,demean_time=demean_time,**kw)
+            a,dt_saved,L,**kw)
         if compute_eigenmodes:
             out['eigenmodes']=estimate_linear_eigenvalues(
                 a,dt_saved,L=L,bc=bc,burn_in=burn_in,**(eigen_kwargs or {}))
