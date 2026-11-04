@@ -44,11 +44,10 @@ from matplotlib.lines import Line2D
 import numpy as np
 from matplotlib.colors import CenteredNorm
 
-# Works both as "python scripts/plot_schelling_phase_diagram.py" and as a module.
-if __package__:
-    from .observables import estimate_linear_eigenvalues, eigenvalues_from_covariance
-else:
-    from observables import estimate_linear_eigenvalues, eigenvalues_from_covariance
+from fhd.observables import (
+    estimate_linear_eigenvalues,
+    eigenvalues_from_covariance,
+)
  
 
 FAMILIES = ('reciprocal', 'nonreciprocal')
@@ -80,6 +79,8 @@ def parse_args(argv=None):
                         help='Physical wavenumber band for temporal diagnostics; default all saved dynamic k bins')
     parser.add_argument('--osc-min-peak-ratio', type=float, default=1.10,
                         help='Require nonzero-frequency spectral peak > this multiple of low-frequency power')
+    parser.add_argument('--osc-max-lag-fraction', type=float, default=0.75,
+                        help='Use lags up to this fraction of the post-burn-in trajectory duration for diagnostics (default 0.75); all C(k,tau) values remain saved')
     parser.add_argument('--eig-k-range', nargs=2, type=float, default=(0.5,2.5),
                         metavar=('KMIN','KMAX'),
                         help='Physical k interval scanned for eigenvalue maxima (default 0.5 to 2.5)')
@@ -334,20 +335,23 @@ def overlay_threshold(ax,family,betas,xs,params,*,fields=None,longwave_fields=No
                         color='black',linestyle='solid',linewidth=2.2):
             out.append('lambda_minus')
     else:
-        # Retain the earlier stability-boundary calculation for the
-        # nonreciprocal family: solid = stationary, dashed = Hopf-like.
-        stationary=np.where(fields['trace_min']>0.,fields['det_min'],np.nan)
-        hopf=np.where(fields['det_min']>0.,fields['trace_min'],np.nan)
-        if draw_contour(ax,betas,xs,stationary,
-                        color='black',linestyle='solid',linewidth=2.0):
+        # Nonreciprocal family: continue both stability contours
+        # throughout the phase diagram, including unstable regions.
+
+        # Stationary branch: det(J + k²B) = 0
+        if draw_contour(ax, betas, xs, fields['det_min'],
+                        color='black', linestyle='solid', linewidth=2.0):
             out.append('stationary')
-        if draw_contour(ax,betas,xs,hopf,
-                        color='black',linestyle='dashed',linewidth=2.0):
+
+        # Hopf-like branch: tr(J + k²B) = 0
+        if draw_contour(ax, betas, xs, fields['trace_min'],
+                        color='black', linestyle='dashed', linewidth=2.0):
             out.append('oscillatory')
-        # Onset of complex modes: Delta(q)=0 for SOME allowed wavevector.
-        # This is not restricted to linearly stable or unstable regions.
-        if draw_contour(ax,betas,xs,fields['discriminant_min'],
-                        color='#7a2778',linestyle='dotted',linewidth=2.0,zorder=7):
+
+        # Onset of complex eigenvalues
+        if draw_contour(ax, betas, xs, fields['discriminant_min'],
+                        color='#7a2778', linestyle='dotted',
+                        linewidth=2.0, zorder=7):
             out.append('complex_onset')
 
     if longwave_fields is not None:
@@ -366,12 +370,14 @@ def overlay_threshold(ax,family,betas,xs,params,*,fields=None,longwave_fields=No
 
 # These maps can be obtained from individual existing sweep NPZ files.
 # They were NOT included in *_grids.npz by the original sweep script.
-EIGEN_KEYS = ('Omega_max','r_max','r_at_Omega_max','k_Omega_max','k_r_max')
+EIGEN_KEYS = ('Omega_max','r_max','r_at_Omega_max','k_Omega_max','k_r_max',
+              'r_complex_max','Omega_at_r_complex_max','k_r_complex_max')
 DYNAMIC_KEYS = ('oscillation_peak', 'oscillation_frequency',
                 'oscillation_negative_lobe', 'temporal_antisymmetry') + EIGEN_KEYS
 
 
-def dynamic_indicators(data, k_band=None, min_peak_ratio=1.10):
+def dynamic_indicators(data, k_band=None, min_peak_ratio=1.10,
+                       max_lag_fraction=0.75):
     """Summaries of already-saved DCT/FFT temporal observables.
 
     oscillation_peak: finite-frequency peak prominence of the spatially
@@ -389,6 +395,8 @@ def dynamic_indicators(data, k_band=None, min_peak_ratio=1.10):
     not uniquely an oscillatory phase.
     """
     result = {key: np.nan for key in DYNAMIC_KEYS}
+    if not 0 < max_lag_fraction <= 1:
+        raise ValueError('max_lag_fraction must lie in (0,1]')
     if not all(key in data for key in ('k_dynamic', 'omega', 'S_k_omega', 'tau', 'C_k_tau')):
         return result
     k=np.asarray(data['k_dynamic'], dtype=float)
@@ -440,16 +448,63 @@ def dynamic_indicators(data, k_band=None, min_peak_ratio=1.10):
 
     # The lag statistic is intentionally a separate diagnostic: time
     # demeaning over a short window can give spurious negative lobes.
+    # Full C(tau) may be saved, but extreme lags have very few pairs. Limit
+    # the phase score to a chosen fraction of the available record length.
     if len(tau)>1 and C.shape[0]==len(tau):
+        n_frames = len(omega)  # one FFT frequency for each post-burn-in frame
+        domega = float(np.median(np.diff(omega)))
+        if np.isfinite(domega) and domega > 0 and n_frames > 1:
+            dt_saved = 2*np.pi/(n_frames*domega)
+            lag_ok = (tau > 0) & (tau <= max_lag_fraction*(n_frames-1)*dt_saved + 1.e-12)
+        else:
+            lag_ok = tau > 0
         trace=np.real(C[...,0,0]+C[...,1,1])
-        with np.errstate(invalid='ignore'):
-            trace0=float(np.nanmean(trace[0,keep]))
-            lag_trace=np.nanmean(trace[1:,keep],axis=1)
-        if np.isfinite(trace0) and trace0>0 and np.any(np.isfinite(lag_trace)):
-            result['oscillation_negative_lobe']=float(np.clip(-np.nanmin(lag_trace)/trace0,0.,1.))
-            cross=C[1:,keep,0,1]-C[1:,keep,1,0]
-            result['temporal_antisymmetry']=float(np.sqrt(np.nanmean(np.abs(cross)**2))/trace0)
+        if np.any(lag_ok):
+            with np.errstate(invalid='ignore'):
+                trace0=float(np.nanmean(trace[0,keep]))
+                lag_trace=np.nanmean(trace[lag_ok][:,keep],axis=1)
+            if np.isfinite(trace0) and trace0>0 and np.any(np.isfinite(lag_trace)):
+                result['oscillation_negative_lobe']=float(np.clip(-np.nanmin(lag_trace)/trace0,0.,1.))
+                cross=C[lag_ok][:,keep,0,1]-C[lag_ok][:,keep,1,0]
+                result['temporal_antisymmetry']=float(np.sqrt(np.nanmean(np.abs(cross)**2))/trace0)
     return result
+
+def temporal_diagnostic_summary(data, k_band=None):
+    """Inspect why an archived run does or does not have oscillation peaks.
+
+    Accepts a loaded NPZ or mapping, for use interactively from notebooks.
+    Retained time span, spectral resolution, and trace-power comparisons
+    can distinguish a too-short run from a genuinely non-peaked spectrum.
+    """
+    k=np.asarray(data['k_dynamic'],float)
+    omega=np.asarray(data['omega'],float)
+    tau=np.asarray(data['tau'],float)
+    S=np.asarray(data['S_k_omega'])
+    keep=np.isfinite(k)
+    if k_band is not None:
+        keep &= (k>=k_band[0]) & (k<=k_band[1])
+    if not np.any(keep):
+        raise ValueError('No saved spatial bins in k_band')
+    P=np.nanmean(np.real(S[keep,:,0,0]+S[keep,:,1,1]),axis=0)
+    zero=np.argmin(np.abs(omega))
+    positive=np.flatnonzero(omega>0)
+    domega=float(np.median(np.diff(omega)))
+    duration=2*np.pi/domega if domega>0 else np.nan
+    low=float(max(P[zero],P[positive[0]],0)) if len(positive) else np.nan
+    finite_positive=positive[np.isfinite(P[positive])]
+    peak_i=int(finite_positive[np.argmax(P[finite_positive])]) if len(finite_positive) else None
+    peak_power=float(P[peak_i]) if peak_i is not None else np.nan
+    return dict(n_k_bins=int(keep.sum()), n_time_frames=len(omega),
+                n_saved_lags=len(tau), max_stored_lag=float(tau[-1]),
+                post_burn_duration=duration,
+                frequency_resolution=domega,
+                low_frequency_power=low,
+                largest_positive_frequency_power=peak_power,
+                largest_positive_to_low_ratio=float(peak_power/low)
+                    if peak_i is not None and low>0 else np.nan,
+                omega_at_largest_power=float(omega[peak_i])
+                    if peak_i is not None else np.nan)
+
 
 def _mode_counts_for_saved_bins(k, params):
     """Reconstruct the number of modes per saved radial bin using PHYSICAL L."""
@@ -485,10 +540,11 @@ def eigen_indicators(data, params, *, k_range=(0.5,2.5),
     options = dict(k_range=k_range, widths=widths, step=step,
                    min_modes=min_modes, max_condition=max_condition,
                    min_modulus=min_modulus, min_cycles=min_cycles)
-    if raw_key is None and 'Omega_max' in data and 'r_max' in data:
-        # A sweep can persist the direct estimator outputs as scalars.
-        return {key: float(data[key]) if key in data else np.nan
-                for key in EIGEN_KEYS}
+    saved={key: float(data[key]) if key in data else np.nan
+           for key in EIGEN_KEYS}
+    if raw_key is None and all(key in data for key in EIGEN_KEYS):
+        # All direct estimator outputs were persisted in the sweep.
+        return saved
     if raw_key is not None:
         if 'dt_saved' in data:
             dt = float(np.asarray(data['dt_saved']))
@@ -517,13 +573,17 @@ def eigen_indicators(data, params, *, k_range=(0.5,2.5),
             k,t,C,counts=counts,lag_index=lag_frames,
             duration=duration if duration>0 else None,**options)
     else:
-        return {key:np.nan for key in EIGEN_KEYS}
-    return {key:result[key] for key in EIGEN_KEYS}
+        return saved
+    # Prefer directly saved scalars when available (they may be less biased
+    # than archived, time-demeaned covariances); fill missing new diagnostics.
+    return {key: saved[key] if np.isfinite(saved[key]) else result[key]
+            for key in EIGEN_KEYS}
 
 
 
 def dynamic_grid(out, family, beta, xs, key, *, k_band=None, min_peak_ratio=1.10,
-                 eigen_options=None, params=None, eigen_cache=None):    
+                 max_lag_fraction=0.75, eigen_options=None, params=None, 
+                 eigen_cache=None):    
     """Build a [beta,x] map from saved per-run NPZs; average replicates."""
     shape=(len(beta),len(xs))
     sums=np.zeros(shape,dtype=float)
@@ -543,8 +603,8 @@ def dynamic_grid(out, family, beta, xs, key, *, k_band=None, min_peak_ratio=1.10
                         np.isclose(float(f['x']),xs[ix])):
                     continue
                 if key in EIGEN_KEYS:
-                    if (not warned_covariance and
-                        not any(k in f for k in ('phi_run','phi_runs','Omega_max')) and
+                    if (not warned_covariance and key not in f and
+                        not any(k in f for k in ('phi_run','phi_runs')) and
                         'C_k_tau' in f):
                         warnings.warn('Estimating from archived C_k_tau: earlier '
                                       'sweeps time-demeaned the modes and used '
@@ -561,7 +621,9 @@ def dynamic_grid(out, family, beta, xs, key, *, k_band=None, min_peak_ratio=1.10
                             eigen_cache[path]=estimates
                         score=estimates[key]
                 else:
-                    score=dynamic_indicators(f,k_band,min_peak_ratio)[key]
+                    score=dynamic_indicators(
+                        f,k_band,min_peak_ratio,
+                        max_lag_fraction=max_lag_fraction)[key]
             if np.isfinite(score):
                 sums[ib,ix]+=score
                 counts[ib,ix]+=1
@@ -593,6 +655,9 @@ def pretty_label(key):
         'r_at_Omega_max': r'$r$ at $\Omega_{\max}$',
         'k_Omega_max': r'$k$ at $\Omega_{\max}$',
         'k_r_max': r'$k$ at $r_{\max}$',
+        'r_complex_max': r'Largest growth of oscillatory mode',
+        'Omega_at_r_complex_max': r'$\Omega$ at fastest-growing complex mode',
+        'k_r_complex_max': r'$k$ at fastest-growing complex mode',
     }.get(key,key)
 
 def cell_edges(values):
@@ -622,6 +687,8 @@ def main(argv=None):
         raise ValueError('--osc-k-band must be 0 <= lower < upper')
     if args.osc_min_peak_ratio<=1:
         raise ValueError('--osc-min-peak-ratio must exceed 1')
+    if not 0 < args.osc_max_lag_fraction <= 1:
+        raise ValueError('--osc-max-lag-fraction must lie in (0,1]')
     # Fail early if a requested k scan has impossible width/spacing.
     if (args.eig_k_range[0] <= 0 or args.eig_k_range[1] <= args.eig_k_range[0] or
         args.eig_step <= 0 or args.eig_bin_width <= 0 or
@@ -660,6 +727,7 @@ def main(argv=None):
                     values=dynamic_grid(args.out,family,bs,xs,key,
                                         k_band=args.osc_k_band,
                                         min_peak_ratio=args.osc_min_peak_ratio,
+                                        max_lag_fraction=args.osc_max_lag_fraction,
                                         eigen_options=eigen_options, params=params,
                                         eigen_cache=eigen_cache)
                 elif key in data:
@@ -679,8 +747,8 @@ def main(argv=None):
                     elif key == 'entropy_kl_late': kwargs.update(cmap = 'plasma')
                     elif key=='temporal_antisymmetry': kwargs.update(cmap='magma',vmin=0)
                     elif key=='oscillation_frequency': kwargs.update(cmap='plasma',vmin=0)
-                    elif key in ('r_max','r_at_Omega_max'):
-                        kwargs.update(cmap='coolwarm',norm=CenteredNorm(vcenter=0))
+                    elif key in ('r_max','r_at_Omega_max','r_complex_max'):
+                        kwargs.update(cmap='coolwarm') #,norm=CenteredNorm(vcenter=0))
                     elif key in EIGEN_KEYS:
                         kwargs.update(cmap='viridis',vmin=0)
                     else: kwargs.update(cmap='viridis',vmin=0)
@@ -705,9 +773,9 @@ def main(argv=None):
                                label=r'Reciprocal $\lambda_+^{\min}=0$')]
         if any(family=='nonreciprocal' for family,_ in found):
             handles += [Line2D([0],[0],color='black',lw=2,ls='-',
-                               label='Nonreciprocal stationary threshold'),
+                               label='Nonreciprocal onset of stationary instability'),
                         Line2D([0],[0],color='black',lw=2,ls='--',
-                               label='Nonreciprocal oscillatory threshold'),
+                               label='Nonreciprocal onset of oscillatory instability'),
                         Line2D([0],[0],color='#7a2778',lw=2,ls=':',
                                label=r'Complex modes: $\min_q\Delta(q)=0$')]
         if args.longwave:

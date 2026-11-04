@@ -21,9 +21,10 @@ Units and conventions
   satisfies int S(k,omega) d omega/(2*pi) = time-averaged equal-time
   connected S(k), for a rectangular time window.
 * Excess reference 'initial' subtracts the first frame's MODE-WISE power;
-  'white' subtracts a wavevector-independent random-Gaussian reference
-  determined by the initial spatial covariance matrix; a separate reference
-  initial configuration or ensemble may be supplied explicitly.
+  'white' subtracts a wavevector-independent reference estimated from the
+  initial covariance; 'beta0' is the canonical, fixed-mass ideal-exclusion
+  reference (requiring an appropriate effective cell capacity). An actual
+  beta=0 reference trajectory can also be provided as an array.
 * Radial averaging removes directional information. For coherent migration,
   inspect individual k modes as well as the isotropic radial spectrum.
 
@@ -34,10 +35,11 @@ from __future__ import annotations
 import warnings
 
 import numpy as np
-from scipy.fft import dctn
+from scipy.fft import dctn, fft as time_fft, ifft as time_ifft, next_fast_len
 
 __all__ = [
     'spatial_structure_factor', 'excess_spectral_power',
+    'beta0_reference_covariance',
     'segregation_index', 'occupation_index',
     'connected_time_lag_covariance', 'spatiotemporal_structure_factor',
     'estimate_linear_eigenvalues', 'eigenvalues_from_covariance',
@@ -235,26 +237,60 @@ def _components(S):
         0.5*(S[...,0,0]+S[...,1,1]-s_ab))
 
 
-def _mode_baseline(phi, geo, reference):
-    """Return one baseline covariance per radial bin, shape (nb,2,2)."""
+def beta0_reference_covariance(rho, *, cell_capacity=1., n_cells=None):
+    """Nonzero-mode covariance of a uniform, fixed-mass A/B/vacancy gas.
+
+    Each coarse cell averages ``cell_capacity`` independent exclusion sites.
+    For a microscopic one-site-per-cell lattice set cell_capacity=1.
+    The canonical finite-size correction is K/(K-1), K=n_cells*capacity;
+    the grand-canonical (large-system) limit is simply Sigma/capacity.
+    Do not use this amplitude uncalibrated for an SPDE with arbitrary noise.
+    """
+    rho = np.asarray(rho, dtype=float)
+    if rho.shape != (2,) or not np.all(np.isfinite(rho)) or np.any(rho < 0):
+        raise ValueError('rho must contain two nonnegative finite densities')
+    if rho.sum() > 1 + 1.e-10:
+        raise ValueError('rho_A + rho_B must not exceed 1')
+    cap = float(cell_capacity)
+    if not np.isfinite(cap) or cap <= 0:
+        raise ValueError('cell_capacity must be finite and positive')
+    cov = (np.diag(rho) - np.outer(rho, rho)) / cap
+    if n_cells is not None:
+        n_total = float(n_cells)*cap
+        if n_total <= 1:
+            raise ValueError('At least two exclusion sites required')
+        cov *= n_total/(n_total-1.)
+    return cov
+
+
+def _mode_baseline(phi, geo, reference, *, reference_cell_capacity=1.,
+                   reference_rho=None):
+    """One 2x2 baseline spectrum per radial bin (area_cell normalization)."""
+    nb = len(geo['counts'])
     if isinstance(reference, str):
-        if reference not in ('initial', 'white', 'none'):
-            raise ValueError("reference must be 'initial', 'white', 'none', or an array")
+        if reference not in ('initial', 'white', 'none', 'beta0'):
+            raise ValueError("reference must be 'initial', 'white', 'beta0', 'none', or an array")
         if reference == 'none':
-            return np.zeros((len(geo['counts']),2,2), dtype=complex)
+            return np.zeros((nb,2,2), dtype=complex)
+        if reference == 'beta0':
+            rho = (phi[:,0].mean(axis=(-2,-1)) if reference_rho is None
+                   else reference_rho)
+            cov = beta0_reference_covariance(
+                rho, cell_capacity=reference_cell_capacity,
+                n_cells=phi.shape[-2]*phi.shape[-1])
+            baseline = geo['area_cell']*cov
+            return np.broadcast_to(baseline,(nb,2,2)).copy().astype(complex)
         ref_phi = phi[:,0:1]
     else:
         ref_phi = _frames(reference)
         if ref_phi.shape[-2:] != phi.shape[-2:]:
             raise ValueError('reference field must have the same spatial grid')
     if isinstance(reference,str) and reference=='white':
-        # IID Gaussian reference estimated from the actual (possibly correlated)
-        # initial spatial samples. Under unitary transforms this covariance is
-        # k-independent and equals area_cell * Cov_initial.
+        # White, estimated from the actual initial spatial covariance.
         z = ref_phi[:,0].reshape(2,-1)
         cc = np.cov(z, ddof=1)
         baseline = geo['area_cell'] * cc
-        return np.broadcast_to(baseline,(len(geo['counts']),2,2)).copy().astype(complex)
+        return np.broadcast_to(baseline,(nb,2,2)).copy().astype(complex)    
     modes = _modes(ref_phi,geo)
     with np.errstate(invalid='ignore'):
         return np.mean(_bin_covariances(modes,geo),axis=0)
@@ -282,13 +318,18 @@ def excess_spectral_power(phi_run, L=(50.,50.), *, reference='initial',
                           bc='periodic', n_bins=40, bin_edges=None,
                           k_max=None, k_band=None, k_definition='physical',
                           threshold=1e-13,
-                          min_excess_fraction=0.10):
+                          min_excess_fraction=0.10,
+                          reference_cell_capacity=1., reference_rho=None):
     """Excess spectra and segregation/integration order parameter C(t).
 
     reference='initial' uses actual first frame's spectrum; 'white' uses
-    spatial covariance of initial IID-Gaussian field, giving a flat baseline;
-    'none' uses zero. Another array with shape (2,Nx,Ny) or (2,Tref,Nx,Ny)
-    can be supplied as a reference ensemble of random configurations.
+    spatial covariance of the initial field, giving a flat baseline;
+    'beta0' uses the exact ideal-exclusion fixed-mass covariance, with
+    cell_capacity independent exclusion sites per coarse cell. For stochastic
+    density PDEs, this microscopic amplitude may NOT match the solver noise:
+    an equilibrated beta=0 trajectory supplied as an array is safer.
+    'none' uses zero. Reference arrays have shape (2,Nx,Ny) or
+    (2,Tref,Nx,Ny) and represent an ensemble of reference configurations.
 
     Integrated excess P_{+,-} sums [S_{+,-}(t)-S_{+,-}^ref] over EVERY
     Fourier mode in chosen k-band, not equally over radial bins. P can be
@@ -302,7 +343,9 @@ def excess_spectral_power(phi_run, L=(50.,50.), *, reference='initial',
     phi = _frames(phi_run)
     geo = _geometry(phi.shape[-2:],L,bc,n_bins,bin_edges,k_max,k_definition)
     S = _bin_covariances(_modes(phi,geo),geo)
-    baseline = _mode_baseline(phi,geo,reference)
+    baseline = _mode_baseline(
+        phi,geo,reference, reference_cell_capacity=reference_cell_capacity,
+        reference_rho=reference_rho)
     excess = S - baseline[None,:,:,:]
     plus,minus = _components(S)
     plus0,minus0 = _components(baseline)
@@ -389,6 +432,10 @@ def _validated_lags(lags, available_frames):
     """Choose only feasible lags after burn-in, reporting discarded requests."""
     if lags is None:
         return np.arange(min(100, available_frames - 1) + 1, dtype=int)
+    if isinstance(lags, str):
+        if lags != 'all':
+            raise ValueError("lags must be None, 'all', or integer frame offsets")
+        return np.arange(available_frames, dtype=int)
     raw = np.asarray(lags)
     if raw.ndim != 1 or raw.size == 0:
         raise ValueError('lags must be a nonempty one-dimensional array')
@@ -416,21 +463,21 @@ def connected_time_lag_covariance(phi_run, dt, L=(50.,50.), *,
                                   bc='periodic', n_bins=40, bin_edges=None,
                                   k_max=None, lags=None, burn_in=0,
                                   k_definition='physical',
-                                  demean_time=True):
-    """Connected C_ab(k-bin,tau) of spatial Fourier/DCT amplitudes.
+                                  demean_time=False, method='fft',
+                                  mode_chunk_size=256):
+    """Lag covariances of orthonormal spatial modes, averaged over radial bins.
 
-    C_ab(k,tau) = area_cell <[F_a(t+tau,k)-<F_a>_time]
-                            [F_b(t,k)-<F_b>_time]^*>_{t,k in bin}.
-    No k=0. Fixed lag frame units; dt is the time between SAVED frames,
-    not the integrator step. Lags are limited by the number of frames AFTER
-    burn_in: out-of-range positive user-supplied lags are discarded with a
-    warning, while lags=None selects a valid range automatically.
-    A periodic stationary traveling wave may be
-    obscured by isotropic ring averaging of k and -k: use directional data
-    for a migration test. For growing patterns, connected time-demeaning
-    mixes time dependence; optionally set demean_time=False.
+    C_ab(k,tau) = area_cell <z_a(t+tau,k) z_b(t,k)^*>_{t,k in bin}.
+    ``lags='all'`` computes every lag after burn-in; ``lags=None`` retains
+    the old 0..100 default. Spatial means are always removed, but temporal
+    demeaning is off by default to avoid suppressing growing slow modes. ``method='fft'`` computes the EXACT same finite
+    sample/unbiased-lag estimator using zero-padded FFT convolutions, with
+    O(T log T) time scaling. Modes are processed in bounded chunks.
+
+    Note: the longest lags have very few time pairs, and should not be used
+    indiscriminately in quantitative phase classification.
     """
-    a=_frames(phi_run)
+    a = _frames(phi_run)
     if dt<=0: raise ValueError('dt must be the spacing BETWEEN SAVED frames')
     if burn_in<0 or burn_in>=a.shape[1]-1:
         raise ValueError('burn_in must leave >=2 frames')
@@ -440,25 +487,56 @@ def connected_time_lag_covariance(phi_run, dt, L=(50.,50.), *,
     if demean_time: z=z-z.mean(axis=1,keepdims=True)
     lags = _validated_lags(lags, T)
     nb=len(geo['counts'])
-    cov=np.empty((len(lags),nb,2,2),dtype=complex)
-    for li,lag in enumerate(lags):
-        for s in range(2):
-            for b in range(2):
-                per_mode=np.einsum('tm,tm->m', z[s,lag:],
-                                   z[b,:T-lag].conj(), optimize=True)/(T-lag)
-                cov[li,:,s,b]=geo['area_cell']*_bin_complex(
-                    per_mode,geo['bins'],geo['counts'],nb)
+    cov=np.full((len(lags),nb,2,2), np.nan+1j*np.nan,dtype=complex)
+    if method == 'direct':
+        for li, lag in enumerate(lags):
+            for species in range(2):
+                for other in range(2):
+                    per_mode=np.einsum('tm,tm->m', z[species,lag:],
+                                      z[other,:T-lag].conj(),
+                                      optimize=True)/(T-lag)
+                    cov[li,:,species,other] = geo['area_cell']*_bin_complex(
+                        per_mode,geo['bins'],geo['counts'],nb)
+    elif method == 'fft':
+        if mode_chunk_size < 1:
+            raise ValueError('mode_chunk_size must be positive')
+        # Padding by >=T-1 zeros eliminates circular wraparound: at lag l
+        # ifft(fft(z_a)*conj(fft(z_b)))[l] = sum_t z_a(t+l)*conj(z_b(t)).
+        nfft = next_fast_len(2*T-1)
+        cross_spectra=np.zeros((nb,2,2,nfft),dtype=complex)
+        nm=z.shape[-1]
+        for left in range(0,nm,mode_chunk_size):
+            right=min(nm,left+mode_chunk_size)
+            freq=time_fft(z[:,:,left:right],n=nfft,axis=1)
+            local_bins=geo['bins'][left:right]
+            for ib in np.unique(local_bins):
+                selected=local_bins==ib
+                sub=freq[:,:,selected]
+                for species in range(2):
+                    for other in range(2):
+                        cross_spectra[ib,species,other] += np.sum(
+                            sub[species]*sub[other].conj(),axis=-1)
+        for ib in range(nb):
+            if geo['counts'][ib]==0:
+                continue
+            # numpy/scipy inverse FFT uses normalization by 1/nfft.
+            corr=time_ifft(cross_spectra[ib],axis=-1)
+            corr=corr[...,lags]/(T-lags)[None,None,:]
+            cov[:,ib]=np.moveaxis(corr,-1,0)*geo['area_cell']/geo['counts'][ib]
+    else:
+        raise ValueError("method must be 'fft' or 'direct'")
     plus,minus=_components(cov)
-    return dict(lags=lags, tau=lags*float(dt), k=geo['centers'],
-                counts=geo['counts'], C=cov, C_plus=plus,C_minus=minus,
-                demean_time=demean_time, **_k_metadata(geo))
+    return dict(lags=lags,tau=lags*float(dt),k=geo['centers'],
+                counts=geo['counts'],C=cov,C_plus=plus,C_minus=minus,
+                demean_time=demean_time,method=method,
+                n_frames_used=T,dt_saved=float(dt))
 
 
 def spatiotemporal_structure_factor(phi_run, dt, L=(50.,50.), *,
                                      bc='periodic', n_bins=40,
                                      bin_edges=None,k_max=None,burn_in=0,
                                      k_definition='physical',
-                                     window='hann',demean_time=True,
+                                     window='hann',demean_time=False,
                                      return_mode_spectrum=False):
     """S_ab(k-bin, omega), with angular omega in rad / physical time.
 
@@ -629,13 +707,21 @@ def eigenvalues_from_covariance(k, tau, C, *, counts=None,
 
     good_omega = np.flatnonzero(np.isfinite(omega))
     good_growth = np.flatnonzero(np.isfinite(growth))
+    good_complex = np.flatnonzero((omega > 0) & np.isfinite(growth))
     i_omega = int(good_omega[np.argmax(omega[good_omega])]) if len(good_omega) else None
     i_growth = int(good_growth[np.argmax(growth[good_growth])]) if len(good_growth) else None
+    i_complex_growth = (int(good_complex[np.argmax(growth[good_complex])])
+                        if len(good_complex) else None)
     def center(i):
         return float(bands[i].mean()) if i is not None else np.nan
     return dict(Omega_max=float(omega[i_omega]) if i_omega is not None else np.nan,
                 r_max=float(growth[i_growth]) if i_growth is not None else np.nan,
                 r_at_Omega_max=float(growth[i_omega]) if i_omega is not None else np.nan,
+                r_complex_max=(float(growth[i_complex_growth])
+                               if i_complex_growth is not None else np.nan),
+                Omega_at_r_complex_max=(float(omega[i_complex_growth])
+                                        if i_complex_growth is not None else np.nan),
+                k_r_complex_max=center(i_complex_growth),
                 k_Omega_max=center(i_omega), k_r_max=center(i_growth),
                 band_Omega_max=bands[i_omega].copy() if i_omega is not None else np.full(2,np.nan),
                 band_r_max=bands[i_growth].copy() if i_growth is not None else np.full(2,np.nan),
@@ -706,8 +792,11 @@ def compute_observables(phi_run, L=(50.,50.), *, dt_saved=None, bc='periodic',
                         reference='white', n_bins=40, k_max=None,
                         k_definition='physical',
                         k_band=None,cell_capacity=None,burn_in=0,
-                        lags=None,compute_dynamics=True, demean_time = False,
-                        compute_eigenmodes=False, eigen_kwargs=None):
+                        lags=None,compute_dynamics=True,
+                        compute_eigenmodes=False, eigen_kwargs=None,
+                        demean_time=False, corr_method='fft',
+                        mode_chunk_size=256, reference_cell_capacity=1.,
+                        reference_rho=None):
     """Convenient all-in-one analysis; pure NumPy/Scipy, no solver state.
 
     `dt_saved` MUST be the separation of stored phi_run frames, i.e.
@@ -718,12 +807,19 @@ def compute_observables(phi_run, L=(50.,50.), *, dt_saved=None, bc='periodic',
     lags too large for the frames remaining after burn_in are omitted with
     a warning; lags=None always works. To add the direct (matched-pair)
     eigenvalue estimate set compute_eigenmodes=True and optionally pass
-    eigen_kwargs (for k range, widths, lag, etc.).
+    eigen_kwargs (for k range, widths, lag, etc.). Pass lags='all' to save
+    ALL lags after burn_in, using the FFT algorithm (recommended).
+    Explicit demean_time=False keeps the un-demeaned dynamics consistent
+    with the direct propagator estimator; the spatial mean is always removed.
+    For reference='beta0', reference_cell_capacity specifies how many
+    microscopic exclusion sites are averaged per simulation grid cell.
     """
     a=_frames(phi_run)
     out=dict(excess=excess_spectral_power(a,L,reference=reference,bc=bc,
                      n_bins=n_bins,k_max=k_max,k_band=k_band,
-                     k_definition=k_definition),
+                     n_bins=n_bins,k_max=k_max,k_band=k_band,
+                     reference_cell_capacity=reference_cell_capacity,
+                     reference_rho=reference_rho, k_definition=k_definition),
              segregation=segregation_index(a,cell_capacity=cell_capacity,
                                            subtract_mixing=cell_capacity is not None),
              occupation=occupation_index(a))
@@ -733,6 +829,11 @@ def compute_observables(phi_run, L=(50.,50.), *, dt_saved=None, bc='periodic',
                 k_definition=k_definition, demean_time = demean_time)
         out['time_lag']=connected_time_lag_covariance(a,dt_saved,L,lags=lags,**kw)
         out['spatiotemporal']=spatiotemporal_structure_factor(a,dt_saved,L,**kw)
+        out['time_lag']=connected_time_lag_covariance(
+            a,dt_saved,L,lags=lags,demean_time=demean_time,
+            method=corr_method,mode_chunk_size=mode_chunk_size,**kw)
+        out['spatiotemporal']=spatiotemporal_structure_factor(
+            a,dt_saved,L,demean_time=demean_time,**kw)
         if compute_eigenmodes:
             out['eigenmodes']=estimate_linear_eigenvalues(
                 a,dt_saved,L=L,bc=bc,burn_in=burn_in,**(eigen_kwargs or {}))
