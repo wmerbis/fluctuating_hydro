@@ -43,7 +43,7 @@ def test_canonical_beta0_reference():
     empirical = np.nanmean(S, axis=(0,1)).real
     np.testing.assert_allclose(empirical, theory, atol=.015)
     baseline = excess_spectral_power(
-        phi, L=(8,8), bc='Neumann', reference='beta0', n_bins=5)['baseline']
+        phi, L=(8,8), bc='Neumann', reference='beta0', n_bins=5, reference_cell_capacity=1)['baseline']
     np.testing.assert_allclose(baseline, np.broadcast_to(theory,baseline.shape), atol=1e-12)
 
 
@@ -52,7 +52,7 @@ def test_compute_observables_full_lags_and_debug():
     phi = rng.normal(.35, .01, (2,20,8,8))
     r = compute_observables(phi, L=(50,50), dt_saved=.2, bc='Neumann',
                             reference='beta0', burn_in=5, lags='all',
-                            n_bins=8)
+                            n_bins=8, h=50/8)
     assert r['time_lag']['C'].shape[0] == 15
     assert r['time_lag']['demean_time'] is False
     assert r['time_lag']['method'] == 'fft'

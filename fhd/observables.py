@@ -314,12 +314,12 @@ def spatial_structure_factor(phi_run, L=(50.,50.), *, bc='periodic',
                 **_k_metadata(geo))
 
 
-def excess_spectral_power(phi_run, L=(50.,50.), *, reference='initial',
+def excess_spectral_power(phi_run, L=(50.,50.), *, reference='beta0',
                           bc='periodic', n_bins=40, bin_edges=None,
                           k_max=None, k_band=None, k_definition='physical',
                           threshold=1e-13,
                           min_excess_fraction=0.10,
-                          reference_cell_capacity=1., reference_rho=None):
+                          reference_cell_capacity=None, reference_rho=None, h = None):
     """Excess spectra and segregation/integration order parameter C(t).
 
     reference='initial' uses actual first frame's spectrum; 'white' uses
@@ -341,6 +341,20 @@ def excess_spectral_power(phi_run, L=(50.,50.), *, reference='initial',
     This is a pattern CHANNEL diagnostic, not an independent Z2 order param.
     """
     phi = _frames(phi_run)
+    # For the analytical beta=0 reference, infer the effective
+    # number of microscopic exclusion sites per numerical cell.
+    if isinstance(reference, str) and reference == "beta0":
+        if reference_cell_capacity is None:
+            if h is None or not np.isfinite(h) or h <= 0:
+                raise ValueError(
+                    "reference='beta0' requires h or "
+                    "an explicit reference_cell_capacity"
+                )
+
+            nx, ny = phi.shape[-2:]
+            dx = float(L[0]) / nx
+            dy = float(L[1]) / ny
+            reference_cell_capacity = dx * dy / h**2
     geo = _geometry(phi.shape[-2:],L,bc,n_bins,bin_edges,k_max,k_definition)
     S = _bin_covariances(_modes(phi,geo),geo)
     baseline = _mode_baseline(
@@ -795,8 +809,8 @@ def compute_observables(phi_run, L=(50.,50.), *, dt_saved=None, bc='periodic',
                         lags=None,compute_dynamics=True,
                         compute_eigenmodes=False, eigen_kwargs=None,
                         demean_time=False, corr_method='fft',
-                        mode_chunk_size=256, reference_cell_capacity=1.,
-                        reference_rho=None):
+                        mode_chunk_size=256, reference_cell_capacity=None,
+                        reference_rho=None,  h=None):
     """Convenient all-in-one analysis; pure NumPy/Scipy, no solver state.
 
     `dt_saved` MUST be the separation of stored phi_run frames, i.e.
@@ -818,7 +832,7 @@ def compute_observables(phi_run, L=(50.,50.), *, dt_saved=None, bc='periodic',
     out=dict(excess=excess_spectral_power(a,L,reference=reference,bc=bc,
                      n_bins=n_bins,k_max=k_max,k_band=k_band,
                      reference_cell_capacity=reference_cell_capacity,
-                     reference_rho=reference_rho, k_definition=k_definition),
+                     reference_rho=reference_rho, k_definition=k_definition, h=h),
              segregation=segregation_index(a,cell_capacity=cell_capacity,
                                            subtract_mixing=cell_capacity is not None),
              occupation=occupation_index(a))
