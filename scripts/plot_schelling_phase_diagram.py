@@ -58,7 +58,7 @@ def parse_args(argv=None):
         formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('--out', type=Path, default=Path('schelling_phase_sweep'))
     parser.add_argument('--keys', nargs='+',
-                        default=['C_late', 'entropy_kl_late', 'I_occ_late', 'oscillation_peak'])
+                        default=['C_late', 'entropy_kl_late', 'I_occ_late', 'r_complex_max', 'N_cycles'])
     parser.add_argument('--save', type=Path, default=None)
     parser.add_argument('--no-theory', action='store_true',
                         help='Do not overlay the stability threshold')
@@ -655,9 +655,12 @@ def pretty_label(key):
         'r_at_Omega_max': r'$r$ at $\Omega_{\max}$',
         'k_Omega_max': r'$k$ at $\Omega_{\max}$',
         'k_r_max': r'$k$ at $r_{\max}$',
-        'r_complex_max': r'Largest growth of oscillatory mode',
-        'Omega_at_r_complex_max': r'$\Omega$ at fastest-growing complex mode',
-        'k_r_complex_max': r'$k$ at fastest-growing complex mode',
+        'r_complex_max': r'$r_{\mathrm{complex,max}}$',
+        'Omega_at_r_complex_max': r'$\Omega$ at $r_{\mathrm{complex,max}}$',
+        'k_r_complex_max': r'$k$ at $r_{\mathrm{complex,max}}$',
+        'N_cycles': r'Observed cycles at $r_{\mathrm{complex,max}}$',
+        'r_complex_early': r'Early $r_{\mathrm{complex,max}}$',
+        'r_complex_late': r'Late $r_{\mathrm{complex,max}}$',
     }.get(key,key)
 
 def cell_edges(values):
@@ -723,7 +726,7 @@ def main(argv=None):
                       f'margin range {theory["margin"].min():.4g}..{theory["margin"].max():.4g}')
             for icol,key in enumerate(args.keys):
                 ax=axes[irow,icol]
-                if key in DYNAMIC_KEYS:
+                if key in DYNAMIC_KEYS and key not in data:
                     values=dynamic_grid(args.out,family,bs,xs,key,
                                         k_band=args.osc_k_band,
                                         min_peak_ratio=args.osc_min_peak_ratio,
@@ -747,8 +750,9 @@ def main(argv=None):
                     elif key == 'entropy_kl_late': kwargs.update(cmap = 'plasma')
                     elif key=='temporal_antisymmetry': kwargs.update(cmap='magma',vmin=0)
                     elif key=='oscillation_frequency': kwargs.update(cmap='plasma',vmin=0)
-                    elif key in ('r_max','r_at_Omega_max','r_complex_max'):
-                        kwargs.update(cmap='coolwarm') #,norm=CenteredNorm(vcenter=0))
+                    elif key in ('r_max','r_at_Omega_max','r_complex_max',
+                                 'r_complex_early','r_complex_late'):
+                        kwargs.update(cmap='coolwarm',norm=CenteredNorm(vcenter=0))
                     elif key in EIGEN_KEYS:
                         kwargs.update(cmap='viridis',vmin=0)
                     else: kwargs.update(cmap='viridis',vmin=0)
