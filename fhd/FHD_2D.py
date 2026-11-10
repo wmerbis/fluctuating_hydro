@@ -5377,14 +5377,18 @@ class fhd_2d:
 
         return np.asarray(phi_run).transpose((1,0,2,3))
 
-    def run(self, phi, param, nsteps, dt, toggle_noise, 
-            no_frames = 100,
-            scheme = "FE", 
-            model = "Schelling+Voter",
-            verbatum = True,
-            diagnostic_interval=100,
-            reset_projection_diag=True,
-            use_fastpath=False):
+    def run(
+        self, phi, param, nsteps, dt, toggle_noise,
+        no_frames=100,
+        scheme="FE",
+        model="Schelling",
+        verbatum=True,
+        diagnostic_interval=100,
+        reset_projection_diag=True,
+        use_fastpath=False,
+        mode_recorder=None,
+        store_full_run=True,
+    ):
         ''' Runs the FHD simulation with specified parameters for nsteps, recording no_frames equally timed frames.
 
         Arg:
@@ -5466,8 +5470,16 @@ class fhd_2d:
                 record_projection_history=(diagnostic_interval is not None),
             )
         
-        phi_run = np.zeros((self.nspecies, no_frames+1)+self.N)
-        phi_run[:,0,:,:] = phi_current
+        if verbatum and not store_full_run:
+            raise ValueError("Use verbatum=False when not storing phi_run")
+
+        phi_run = None
+        if store_full_run:
+            phi_run = np.zeros((self.nspecies, no_frames+1) + self.N)
+            phi_run[:, 0] = phi_current
+
+        if mode_recorder is not None:
+            mode_recorder.record(0, phi_current)
 
         
         for n in range(1, nsteps + 1):     
@@ -5502,8 +5514,12 @@ class fhd_2d:
                 # phi_current = self.step(self.rhs_SchellingwithVoter, phi_current, param, dt, toggle_noise, scheme, work)
             else:
                 raise ValueError(f"Model {model} is unknown, please choose 'Vitelli', 'Schelling' or 'Schelling+Voter'") 
-        
-            if n % plot_every == 0:
+            
+            if mode_recorder is not None:
+                if mode_recorder.needs_recording(n):
+                    mode_recorder.record(n, phi_current)
+            
+            if store_full_run and n % plot_every == 0:
                 if verbatum:
                     print(f"Step {n}/{nsteps}: mean rho = {phi_current.mean():.6f}, min = {phi_current.min():.6e}, D_index = {dissimilarity(phi_current):.6f}, mean_kl_div = {mean_relative_entropy(phi_current):.6f}")
                 phi_run[:,n//plot_every,:,:] = phi_current
@@ -5523,7 +5539,7 @@ class fhd_2d:
             cbar.set_label(r"$\phi_a - \phi_b$",size=14)
             plt.show()
             
-        return phi_run
+        return phi_run if store_full_run else phi_current
     
     def run_until_converged(self, phi, param, dt, toggle_noise, 
             save_every = 500, T= 100, K = 50,
