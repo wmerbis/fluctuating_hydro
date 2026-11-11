@@ -12,7 +12,8 @@ Stage 2 (ANALYZE): reads the recordings; writes derived observables to:
 
 Stage 3 (AGGREGATE): averages scalar per-run observables into:
     OUT/reciprocal_grids.npz and OUT/nonreciprocal_grids.npz
-    This is compatible with scripts/plot_schelling_phase_diagram.py.
+    Each family retains its own x axis. This is compatible with
+    scripts/plot_schelling_phase_diagram.py.
 
 Examples, run from the repository root:
 
@@ -23,6 +24,12 @@ Examples, run from the repository root:
       --nsteps 50000 --mode-every 100 --snapshots 500
   python scripts/schelling_phase_sweep.py analyze --out phase_sweep_test
   python scripts/schelling_phase_sweep.py aggregate --out phase_sweep_test
+
+  # Both families in one sweep: shared beta axis, family-specific x axes:
+  # reciprocal [-1,1], nonreciprocal [0,1] by default.
+  python scripts/schelling_phase_sweep.py simulate --out phase_sweep_21 \
+      --families reciprocal nonreciprocal --beta-min 0 --beta-max 8 \
+      --n-beta 21 --n-x 21 --workers 4
 
   # Or run all three stages consecutively with the same arguments:
   python scripts/schelling_phase_sweep.py all --out phase_sweep_test \\
@@ -99,9 +106,12 @@ def parse_args(argv=None):
     p.add_argument("--beta-min", type=float, default=0.)
     p.add_argument("--beta-max", type=float, default=8.)
     p.add_argument("--n-beta", type=int, default=9)
-    p.add_argument("--x-values", type=float, nargs="+", default=None)
-    p.add_argument("--x-min", type=float, default=-1.)
-    p.add_argument("--x-max", type=float, default=1.)
+    p.add_argument("--x-values", type=float, nargs="+", default=None,
+                   help="Explicit x axis for BOTH families; overrides family defaults")
+    p.add_argument("--x-min", type=float, default=None,
+                   help="Override lower x bound for BOTH families (defaults: reciprocal=-1, nonreciprocal=0)")
+    p.add_argument("--x-max", type=float, default=None,
+                   help="Override upper x bound for BOTH families (default: 1)")
     p.add_argument("--n-x", type=int, default=11)
     p.add_argument("--repeats", type=int, default=1)
     p.add_argument("--workers", type=int, default=4,
@@ -173,18 +183,31 @@ def _check_args(args):
 def _grid_config(args):
     betas = (np.asarray(args.beta_values, float) if args.beta_values is not None
              else np.linspace(args.beta_min, args.beta_max, args.n_beta))
-    xs = (np.asarray(args.x_values, float) if args.x_values is not None
-          else np.linspace(args.x_min, args.x_max, args.n_x))
-    if not len(betas) or not len(xs) or not (np.isfinite(betas).all() and np.isfinite(xs).all()):
-        raise ValueError("beta/x grids must be nonempty and finite")
-    if np.any(np.diff(betas) <= 0) or np.any(np.diff(xs) <= 0):
-        raise ValueError("beta/x values must be strictly increasing")
+    if not len(betas) or not np.isfinite(betas).all() or np.any(np.diff(betas) <= 0):
+        raise ValueError("beta grid must be nonempty, finite, and strictly increasing")
+    if args.x_values is None and args.n_x < 1:
+        raise ValueError("--n-x must be >= 1")
+    # Each family has its own x axis by default, just like the original
+    # Schelling sweep. Explicit --x-values/--x-min/--x-max override these
+    # defaults for BOTH families, retaining the old CLI's override semantics.
+    x_by_family = {}
+    for family in args.families:
+        if args.x_values is not None:
+            xs = np.asarray(args.x_values, dtype=float)
+        else:
+            x_min = (args.x_min if args.x_min is not None
+                     else (-1. if family == "reciprocal" else 0.))
+            x_max = args.x_max if args.x_max is not None else 1.
+            xs = np.linspace(x_min, x_max, args.n_x)
+        if not len(xs) or not np.isfinite(xs).all() or np.any(np.diff(xs) <= 0):
+            raise ValueError(f"{family} x grid must be nonempty, finite, and strictly increasing")
+        x_by_family[family] = xs.tolist()
     L = list(map(float, args.L)); N = list(map(int, args.N))
     # For an anisotropic grid the microscopic area is the natural choice.
     h = np.sqrt((L[0] / N[0]) * (L[1] / N[1]) / args.people_per_cell)
     return dict(
-        version=1, families=list(args.families), beta=betas.tolist(),
-        x=xs.tolist(), N=N, L=L, bc="Neumann",
+        version=2, families=list(args.families), beta=betas.tolist(),
+        x_by_family=x_by_family, N=N, L=L, bc="Neumann",
         rho=list(map(float, args.rho)), D=list(map(float, args.D)),
         sigma=float(args.sigma), rho_a=float(args.rho[0]), rho_b=float(args.rho[1]),
         people_per_cell=float(args.people_per_cell),
@@ -194,6 +217,13 @@ def _grid_config(args):
         snapshots=int(args.snapshots), mode_k_band=[0., float(args.mode_kmax)],
         initial_std=float(args.initial_std), seed=int(args.seed),
     )
+
+
+def _xs_for_family(cfg, family):
+    """Per-family x grid; also read recordings from pre-v2 sweep configs."""
+    if "x_by_family" in cfg:
+        return np.asarray(cfg["x_by_family"][family], dtype=float)
+    return np.asarray(cfg["x"], dtype=float)
 
 
 def _load_config(out):
@@ -256,7 +286,7 @@ def _simulate_one(job):
     from fhd.low_k_recording import LowKRecorder
 
     N = tuple(cfg["N"]); L = tuple(cfg["L"])
-    beta = float(cfg["beta"][ib]); x = float(cfg["x"][ix])
+    beta = float(cfg["beta"][ib]); x = float(_xs_for_family(cfg, family)[ix])
     kappa = _kappa(family, x)
     seed = _seed_for_job(cfg["seed"], family, ib, ix, rep)
     rng = np.random.default_rng(seed)
@@ -552,8 +582,9 @@ def _simulate(args):
     _write_config(args.out, cfg)
     jobs = []
     for family in cfg["families"]:
+        xs = _xs_for_family(cfg, family)
         for ib in range(len(cfg["beta"])):
-            for ix in range(len(cfg["x"])):
+            for ix in range(len(xs)):
                 for rep in range(args.repeats):
                     path = _run_path(args.out, family, ib, ix, rep)
                     if not path.exists() or args.overwrite:
@@ -582,8 +613,8 @@ def _analyze(args):
 def _aggregate(args):
     cfg = _load_config(args.out)
     betas = np.asarray(cfg["beta"], float)
-    xs = np.asarray(cfg["x"], float)
     for family in cfg["families"]:
+        xs = _xs_for_family(cfg, family)
         sums = {k: np.zeros((len(betas), len(xs))) for k in GRID_SCALARS}
         counts = {k: np.zeros((len(betas), len(xs)), dtype=int) for k in GRID_SCALARS}
         n_runs = np.zeros((len(betas), len(xs)), dtype=int)
