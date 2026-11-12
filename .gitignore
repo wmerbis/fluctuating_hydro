@@ -8,6 +8,8 @@ benchmark_face_reaction_bias/
 spectral_validation/
 phase_sweep/
 phase_sweep_lattice/
+phase_sweep_test/
+phase_sweep_21/
 notebooks/FHD.ipynb
 notebooks/FHD2d.ipynb
 notebooks/gif_maker.ipynb
