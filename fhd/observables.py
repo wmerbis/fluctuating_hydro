@@ -745,8 +745,8 @@ def eigenvalues_from_covariance(k, tau, C, *, counts=None,
 
 
 def estimate_linear_eigenvalues(phi_runs, dt_saved, L=(50., 50.), *,
-                                bc='Neumann', k_range=(0.5, 2.5),
-                                widths=(0.35, 0.5, 0.75), step=0.1,
+                                bc='Neumann', k_range=(0.2, 2.5),
+                                widths=(0.25, 0.35, 0.5), step=0.05,
                                 bin_width=0.1, lag_frames=1,
                                 burn_in=0, end_frame=None,
                                 min_modes=20, max_condition=1.e6,
