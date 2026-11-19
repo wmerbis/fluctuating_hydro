@@ -34,7 +34,7 @@ def drift_matrix(k, a0, b0, param):
     # kappa_ba = param["kappa"][1,0]
     # kappa_bb = param["kappa"][1,1]
     lin_mat = linear_matrices(rho=(a0,b0), D=param["D"], beta=param['beta'],
-                    kappa=param['kappa'], h=param['h'], D_v=param['h'], sigma=param["sigma"])
+                    kappa=param['kappa'], h=param['h'], D_v=param['D_v'], sigma=param["sigma"])
     A = lin_mat['A']
     Q = lin_mat['Q']
     M = A*k2 - Q*k4
